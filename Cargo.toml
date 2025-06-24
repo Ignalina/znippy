@@ -1,0 +1,4 @@
+# Root Cargo.toml
+[workspace]
+members = ["compress", "decompress"]
+resolver = "2"
