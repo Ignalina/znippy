@@ -1,0 +1,19 @@
+[package]
+name = "decompress"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zstd = "0.13"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+rayon = "1.10"
+anyhow = "1"
+hex = "0.4"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "decompress"
+path = "src/main.rs"
