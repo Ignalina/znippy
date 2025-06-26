@@ -2,21 +2,24 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rerun-if-changed=wrapper.h");
+    println!("cargo:rerun-if-changed=zstd/lib/zstd.h");
 
-    // Länkning till statiska libzstd.a
-    println!("cargo:rustc-link-search=native=../zstd-local/lib");
+    let libzstd_path = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+        .join("../zstd-local/lib");
+    println!("cargo:rustc-link-search=native={}", libzstd_path.display());
     println!("cargo:rustc-link-lib=static=zstd");
 
-    // Skapa bindningar med rätt ZSTD-makron
     let bindings = bindgen::Builder::default()
-        .header("wrapper.h")
+        .header("wrapper.h") // istället för zstd/lib/zstd.h
         .clang_arg("-DZSTD_MULTITHREAD")
         .clang_arg("-Izstd/lib")
         .clang_arg("-Izstd/lib/common")
         .clang_arg("-Izstd/lib/compress")
         .clang_arg("-Izstd/lib/decompress")
         .clang_arg("-Izstd/lib/dictBuilder")
+        .allowlist_function("ZSTD_.*")
+        .allowlist_type("ZSTD_.*")
+        .allowlist_var("ZSTD_.*")
         .generate()
         .expect("Unable to generate bindings");
 

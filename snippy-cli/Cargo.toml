@@ -1,0 +1,13 @@
+# snippy-cli/Cargo.toml
+
+[package]
+name = "snippy-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.4", features = ["derive"] }
+anyhow = "1.0.98"
+
+compress = { path = "../compress" }
+decompress = { path = "../decompress" }

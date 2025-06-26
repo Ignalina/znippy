@@ -1,7 +1,14 @@
 # Root Cargo.toml
 [workspace]
-members = ["compress", "decompress"]
+members = [
+    "compress",
+    "decompress",
+    "snippy-cli",
+    "zstd-sys-patched"
+]
 resolver = "2"
 
 [patch.crates-io]
 zstd-sys = { path = "zstd-sys-patched" }
+
+
