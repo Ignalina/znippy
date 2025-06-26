@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-zstd = "0.13"
-blake3 = "1"
-clap = { version = "4", features = ["derive"] }
+blake3 = "1.8.2"
+clap = { version = "4.5.40", features = ["derive"] }
 rayon = "1.10"
-anyhow = "1"
-hex = "0.4"
+anyhow = "1.0.98"
+hex = "0.4.3"
+zstd-sys = { path = "../zstd-sys-patched", version = "2.0.15" }
 
 [lib]
 path = "src/lib.rs"
