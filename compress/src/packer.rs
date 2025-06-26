@@ -1,24 +1,31 @@
-// compress/src/packer.rs
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
-use rayon::prelude::*;
+use std::sync::{Arc, Mutex};
+
+use anyhow::Context;
 use blake3;
-use hex;
+use rayon::prelude::*;
+use walkdir::WalkDir;
+
+use zstd_sys::{
+    ZSTD_createCCtx,
+    ZSTD_createCCtxParams,
+    ZSTD_compress2,
+    ZSTD_compressBound,
+    ZSTD_CCtxParams_set_compressionLevel,
+    ZSTD_CCtxParams_set_nbWorkers,
+    ZSTD_freeCCtxParams,
+    ZSTD_freeCCtx,
+    ZSTD_isError,
+};
 
 #[derive(Debug)]
-struct FileEntry {
-    path: String,
-    offset: u64,
-    size: u64,
-    hash: [u8; 32],
-}
-
-struct CompressedFile {
-    path: String,
-    compressed: Vec<u8>,
-    hash: [u8; 32],
+pub struct FileEntry {
+    pub path: String,
+    pub offset: u64,
+    pub size: u64,
+    pub hash: [u8; 32],
 }
 
 pub fn create_snippy_archive<P: AsRef<Path>>(input_dir: P, output_file: P) -> anyhow::Result<()> {
@@ -31,40 +38,83 @@ pub fn create_snippy_archive<P: AsRef<Path>>(input_dir: P, output_file: P) -> an
         .map(|e| e.into_path())
         .collect();
 
-    let compressed_files: Vec<CompressedFile> = files
-        .par_iter()
-        .map(|path| {
-            let rel_path = path.strip_prefix(input_dir).unwrap().to_str().unwrap().replace("\\", "/");
-            let mut file = File::open(path)?;
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer)?;
+    let archive_file = Arc::new(Mutex::new(BufWriter::new(File::create(&output_file)?)));
+    let index = Arc::new(Mutex::new(Vec::new()));
+    let offset = Arc::new(Mutex::new(0u64));
 
-            let hash = *blake3::hash(&buffer).as_bytes();
+    files.par_iter().try_for_each(|path| -> anyhow::Result<()> {
+        let rel_path = path.strip_prefix(input_dir)?.to_str().unwrap().replace("\\", "/");
+        let mut file = BufReader::new(File::open(path)?);
+        let mut input_data = Vec::new();
+        file.read_to_end(&mut input_data)?;
 
-            let mut compressed = Vec::new();
-            zstd::stream::copy_encode(&buffer[..], &mut compressed, 3)?;
+        let hash = *blake3::hash(&input_data).as_bytes();
 
-            Ok(CompressedFile { path: rel_path, compressed, hash })
-        })
-        .collect::<Result<_, anyhow::Error>>()?;
+        let max_len = unsafe { ZSTD_compressBound(input_data.len()) };
+        let mut compressed = vec![0u8; max_len];
 
-    let mut archive = BufWriter::new(File::create(&output_file)?);
-    let mut index = Vec::new();
-    let mut offset = 0u64;
+        let cctx = unsafe { ZSTD_createCCtx() };
+        if cctx.is_null() {
+            anyhow::bail!("Failed to create compression context");
+        }
 
-    for file in &compressed_files {
-        archive.write_all(&file.compressed)?;
-        index.push(FileEntry {
-            path: file.path.clone(),
-            offset,
-            size: file.compressed.len() as u64,
-            hash: file.hash,
+        let params = unsafe { ZSTD_createCCtxParams() };
+        if params.is_null() {
+            unsafe { ZSTD_freeCCtx(cctx) };
+            anyhow::bail!("Failed to create compression parameters");
+        }
+
+        let threads = std::thread::available_parallelism()?.get() as i32;
+        unsafe {
+            ZSTD_CCtxParams_set_compressionLevel(params, 3);
+            ZSTD_CCtxParams_set_nbWorkers(params, threads);
+        }
+
+        let compressed_size = unsafe {
+            ZSTD_compress2(
+                cctx,
+                compressed.as_mut_ptr() as *mut _,
+                compressed.len(),
+                input_data.as_ptr() as *const _,
+                input_data.len(),
+                params,
+            )
+        };
+
+        unsafe {
+            ZSTD_freeCCtxParams(params);
+            ZSTD_freeCCtx(cctx);
+        }
+
+        if unsafe { ZSTD_isError(compressed_size) } != 0 {
+            anyhow::bail!("Compression failed");
+        }
+
+        compressed.truncate(compressed_size);
+
+        let mut archive = archive_file.lock().unwrap();
+        let mut idx = index.lock().unwrap();
+        let mut off = offset.lock().unwrap();
+
+        archive.write_all(&compressed)?;
+
+        idx.push(FileEntry {
+            path: rel_path,
+            offset: *off,
+            size: compressed.len() as u64,
+            hash,
         });
-        offset += file.compressed.len() as u64;
-    }
 
+        *off += compressed.len() as u64;
+
+        Ok(())
+    })?;
+
+    let mut archive = archive_file.lock().unwrap();
+    let index = index.lock().unwrap();
     let index_offset = archive.stream_position()?;
-    for entry in &index {
+
+    for entry in &*index {
         let path_bytes = entry.path.as_bytes();
         let path_len = path_bytes.len() as u32;
 
@@ -79,58 +129,4 @@ pub fn create_snippy_archive<P: AsRef<Path>>(input_dir: P, output_file: P) -> an
     archive.write_all(&(index.len() as u32).to_le_bytes())?;
 
     Ok(())
-}
-
-pub fn list_snippy_archive<P: AsRef<Path>>(archive_path: P) -> anyhow::Result<()> {
-    let index = read_index(archive_path)?;
-    for entry in index {
-        println!("{:<60} {:>10} bytes  {}", entry.path, entry.size, hex::encode(entry.hash));
-    }
-    Ok(())
-}
-
-pub fn export_snippy_hashlist<P: AsRef<Path>>(archive_path: P, out_file: P) -> anyhow::Result<()> {
-    let index = read_index(archive_path)?;
-    let mut out = BufWriter::new(File::create(out_file)?);
-    for entry in index {
-        writeln!(out, "{}", hex::encode(entry.hash))?;
-    }
-    Ok(())
-}
-
-fn read_index<P: AsRef<Path>>(archive_path: P) -> anyhow::Result<Vec<FileEntry>> {
-    let mut file = File::open(archive_path)?;
-    file.seek(std::io::SeekFrom::End(-12))?;
-    let mut buf = [0u8; 12];
-    file.read_exact(&mut buf)?;
-    let index_offset = u64::from_le_bytes(buf[0..8].try_into()?);
-    let num_entries = u32::from_le_bytes(buf[8..12].try_into()?);
-
-    file.seek(std::io::SeekFrom::Start(index_offset))?;
-    let mut index = Vec::with_capacity(num_entries as usize);
-
-    for _ in 0..num_entries {
-        let mut len_buf = [0u8; 4];
-        file.read_exact(&mut len_buf)?;
-        let path_len = u32::from_le_bytes(len_buf);
-
-        let mut path_buf = vec![0u8; path_len as usize];
-        file.read_exact(&mut path_buf)?;
-        let path = String::from_utf8(path_buf)?;
-
-        let mut offset_buf = [0u8; 8];
-        file.read_exact(&mut offset_buf)?;
-        let offset = u64::from_le_bytes(offset_buf);
-
-        let mut size_buf = [0u8; 8];
-        file.read_exact(&mut size_buf)?;
-        let size = u64::from_le_bytes(size_buf);
-
-        let mut hash_buf = [0u8; 32];
-        file.read_exact(&mut hash_buf)?;
-
-        index.push(FileEntry { path, offset, size, hash: hash_buf });
-    }
-
-    Ok(index)
 }

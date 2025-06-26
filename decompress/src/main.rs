@@ -1,67 +1,43 @@
-use clap::Parser;
-use decompress::{extract_snippy_archive_filtered, read_snippy_index};
-use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use clap::{Parser, Subcommand};
+use anyhow::Result;
+use decompress::unpacker::{extract_snippy_archive, list_snippy_archive};
 
 #[derive(Parser)]
-struct Args {
-    #[arg(help = "Input .snippy file")]
-    archive_file: String,
-
-    #[arg(help = "Output directory")]
-    output_dir: String,
-
-    #[arg(long, help = "Path to file containing hex-encoded hashes to include")]
-    include_hashes: Option<String>,
-
-    #[arg(long, help = "Path to file containing hex-encoded hashes to exclude")]
-    exclude_hashes: Option<String>,
-
-    #[arg(long, help = "Only list archive contents with hash")]
-    list_only: bool,
+#[command(name = "decompress")]
+#[command(about = "Snippy decompressor", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
 }
 
-fn parse_hashes(path: &str) -> anyhow::Result<HashSet<[u8; 32]>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut set = HashSet::new();
+#[derive(Subcommand)]
+enum Commands {
+    /// Unpack a .snippy archive
+    Unpack {
+        #[arg(help = "Input .snippy archive")]
+        input: String,
+        #[arg(help = "Output directory")]
+        output: String,
+    },
 
-    for line in reader.lines() {
-        let line = line?;
-        let bytes = hex::decode(line.trim())?;
-        if bytes.len() != 32 {
-            anyhow::bail!("Invalid hash length: {}", line);
-        }
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&bytes);
-        set.insert(hash);
+    /// List contents of a .snippy archive
+    List {
+        #[arg(help = "Input .snippy archive")]
+        input: String,
     }
-    Ok(set)
 }
 
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+fn main() -> Result<()> {
+    let cli = Cli::parse();
 
-    if args.list_only {
-        let index = read_snippy_index(&args.archive_file)?;
-        for entry in &index {
-            println!("{:<60} {:>10} bytes  {}", entry.path, entry.size, blake3::Hash::from(entry.hash));
+    match cli.command {
+        Commands::Unpack { input, output } => {
+            extract_snippy_archive(input, output)?;
         }
-        return Ok(());
+        Commands::List { input } => {
+            list_snippy_archive(input)?;
+        }
     }
 
-    let include_hashes = if let Some(path) = &args.include_hashes {
-        Some(parse_hashes(path)?)
-    } else {
-        None
-    };
-
-    let exclude_hashes = if let Some(path) = &args.exclude_hashes {
-        Some(parse_hashes(path)?)
-    } else {
-        None
-    };
-
-    extract_snippy_archive_filtered(&args.archive_file, &args.output_dir, include_hashes.as_ref(), exclude_hashes.as_ref())
+    Ok(())
 }

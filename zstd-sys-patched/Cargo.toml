@@ -1,0 +1,19 @@
+[package]
+name = "zstd-sys"
+version = "2.0.15"
+links = "zstd"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1.0"
+bindgen = "0.72.0"
+
+[dependencies]
+libc = "0.2"
+
+[features]
+default = ["legacy"]
+legacy = []

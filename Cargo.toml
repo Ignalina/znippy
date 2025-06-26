@@ -2,3 +2,6 @@
 [workspace]
 members = ["compress", "decompress"]
 resolver = "2"
+
+[patch.crates-io]
+zstd-sys = { path = "zstd-sys-patched" }
