@@ -1,4 +1,5 @@
-![snippy](https://github.com/user-attachments/assets/dce7ee4a-d814-4602-8309-77e52dab40ae)
+
+![snippy](https://github.com/user-attachments/assets/7db1c1c1-d577-4f87-bfe1-11af6e8c58a0)
 
 # snippy
 Rust fully pararlized compress/decompress of directories. Thanks ChatGPT !
