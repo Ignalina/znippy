@@ -1,11 +1,14 @@
-// snippy-cli/src/main.rs
-
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use anyhow::Result;
+
+use compress::compress_dir;
+use decompress::decompress_archive;
+use snippy_common::{verify_archive_integrity, list_archive_contents};
 
 #[derive(Parser)]
 #[command(name = "snippy")]
-#[command(about = "Snippy: streamande, flertrådad komprimering och dekomprimering", long_about = None)]
+#[command(about = "Snippy: fast archive format with per-file compression", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -13,19 +16,44 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Compress a directory into a .snippy archive
     Compress {
-        input: String,
-        output: String,
+        /// Input directory
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output archive file (.snippy)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Disable skipping compression for already compressed files
+        #[arg(long)]
+        no_skip: bool,
     },
+
+    /// Decompress a .snippy archive
     Decompress {
-        input: String,
-        output: String,
+        /// Input archive file (.snippy)
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output directory
+        #[arg(short, long)]
+        output: PathBuf,
     },
+
+    /// List contents of a .snippy archive
     List {
-        input: String,
+        /// Input archive file (.snippy)
+        #[arg(short, long)]
+        input: PathBuf,
     },
+
+    /// Verify archive integrity (checksum)
     Verify {
-        input: String,
+        /// Input archive file (.snippy)
+        #[arg(short, long)]
+        input: PathBuf,
     },
 }
 
@@ -33,21 +61,19 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Compress { input, output } => {
-            compress::compress_dir(input, output)?;
+        Commands::Compress { input, output, no_skip } => {
+            compress_dir(&input, &output, !no_skip)?;
         }
         Commands::Decompress { input, output } => {
-            decompress::decompress_snippy(input, output)?;
+            decompress_archive(&input, &output)?;
         }
         Commands::List { input } => {
-            let (entries, _) = decompress::read_snippy_index(input)?;
-            for entry in entries {
-                println!("{} ({} bytes)", entry.path.display(), entry.original_size);
-            }
+            let file = std::fs::File::open(&input)?;
+            list_archive_contents(file)?;
         }
         Commands::Verify { input } => {
-            decompress::verify_archive_integrity(input)?;
-            println!("Archive OK.");
+            let file = std::fs::File::open(&input)?;
+            verify_archive_integrity(file)?;
         }
     }
 

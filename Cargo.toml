@@ -3,7 +3,7 @@
 members = [
     "compress",
     "decompress",
-    "snippy-cli",
+    "snippy-cli", "snippy-common",
     "zstd-sys-patched"
 ]
 resolver = "2"
