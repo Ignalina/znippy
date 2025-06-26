@@ -1,9 +1,3 @@
-// decompress/src/lib.rs
+mod unpacker;
 
-pub mod unpacker;
-
-pub use unpacker::{
-    decompress_snippy,
-    read_snippy_index,
-    verify_archive_integrity,
-};
+pub use unpacker::decompress_archive;

@@ -1,8 +1,9 @@
 use std::env;
 use std::path::PathBuf;
+use bindgen::EnumVariation;
 
 fn main() {
-    println!("cargo:rerun-if-changed=zstd/lib/zstd.h");
+    println!("cargo:rerun-if-changed=wrapper.h");
 
     let libzstd_path = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
         .join("../zstd-local/lib");
@@ -10,13 +11,11 @@ fn main() {
     println!("cargo:rustc-link-lib=static=zstd");
 
     let bindings = bindgen::Builder::default()
-        .header("wrapper.h") // istället för zstd/lib/zstd.h
+        .header("wrapper.h")
+        .clang_arg("-DZSTD_STATIC_LINKING_ONLY")
         .clang_arg("-DZSTD_MULTITHREAD")
         .clang_arg("-Izstd/lib")
-        .clang_arg("-Izstd/lib/common")
-        .clang_arg("-Izstd/lib/compress")
-        .clang_arg("-Izstd/lib/decompress")
-        .clang_arg("-Izstd/lib/dictBuilder")
+        .default_enum_style(EnumVariation::Consts)
         .allowlist_function("ZSTD_.*")
         .allowlist_type("ZSTD_.*")
         .allowlist_var("ZSTD_.*")

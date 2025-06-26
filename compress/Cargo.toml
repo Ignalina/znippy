@@ -14,3 +14,5 @@ zstd-sys = { path = "../zstd-sys-patched", version = "2.0.15" }
 serde = { version = "1.0.219", features = ["derive"] }
 bincode = { version = "2.0.1"  ,features = ["serde"] }
 
+snippy-common = { path = "../snippy-common" }
+
