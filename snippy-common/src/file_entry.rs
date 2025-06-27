@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Metadata om en fil i ett `.snippy`-arkiv.
 use bincode::{Encode, Decode};
@@ -14,7 +14,7 @@ pub struct FileEntry {
 }
 
 /// Returnerar `true` om filändelsen antyder att filen redan är komprimerad.
-pub fn is_probably_compressed(path: &PathBuf) -> bool {
+pub fn is_probably_compressed(path: &Path) -> bool {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let ext = ext.to_ascii_lowercase();
         matches!(
@@ -32,6 +32,6 @@ pub fn is_probably_compressed(path: &PathBuf) -> bool {
 /// Returnerar `true` om vi bör skippa komprimering för denna fil.
 ///
 /// Default: alla "redan komprimerade" filtyper (enligt extension).
-pub fn should_skip_compression(path: &PathBuf) -> bool {
+pub fn should_skip_compression(path: &Path) -> bool {
     is_probably_compressed(path)
 }
