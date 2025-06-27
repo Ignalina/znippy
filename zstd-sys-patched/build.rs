@@ -19,6 +19,8 @@ fn main() {
         .allowlist_function("ZSTD_.*")
         .allowlist_type("ZSTD_.*")
         .allowlist_var("ZSTD_.*")
+        .allowlist_var("ZSTD_e_.*")
+        .allowlist_type("ZSTD_e_.*")
         .generate()
         .expect("Unable to generate bindings");
 
@@ -26,4 +28,5 @@ fn main() {
     bindings
         .write_to_file(out_path.join("bindings.rs"))
         .expect("Couldn't write bindings!");
+    println!("cargo:warning=Bindings written to: {}", out_path.join("bindings.rs").display());
 }
