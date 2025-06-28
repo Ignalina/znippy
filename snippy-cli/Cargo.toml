@@ -11,3 +11,4 @@ anyhow = "1.0.98"
 compress = { path = "../compress" }
 decompress = { path = "../decompress" }
 snippy-common = { path = "../snippy-common" }
+env_logger = "0.11.8"
