@@ -16,4 +16,5 @@ snippy-common = { path = "../snippy-common" }
 rayon = "1.10.0"
 num_cpus = "1.17.0"
 parking_lot = "0.12.4"
+log = "0.4.27"
 
