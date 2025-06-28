@@ -15,12 +15,13 @@ fn main() {
         .clang_arg("-DZSTD_STATIC_LINKING_ONLY")
         .clang_arg("-DZSTD_MULTITHREAD")
         .clang_arg("-Izstd/lib")
-        .default_enum_style(EnumVariation::Consts)
+        .default_enum_style(EnumVariation::Rust { non_exhaustive: false })
         .allowlist_function("ZSTD_.*")
-        .allowlist_type("ZSTD_.*")
         .allowlist_var("ZSTD_.*")
         .allowlist_var("ZSTD_e_.*")
-        .allowlist_type("ZSTD_e_.*")
+        .allowlist_var("ZSTD_cParameter_.*")
+        .allowlist_type("ZSTD_cParameter")           // ← valfri för säkerhets skull
+        .allowlist_type("ZSTD_EndDirective")
         .generate()
         .expect("Unable to generate bindings");
 
