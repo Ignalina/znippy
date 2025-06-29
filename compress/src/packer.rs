@@ -1,3 +1,5 @@
+// compress/src/packer.rs
+
 use std::{
     fs::File,
     io::{BufWriter, Read, Seek, SeekFrom, Write},
@@ -163,10 +165,8 @@ pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool
     let writer_handle = thread::spawn({
         let mut writer = writer;
         move || -> Result<(Vec<FileEntry>, u64)> {
-            debug!("[writer] Initierar skrivning...");
             writer.seek(SeekFrom::Start(8))?;
             for (i, data, compressed, path, in_bytes, out_bytes) in rx_writer.iter() {
-                debug!("[writer] Fil index {}: {:?} ({} -> {} bytes, compressed={})", i, path, in_bytes, out_bytes, compressed);
                 let entry = &mut entries[i];
                 entry.offset = writer.seek(SeekFrom::Current(0))?;
                 entry.compressed = compressed;
@@ -174,14 +174,13 @@ pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool
                 entry.length = out_bytes;
 
                 if compressed {
-                    debug!("[writer] Skriver komprimerad fil {:?}", path);
                     entry.checksum = *blake3::hash(&data).as_bytes();
                     writer.write_all(&data)?;
                 } else {
-                    debug!("[writer] Skriver okomprimerad fil {:?}", path);
                     let mut file = File::open(&path)?;
                     let mut hasher = Hasher::new();
                     let mut buffer = [0u8; 1024 * 1024];
+                    let mut written = 0;
 
                     loop {
                         let n = file.read(&mut buffer)?;
@@ -190,11 +189,14 @@ pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool
                         }
                         writer.write_all(&buffer[..n])?;
                         hasher.update(&buffer[..n]);
+                        written += n;
                     }
 
                     entry.checksum = *hasher.finalize().as_bytes();
                 }
-                debug!("[writer] Klar med {:?}", path);
+
+                debug!("[writer] Skrev fil {:?} @ offset {} ({} bytes, komprimerad = {})",
+                    entry.relative_path, entry.offset, entry.length, entry.compressed);
             }
 
             let index_bytes = bincode::encode_to_vec(&entries, bincode::config::standard())?;
@@ -203,7 +205,6 @@ pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool
             writer.seek(SeekFrom::Start(0))?;
             writer.write_all(&index_len.to_le_bytes())?;
             writer.flush()?;
-            debug!("[writer] Skrev index på {} bytes, klart", index_len);
             Ok((entries, index_len))
         }
     });

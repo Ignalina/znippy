@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use blake3::Hasher;
 use bincode::{config::standard, decode_from_slice};
 use log::debug;
