@@ -8,7 +8,7 @@ use log::debug;
 
 use crate::FileEntry;
 
-pub fn read_snippy_index(file: &mut File) -> Result<Vec<FileEntry>> {
+pub fn read_znippy_index(file: &mut File) -> Result<Vec<FileEntry>> {
     let mut reader = BufReader::new(file);
     let mut len_buf = [0u8; 8];
     reader.read_exact(&mut len_buf)?;
@@ -25,7 +25,7 @@ pub fn read_snippy_index(file: &mut File) -> Result<Vec<FileEntry>> {
 
 pub fn verify_archive_integrity(mut file: File) -> Result<()> {
     debug!("[verify] Läser index...");
-    let entries = read_snippy_index(&mut file)?;
+    let entries = read_znippy_index(&mut file)?;
     debug!("[verify] Läste {} poster", entries.len());
 
     let mut verified_count = 0;
@@ -65,7 +65,7 @@ pub fn verify_archive_integrity(mut file: File) -> Result<()> {
 }
 
 pub fn list_archive_contents(mut file: File) -> Result<()> {
-    let entries = read_snippy_index(&mut file)?;
+    let entries = read_znippy_index(&mut file)?;
 
     for entry in entries {
         println!(

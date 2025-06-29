@@ -5,7 +5,7 @@ pub mod common_config;
 use serde::{Serialize, Deserialize};
 
 pub use file_entry::{is_probably_compressed, should_skip_compression, FileEntry};
-pub use index::{list_archive_contents, read_snippy_index, verify_archive_integrity};
+pub use index::{list_archive_contents, read_znippy_index, verify_archive_integrity};
 
 #[derive(Debug, Clone)]
 pub struct StrategicConfig {
