@@ -1,14 +1,12 @@
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use blake3::Hasher;
 use bincode::{config::standard, decode_from_slice};
-
-use anyhow::{bail};
 use log::debug;
 
-use crate::{FileEntry};
+use crate::FileEntry;
 
 pub fn read_snippy_index(file: &mut File) -> Result<Vec<FileEntry>> {
     let mut reader = BufReader::new(file);
@@ -24,7 +22,6 @@ pub fn read_snippy_index(file: &mut File) -> Result<Vec<FileEntry>> {
 
     Ok(entries)
 }
-
 
 pub fn verify_archive_integrity(mut file: File) -> Result<()> {
     debug!("[verify] Läser index...");

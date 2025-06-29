@@ -35,7 +35,7 @@ pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool
         }
     }
 
-    let entries: Vec<FileEntry> = all_paths
+    let mut entries: Vec<FileEntry> = all_paths
         .iter()
         .map(|path| FileEntry {
             relative_path: path.strip_prefix(input_dir).unwrap().to_path_buf(),
@@ -72,7 +72,7 @@ pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool
             thread::spawn(move || {
                 for (i, pathbuf) in rx.iter() {
                     let should_compress = !skip_compression && !should_skip_compression(&pathbuf);
-                    debug!("[compressor-{thread_id}] Behandlar fil {:?} (index {}), skip_compression = {}, should_skip = {}", pathbuf, i, skip_compression, !should_compress);
+                    debug!("[compressor-{thread_id}] Behandlar fil {:?} (index {})", pathbuf, i);
 
                     let mut file = match File::open(&pathbuf) {
                         Ok(f) => f,
@@ -138,7 +138,7 @@ pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool
                         compressed_bytes.fetch_add(dst_len, Ordering::SeqCst);
                         num_compressed.fetch_add(1, Ordering::SeqCst);
 
-                        debug!("[compressor-{thread_id}] Skickar komprimerad fil {} ({} bytes)", pathbuf.display(), dst_len);
+                        debug!("[compressor-{thread_id}] Skickar KOMPRIMERAD fil {} ({} bytes)", pathbuf.display(), dst_len);
                         tx.send((i, dst, true, pathbuf, input_len as u64, dst_len)).unwrap();
                     } else {
                         let mut total = 0u64;
@@ -152,7 +152,7 @@ pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool
                         uncompressed_bytes.fetch_add(total, Ordering::SeqCst);
                         num_uncompressed.fetch_add(1, Ordering::SeqCst);
 
-                        debug!("[compressor-{thread_id}] Skickar okomprimerad fil {} ({} bytes)", pathbuf.display(), total);
+                        debug!("[compressor-{thread_id}] Skickar OKOMPRIMERAD fil {} ({} bytes)", pathbuf.display(), total);
                         tx.send((i, Vec::new(), false, pathbuf, total, total)).unwrap();
                     }
                 }
@@ -162,10 +162,11 @@ pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool
 
     let writer_handle = thread::spawn({
         let mut writer = writer;
-        let mut entries = entries;
         move || -> Result<(Vec<FileEntry>, u64)> {
+            debug!("[writer] Initierar skrivning...");
             writer.seek(SeekFrom::Start(8))?;
             for (i, data, compressed, path, in_bytes, out_bytes) in rx_writer.iter() {
+                debug!("[writer] Fil index {}: {:?} ({} -> {} bytes, compressed={})", i, path, in_bytes, out_bytes, compressed);
                 let entry = &mut entries[i];
                 entry.offset = writer.seek(SeekFrom::Current(0))?;
                 entry.compressed = compressed;
@@ -173,13 +174,14 @@ pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool
                 entry.length = out_bytes;
 
                 if compressed {
+                    debug!("[writer] Skriver komprimerad fil {:?}", path);
                     entry.checksum = *blake3::hash(&data).as_bytes();
                     writer.write_all(&data)?;
                 } else {
+                    debug!("[writer] Skriver okomprimerad fil {:?}", path);
                     let mut file = File::open(&path)?;
                     let mut hasher = Hasher::new();
                     let mut buffer = [0u8; 1024 * 1024];
-                    let mut written = 0;
 
                     loop {
                         let n = file.read(&mut buffer)?;
@@ -188,11 +190,11 @@ pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool
                         }
                         writer.write_all(&buffer[..n])?;
                         hasher.update(&buffer[..n]);
-                        written += n;
                     }
 
                     entry.checksum = *hasher.finalize().as_bytes();
                 }
+                debug!("[writer] Klar med {:?}", path);
             }
 
             let index_bytes = bincode::encode_to_vec(&entries, bincode::config::standard())?;
@@ -201,6 +203,7 @@ pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool
             writer.seek(SeekFrom::Start(0))?;
             writer.write_all(&index_len.to_le_bytes())?;
             writer.flush()?;
+            debug!("[writer] Skrev index på {} bytes, klart", index_len);
             Ok((entries, index_len))
         }
     });
@@ -231,12 +234,12 @@ pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool
 
     let (entries, _index_len) = writer_handle.join().unwrap()?;
 
-    let total_in = uncompressed_bytes.load(Ordering::SeqCst);
-    let total_out = compressed_bytes.load(Ordering::SeqCst)
+    let total_bytes_in = uncompressed_bytes.load(Ordering::SeqCst);
+    let total_bytes_out = compressed_bytes.load(Ordering::SeqCst)
         + entries.iter().filter(|e| !e.compressed).map(|e| e.length).sum::<u64>();
 
-    let ratio = if total_in > 0 {
-        (compressed_bytes.load(Ordering::SeqCst) as f32 / total_in as f32) * 100.0
+    let ratio = if total_bytes_in > 0 {
+        (compressed_bytes.load(Ordering::SeqCst) as f32 / total_bytes_in as f32) * 100.0
     } else {
         0.0
     };
@@ -246,10 +249,10 @@ pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool
         total_dirs,
         compressed_files: num_compressed.load(Ordering::SeqCst) as usize,
         uncompressed_files: num_uncompressed.load(Ordering::SeqCst) as usize,
-        total_bytes_in: total_in,
-        total_bytes_out: total_out,
+        total_bytes_in,
+        total_bytes_out,
         compressed_bytes: compressed_bytes.load(Ordering::SeqCst),
-        uncompressed_bytes: total_out - compressed_bytes.load(Ordering::SeqCst),
+        uncompressed_bytes: total_bytes_out - compressed_bytes.load(Ordering::SeqCst),
         compression_ratio: ratio,
     })
 }
