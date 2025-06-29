@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-/// Metadata om en fil i ett `.snippy`-arkiv.
+/// Metadata om en fil i ett `.znippy`-arkiv.
 use bincode::{Encode, Decode};
 
 #[derive(Debug, Clone, Encode, Decode)]

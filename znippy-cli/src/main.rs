@@ -4,11 +4,11 @@ use anyhow::Result;
 
 use compress::compress_dir;
 use decompress::decompress_archive;
-use snippy_common::{verify_archive_integrity, list_archive_contents};
+use znippy_common::{verify_archive_integrity, list_archive_contents};
 
 #[derive(Parser)]
-#[command(name = "snippy")]
-#[command(about = "Snippy: fast archive format with per-file compression", long_about = None)]
+#[command(name = "znippy")]
+#[command(about = "Znippy: fast archive format with per-file compression", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -16,13 +16,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Compress a directory into a .snippy archive
+    /// Compress a directory into a .znippy archive
     Compress {
         /// Input directory
         #[arg(short, long)]
         input: PathBuf,
 
-        /// Output archive file (.snippy)
+        /// Output archive file (.znippy)
         #[arg(short, long)]
         output: PathBuf,
 
@@ -31,9 +31,9 @@ enum Commands {
         no_skip: bool,
     },
 
-    /// Decompress a .snippy archive
+    /// Decompress a .znippy archive
     Decompress {
-        /// Input archive file (.snippy)
+        /// Input archive file (.znippy)
         #[arg(short, long)]
         input: PathBuf,
 
@@ -42,16 +42,16 @@ enum Commands {
         output: PathBuf,
     },
 
-    /// List contents of a .snippy archive
+    /// List contents of a .znippy archive
     List {
-        /// Input archive file (.snippy)
+        /// Input archive file (.znippy)
         #[arg(short, long)]
         input: PathBuf,
     },
 
     /// Verify archive integrity (checksum)
     Verify {
-        /// Input archive file (.snippy)
+        /// Input archive file (.znippy)
         #[arg(short, long)]
         input: PathBuf,
     },

@@ -12,7 +12,7 @@ blake3 = "1.8.2"
 zstd-sys = { path = "../zstd-sys-patched" }
 rayon = "1.10.0"
 walkdir = "2.5.0"
-snippy-common = { path = "../snippy-common" }
+znippy-common = { path = "../znippy-common" }
 log = "0.4.27"
 parking_lot = "0.12.4"
 crossbeam-channel = "0.5.15"

@@ -13,12 +13,12 @@ use log::debug;
 use rayon::prelude::*;
 use zstd_sys::*;
 
-use snippy_common::{common_config::CONFIG, read_snippy_index, FileEntry};
+use znippy_common::{common_config::CONFIG, read_znippy_index, FileEntry};
 
 pub fn decompress_archive(archive_path: &Path, output_dir: &Path) -> Result<()> {
     debug!("[decompress_archive] Reading index from {:?}", archive_path);
     let archive_file = File::open(archive_path)?;
-    let entries = read_snippy_index(&mut archive_file.try_clone()?)?;
+    let entries = read_znippy_index(&mut archive_file.try_clone()?)?;
     let archive_path = Arc::new(archive_path.to_path_buf());
 
     let (tx, rx): (Sender<usize>, Receiver<usize>) = bounded(CONFIG.max_core_in_flight);

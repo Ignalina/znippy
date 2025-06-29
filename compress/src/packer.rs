@@ -20,7 +20,7 @@ use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use walkdir::WalkDir;
 use zstd_sys::*;
 
-use snippy_common::{common_config::CONFIG, CompressionReport, FileEntry, should_skip_compression};
+use znippy_common::{common_config::CONFIG, CompressionReport, FileEntry, should_skip_compression};
 
 pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool) -> Result<CompressionReport> {
     debug!("[compress_dir] Startar komprimering från {:?} till {:?}", input_dir, output_file);
