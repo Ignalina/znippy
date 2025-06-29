@@ -57,8 +57,8 @@ pub fn decompress_archive(archive_path: &Path, output_dir: &Path) -> Result<()> 
                             .open(&out_path)
                             .unwrap();
 
-                        let mut in_buf = vec![0u8; 1 << 16];  // 64 KiB
-                        let mut out_buf = vec![0u8; 1 << 16]; // 64 KiB
+                        let mut in_buf = vec![0u8; 1024*1024];  // 64 KiB
+                        let mut out_buf = vec![0u8; 1024*1024]; // 64 KiB
                         let mut hasher = Hasher::new();
 
                         let mut z_in = ZSTD_inBuffer {

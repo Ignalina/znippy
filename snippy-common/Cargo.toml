@@ -11,3 +11,6 @@ sysinfo = { version = "0.35.2", features = ["multithread"] }
 once_cell = "1.21.3"
 num_cpus = "1.17.0"
 serde = { version = "1.0.219", features = ["derive"] }
+log = "0.4.27"
+hex = "0.4.3"
+
