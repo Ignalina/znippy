@@ -63,7 +63,17 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Compress { input, output, no_skip } => {
-            compress_dir(&input, &output, !no_skip)?;
+            let report = compress_dir(&input, &output, !no_skip)?;
+            println!("\n✅ Komprimering klar:");
+            println!("📁 Totalt antal filer:         {}", report.total_files);
+            println!("📂 Totalt antal kataloger:     {}", report.total_dirs);
+            println!("📦 Filer komprimerade:         {}", report.compressed_files);
+            println!("📄 Filer ej komprimerade:      {}", report.uncompressed_files);
+            println!("📥 Totalt inlästa bytes:       {}", report.total_bytes_in);
+            println!("📤 Totalt skrivna bytes:       {}", report.total_bytes_out);
+            println!("📉 Bytes som komprimerades:    {}", report.compressed_bytes);
+            println!("📃 Bytes ej komprimerade:      {}", report.uncompressed_bytes);
+            println!("📊 Komprimeringsgrad:          {:.2}%", report.compression_ratio);
         }
         Commands::Decompress { input, output } => {
             decompress_archive(&input, &output)?;

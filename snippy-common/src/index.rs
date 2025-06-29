@@ -5,7 +5,10 @@ use anyhow::{Context, Result};
 use blake3::Hasher;
 use bincode::{config::standard, decode_from_slice};
 
-use crate::file_entry::FileEntry;
+use anyhow::{bail};
+use log::debug;
+
+use crate::{FileEntry};
 
 pub fn read_snippy_index(file: &mut File) -> Result<Vec<FileEntry>> {
     let mut reader = BufReader::new(file);
@@ -22,23 +25,45 @@ pub fn read_snippy_index(file: &mut File) -> Result<Vec<FileEntry>> {
     Ok(entries)
 }
 
+
 pub fn verify_archive_integrity(mut file: File) -> Result<()> {
+    debug!("[verify] Läser index...");
     let entries = read_snippy_index(&mut file)?;
+    debug!("[verify] Läste {} poster", entries.len());
 
-    for entry in &entries {
+    let mut verified_count = 0;
+
+    for (i, entry) in entries.iter().enumerate() {
         file.seek(SeekFrom::Start(entry.offset))?;
-        let mut buffer = vec![0u8; entry.uncompressed_size as usize];
-        file.read_exact(&mut buffer)?;
+        let mut reader = (&mut file).take(entry.length);
 
-        let hash = blake3::hash(&buffer);
-        if hash.as_bytes() != &entry.checksum {
-            anyhow::bail!(
-                "Checksum mismatch for file {:?}",
-                entry.relative_path
+        let mut hasher = Hasher::new();
+        let mut buffer = [0u8; 8192];
+
+        loop {
+            let n = reader.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buffer[..n]);
+        }
+
+        let actual = hasher.finalize();
+        if actual.as_bytes() != &entry.checksum {
+            bail!(
+                "❌ Felaktig kontrollsumma för {:?} (index {}):\nFörväntad: {}\nFick:      {}",
+                entry.relative_path,
+                i,
+                hex::encode(entry.checksum),
+                actual.to_hex()
             );
         }
+
+        verified_count += 1;
+        debug!("[verify] OK: {:?} (index {})", entry.relative_path, i);
     }
 
+    println!("✅ Arkivet är korrekt (alla {} checksummor matchar).", verified_count);
     Ok(())
 }
 
