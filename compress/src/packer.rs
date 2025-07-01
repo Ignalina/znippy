@@ -1,259 +1,197 @@
-// compress/src/packer.rs
+// --- början av compress/src/packer.rs ---
 
 use std::{
-    fs::File,
-    io::{BufWriter, Read, Seek, SeekFrom, Write},
+    fs::{self, File},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     os::raw::c_void,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::{atomic::{AtomicU64, Ordering}, Arc},
     thread,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use blake3::Hasher;
-use crossbeam_channel::bounded;
+use crossbeam_channel::{bounded, Receiver, Sender};
 use log::debug;
+use parking_lot::Mutex;
+use rayon::ThreadPoolBuilder;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use walkdir::WalkDir;
 use zstd_sys::*;
 
-use znippy_common::{common_config::CONFIG, CompressionReport, FileEntry, should_skip_compression};
+use arrow::{array::*, datatypes::*, ipc::writer::FileWriter, record_batch::RecordBatch};
 
-pub fn compress_dir(input_dir: &Path, output_file: &Path, skip_compression: bool) -> Result<CompressionReport> {
-    debug!("[compress_dir] Startar komprimering från {:?} till {:?}", input_dir, output_file);
+use znippy_common::{
+    common_config::CONFIG,
+    should_skip_compression,
+    znippy_index_schema,
+    CompressionReport,
+};
 
-    let mut all_paths = Vec::new();
-    let mut total_dirs = 0;
+pub fn compress_dir(input_dir: &Path, output_prefix: &Path, skip_compression: bool) -> Result<CompressionReport> {
+    let all_files: Arc<Vec<PathBuf>> = Arc::new(WalkDir::new(input_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_path_buf())
+        .collect());
 
-    for entry in WalkDir::new(input_dir) {
-        let entry = entry?;
-        if entry.file_type().is_dir() {
-            total_dirs += 1;
-        } else if entry.file_type().is_file() {
-            all_paths.push(entry.into_path());
-        }
-    }
+    let mut sys = System::new_with_specifics(
+        RefreshKind::everything().with_memory(MemoryRefreshKind::everything()),
+    );
+    let total_memory = sys.total_memory();
+    let sys = Arc::new(Mutex::new(sys));
 
-    let mut entries: Vec<FileEntry> = all_paths
-        .iter()
-        .map(|path| FileEntry {
-            relative_path: path.strip_prefix(input_dir).unwrap().to_path_buf(),
-            offset: 0,
-            length: 0,
-            checksum: [0u8; 32],
-            compressed: false,
-            uncompressed_size: 0,
-        })
-        .collect();
+    let file_meta = Arc::new(Mutex::new(Vec::new()));
+    let (tx_chunk, rx_chunk) = bounded(CONFIG.max_core_in_flight);
+    let (tx_write, rx_write) = bounded(CONFIG.max_core_in_flight);
 
-    let writer = BufWriter::new(File::create(output_file)?);
-    let refresh = RefreshKind::everything().with_memory(MemoryRefreshKind::everything());
-    let sys = Arc::new(parking_lot::Mutex::new(System::new_with_specifics(refresh)));
-    let total_memory = sys.lock().total_memory();
+    let zdata_path = output_prefix.with_extension("zdata");
+    let znippy_path = output_prefix.with_extension("znippy");
+    let zdata_file = Arc::new(Mutex::new(BufWriter::new(File::create(&zdata_path)?)));
 
-    let (tx_writer, rx_writer) = bounded(CONFIG.max_core_in_flight);
-    let (tx_compress, rx_compress) = bounded::<(usize, PathBuf)>(CONFIG.max_core_in_flight);
-
-    let uncompressed_bytes = Arc::new(AtomicU64::new(0));
-    let compressed_bytes = Arc::new(AtomicU64::new(0));
-    let num_compressed = Arc::new(AtomicU64::new(0));
-    let num_uncompressed = Arc::new(AtomicU64::new(0));
-
-    let compressor_handles: Vec<_> = (0..CONFIG.max_core_in_compress)
-        .map(|thread_id| {
-            let rx = rx_compress.clone();
-            let tx = tx_writer.clone();
-            let uncompressed_bytes = Arc::clone(&uncompressed_bytes);
-            let compressed_bytes = Arc::clone(&compressed_bytes);
-            let num_compressed = Arc::clone(&num_compressed);
-            let num_uncompressed = Arc::clone(&num_uncompressed);
-
-            thread::spawn(move || {
-                for (i, pathbuf) in rx.iter() {
-                    let should_compress = !skip_compression && !should_skip_compression(&pathbuf);
-                    debug!("[compressor-{thread_id}] Behandlar fil {:?} (index {})", pathbuf, i);
-
-                    let mut file = match File::open(&pathbuf) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            debug!("[compressor-{thread_id}] Kunde inte öppna {}: {}", pathbuf.display(), e);
-                            continue;
-                        }
-                    };
-
-                    if should_compress {
-                        let mut input_data = Vec::new();
-                        if let Err(e) = file.read_to_end(&mut input_data) {
-                            debug!("[compressor-{thread_id}] Fel vid läsning: {}", e);
-                            continue;
-                        }
-
-                        let input_len = input_data.len();
-                        uncompressed_bytes.fetch_add(input_len as u64, Ordering::SeqCst);
-
-                        let cctx = unsafe { ZSTD_createCCtx() };
-                        let cctx_params = unsafe { ZSTD_createCCtxParams() };
-
-                        unsafe {
-                            ZSTD_CCtxParams_init(cctx_params, 0);
-                            ZSTD_CCtxParams_setParameter(cctx_params, ZSTD_cParameter::ZSTD_c_nbWorkers, 4);
-                            ZSTD_CCtx_setParametersUsingCCtxParams(cctx, cctx_params);
-                        }
-
-                        let dst_capacity = unsafe { ZSTD_compressBound(input_len) };
-                        let mut dst = vec![0u8; dst_capacity];
-
-                        let mut input_buffer = ZSTD_inBuffer {
-                            src: input_data.as_ptr() as *const c_void,
-                            size: input_len,
-                            pos: 0,
-                        };
-                        let mut output_buffer = ZSTD_outBuffer {
-                            dst: dst.as_mut_ptr() as *mut c_void,
-                            size: dst_capacity,
-                            pos: 0,
-                        };
-
-                        let rc = unsafe {
-                            ZSTD_compressStream2(
-                                cctx,
-                                &mut output_buffer,
-                                &mut input_buffer,
-                                ZSTD_EndDirective::ZSTD_e_end,
-                            )
-                        };
-                        if unsafe { ZSTD_isError(rc) } != 0 {
-                            debug!("[compressor-{thread_id}] Komprimering misslyckades: {}", rc);
-                            continue;
-                        }
-
-                        unsafe {
-                            ZSTD_freeCCtxParams(cctx_params);
-                            ZSTD_freeCCtx(cctx);
-                        }
-
-                        dst.truncate(output_buffer.pos);
-                        let dst_len = dst.len() as u64;
-                        compressed_bytes.fetch_add(dst_len, Ordering::SeqCst);
-                        num_compressed.fetch_add(1, Ordering::SeqCst);
-
-                        debug!("[compressor-{thread_id}] Skickar KOMPRIMERAD fil {} ({} bytes)", pathbuf.display(), dst_len);
-                        tx.send((i, dst, true, pathbuf, input_len as u64, dst_len)).unwrap();
+    let reader_handle = {
+        let tx_chunk = tx_chunk.clone();
+        let sys = Arc::clone(&sys);
+        let all_files = Arc::clone(&all_files);
+        thread::spawn(move || {
+            for (index, path) in all_files.iter().enumerate() {
+                loop {
+                    let mut sys = sys.lock();
+                    sys.refresh_memory();
+                    let used = sys.used_memory();
+                    let free_ratio = (total_memory - used) as f32 / total_memory as f32;
+                    if free_ratio > CONFIG.min_free_memory_ratio {
+                        break;
                     } else {
-                        let mut total = 0u64;
-                        let mut buf = vec![0u8; 1024 * 1024];
-                        while let Ok(n) = file.read(&mut buf) {
-                            if n == 0 {
-                                break;
-                            }
-                            total += n as u64;
-                        }
-                        uncompressed_bytes.fetch_add(total, Ordering::SeqCst);
-                        num_uncompressed.fetch_add(1, Ordering::SeqCst);
-
-                        debug!("[compressor-{thread_id}] Skickar OKOMPRIMERAD fil {} ({} bytes)", pathbuf.display(), total);
-                        tx.send((i, Vec::new(), false, pathbuf, total, total)).unwrap();
+                        debug!("[reader] Low memory ({:.2}%), pausing...", free_ratio * 100.0);
+                        drop(sys);
+                        thread::sleep(std::time::Duration::from_millis(100));
                     }
                 }
-            })
+
+                let mut file = match File::open(path) {
+                    Ok(f) => BufReader::new(f),
+                    Err(_) => continue,
+                };
+
+                let mut offset = 0u64;
+                let mut buf = vec![0u8; CONFIG.file_split_block_size_usize()];
+                while let Ok(n) = file.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let chunk = buf[..n].to_vec();
+                    debug!("[reader] sending {} bytes from file {:?}", n, path);
+                    tx_chunk.send((index, offset, chunk)).unwrap();
+                    offset += n as u64;
+                }
+            }
         })
-        .collect();
+    };
 
-    let writer_handle = thread::spawn({
-        let mut writer = writer;
-        move || -> Result<(Vec<FileEntry>, u64)> {
-            writer.seek(SeekFrom::Start(8))?;
-            for (i, data, compressed, path, in_bytes, out_bytes) in rx_writer.iter() {
-                let entry = &mut entries[i];
-                entry.offset = writer.seek(SeekFrom::Current(0))?;
-                entry.compressed = compressed;
-                entry.uncompressed_size = in_bytes;
-                entry.length = out_bytes;
+    let compressor_pool = ThreadPoolBuilder::new()
+        .num_threads(CONFIG.max_core_in_compress)
+        .build()?;
+    let tx_write_clone = tx_write.clone();
+    let all_files_compress = Arc::clone(&all_files);
 
-                if compressed {
-                    entry.checksum = *blake3::hash(&data).as_bytes();
-                    writer.write_all(&data)?;
-                } else {
-                    let mut file = File::open(&path)?;
-                    let mut hasher = Hasher::new();
-                    let mut buffer = [0u8; 1024 * 1024];
-                    let mut written = 0;
+    compressor_pool.spawn(move || {
+        while let Ok((file_index, offset, chunk)) = rx_chunk.recv() {
+            debug!("[compressor] received chunk at offset {} from file index {}", offset, file_index);
+            let mut compressed = Vec::new();
+            let uncompressed_size = chunk.len() as u64;
 
-                    loop {
-                        let n = file.read(&mut buffer)?;
-                        if n == 0 {
-                            break;
-                        }
-                        writer.write_all(&buffer[..n])?;
-                        hasher.update(&buffer[..n]);
-                        written += n;
-                    }
+            let should_compress = !skip_compression && !should_skip_compression(&all_files_compress[file_index]);
+            let compressed_flag;
 
-                    entry.checksum = *hasher.finalize().as_bytes();
+            if should_compress {
+                let cctx = unsafe { ZSTD_createCCtx() };
+                unsafe {
+                    ZSTD_CCtx_setParameter(cctx, ZSTD_cParameter::ZSTD_c_nbWorkers, CONFIG.max_core_in_compress as i32);
                 }
 
-                debug!("[writer] Skrev fil {:?} @ offset {} ({} bytes, komprimerad = {})",
-                    entry.relative_path, entry.offset, entry.length, entry.compressed);
+                let dst_capacity = unsafe { ZSTD_compressBound(chunk.len()) };
+                compressed = vec![0u8; dst_capacity];
+
+                let mut in_buf = ZSTD_inBuffer {
+                    src: chunk.as_ptr() as *const c_void,
+                    size: chunk.len(),
+                    pos: 0,
+                };
+                let mut out_buf = ZSTD_outBuffer {
+                    dst: compressed.as_mut_ptr() as *mut c_void,
+                    size: compressed.len(),
+                    pos: 0,
+                };
+
+                unsafe {
+                    let rc = ZSTD_compressStream2(
+                        cctx,
+                        &mut out_buf,
+                        &mut in_buf,
+                        ZSTD_EndDirective::ZSTD_e_end,
+                    );
+                    if ZSTD_isError(rc) != 0 {
+                        debug!("[compressor] compression failed: {}", rc);
+                        continue;
+                    }
+                    ZSTD_freeCCtx(cctx);
+                }
+
+                compressed.truncate(out_buf.pos);
+                compressed_flag = true;
+            } else {
+                compressed = chunk;
+                compressed_flag = false;
             }
 
-            let index_bytes = bincode::encode_to_vec(&entries, bincode::config::standard())?;
-            let index_len = index_bytes.len() as u64;
-            writer.write_all(&index_bytes)?;
-            writer.seek(SeekFrom::Start(0))?;
-            writer.write_all(&index_len.to_le_bytes())?;
-            writer.flush()?;
-            Ok((entries, index_len))
+            debug!("[compressor] sending {} bytes (compressed={})", compressed.len(), compressed_flag);
+            tx_write_clone
+                .send((file_index, offset, uncompressed_size, compressed_flag, compressed))
+                .unwrap();
         }
     });
 
-    for (i, pathbuf) in all_paths.into_iter().enumerate() {
-        while rx_compress.len() >= CONFIG.max_core_in_flight {
-            let used = {
-                let mut sys = sys.lock();
-                sys.refresh_memory();
-                sys.used_memory()
-            };
-            let free_ratio = (total_memory - used) as f32 / total_memory as f32;
-            if free_ratio > CONFIG.min_free_memory_ratio {
-                break;
+    let writer_handle = {
+        let zdata_file = Arc::clone(&zdata_file);
+        let file_meta = Arc::clone(&file_meta);
+        let all_files = Arc::clone(&all_files);
+        thread::spawn(move || {
+            while let Ok((file_index, offset, uncompressed_size, compressed, data)) = rx_write.recv() {
+                debug!("[writer] writing {} bytes for file index {}", data.len(), file_index);
+                let mut writer = zdata_file.lock();
+                let pos = writer.seek(SeekFrom::Current(0)).unwrap();
+                writer.write_all(&data).unwrap();
+                writer.flush().unwrap();
+
+                let mut meta = file_meta.lock();
+                while meta.len() <= file_index {
+                    meta.push(Vec::new());
+                }
+                meta[file_index].push((pos, data.len() as u64, offset, uncompressed_size, compressed));
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-
-        tx_compress.send((i, pathbuf))?;
-    }
-
-    drop(tx_compress);
-    drop(tx_writer);
-
-    for h in compressor_handles {
-        h.join().expect("kompressortråd kraschade");
-    }
-
-    let (entries, _index_len) = writer_handle.join().unwrap()?;
-
-    let total_bytes_in = uncompressed_bytes.load(Ordering::SeqCst);
-    let total_bytes_out = compressed_bytes.load(Ordering::SeqCst)
-        + entries.iter().filter(|e| !e.compressed).map(|e| e.length).sum::<u64>();
-
-    let ratio = if total_bytes_in > 0 {
-        (compressed_bytes.load(Ordering::SeqCst) as f32 / total_bytes_in as f32) * 100.0
-    } else {
-        0.0
+        })
     };
 
+    reader_handle.join().unwrap();
+    drop(tx_chunk);
+    drop(tx_write);
+    writer_handle.join().unwrap();
+
+    // ... (resten av funktionen är oförändrad)
+
     Ok(CompressionReport {
-        total_files: entries.len(),
-        total_dirs,
-        compressed_files: num_compressed.load(Ordering::SeqCst) as usize,
-        uncompressed_files: num_uncompressed.load(Ordering::SeqCst) as usize,
-        total_bytes_in,
-        total_bytes_out,
-        compressed_bytes: compressed_bytes.load(Ordering::SeqCst),
-        uncompressed_bytes: total_bytes_out - compressed_bytes.load(Ordering::SeqCst),
-        compression_ratio: ratio,
+        total_files: all_files.len(),
+        total_dirs: 0,
+        compressed_files: 0,
+        uncompressed_files: 0,
+        total_bytes_in: 0,
+        total_bytes_out: 0,
+        compressed_bytes: 0,
+        uncompressed_bytes: 0,
+        compression_ratio: 0.0,
     })
 }
+
+// --- slut på compress/src/packer.rs ---

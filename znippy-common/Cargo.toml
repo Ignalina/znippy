@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bincode = "2.0.1"
 anyhow = "1.0.98"
 blake3 = "1.8.2"
 sysinfo = { version = "0.35.2", features = ["multithread"] }
@@ -13,4 +12,9 @@ num_cpus = "1.17.0"
 serde = { version = "1.0.219", features = ["derive"] }
 log = "0.4.27"
 hex = "0.4.3"
-
+arrow = "55.2.0"
+zstd-sys = "2.0.15+zstd.1.5.7"
+crossbeam-channel = "0.5.15"
+rayon = "1.10.0"
+walkdir = "2.5.0"
+parking_lot = "0.12.4"
