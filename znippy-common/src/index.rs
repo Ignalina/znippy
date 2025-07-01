@@ -8,7 +8,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use arrow::datatypes::{DataType, Field, Fields, Schema};
-use arrow::array::{ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, ListBuilder, StringBuilder, StructBuilder, UInt64Builder, ArrayBuilder, FixedSizeBinaryArray, ListArray, StructArray, UInt64Array, StringArray, BooleanArray};
+use arrow::array::{ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, ListBuilder, StringBuilder, StructBuilder, UInt64Builder, ArrayBuilder, FixedSizeBinaryArray, ListArray, StructArray, UInt64Array, StringArray, BooleanArray, make_builder};
 use arrow::record_batch::RecordBatch;
 use arrow::ipc::reader::FileReader;
 use blake3::Hasher;
@@ -22,7 +22,7 @@ use crate::common_config::CONFIG;
 pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("relative_path", DataType::Utf8, false),
-        Field::new("compressed", DataType::Boolean, false),
+        Field::new("compressed", DataType::Boolean, true),
         Field::new("uncompressed_size", DataType::UInt64, false),
         Field::new("checksum", DataType::FixedSizeBinary(32), false),
         Field::new(
@@ -33,9 +33,9 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
                     Field::new("offset", DataType::UInt64, false),
                     Field::new("length", DataType::UInt64, false),
                 ])),
-                false,
+                true // <── change this from false to true
             ))),
-            false,
+            true,
         ),
     ]))
 });
@@ -63,6 +63,38 @@ pub fn should_skip_compression(path: &Path) -> bool {
     is_probably_compressed(path)
 }
 
+pub fn make_chunks_builder(capacity: usize) -> ListBuilder<StructBuilder> {
+    let chunk_struct_type = DataType::Struct(Fields::from(vec![
+        Field::new("offset", DataType::UInt64, false),
+        Field::new("length", DataType::UInt64, false),
+    ]));
+
+    let list_type = DataType::List(Arc::new(Field::new(
+        "item",
+        chunk_struct_type,
+        true, // nullable
+    )));
+
+    let builder_boxed = make_builder(&list_type, capacity);
+    let builder_any = builder_boxed
+        .as_any()
+        .downcast_ref::<ListBuilder<StructBuilder>>()
+        .expect("downcast to ListBuilder<StructBuilder> failed");
+
+    // Klonar buildern via explicit konstruktion
+    let inner_builder = StructBuilder::new(
+        Fields::from(vec![
+            Field::new("offset", DataType::UInt64, false),
+            Field::new("length", DataType::UInt64, false),
+        ]),
+        vec![
+            Box::new(UInt64Builder::new()),
+            Box::new(UInt64Builder::new()),
+        ],
+    );
+
+    ListBuilder::new(inner_builder)
+}
 pub fn build_arrow_batch(
     paths: &[PathBuf],
     metas: &[Vec<(u64, u64, u64, u64, bool)>],
@@ -72,20 +104,7 @@ pub fn build_arrow_batch(
     let mut uncompressed_size_builder = UInt64Builder::new();
     let mut checksum_builder = FixedSizeBinaryBuilder::new(32);
 
-    let chunk_struct_fields = Fields::from(vec![
-        Field::new("offset", DataType::UInt64, false),
-        Field::new("length", DataType::UInt64, false),
-    ]);
-
-    let chunk_struct_builder = StructBuilder::new(
-        chunk_struct_fields,
-        vec![
-            Box::new(UInt64Builder::new()) as Box<dyn ArrayBuilder>,
-            Box::new(UInt64Builder::new()) as Box<dyn ArrayBuilder>,
-        ],
-    );
-
-    let mut chunks_builder = ListBuilder::new(chunk_struct_builder);
+    let mut chunks_builder = make_chunks_builder(paths.len());
 
     for (i, path) in paths.iter().enumerate() {
         let chunks = &metas[i];
@@ -108,7 +127,7 @@ pub fn build_arrow_batch(
         checksum_builder.append_value(hash.as_bytes());
 
         if chunks.is_empty() {
-            chunks_builder.append(true);
+            chunks_builder.append_null()
         } else {
             for (offset, length, _, _, _) in chunks.iter() {
                 chunks_builder
@@ -121,8 +140,9 @@ pub fn build_arrow_batch(
                     .field_builder::<UInt64Builder>(1)
                     .unwrap()
                     .append_value(*length);
-                chunks_builder.append(true);
+                chunks_builder.values().append(true);
             }
+            chunks_builder.append(true);
         }
     }
 
