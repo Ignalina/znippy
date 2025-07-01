@@ -1,11 +1,16 @@
 use once_cell::sync::Lazy;
 use sysinfo::{System, RefreshKind, MemoryRefreshKind};
-
+impl StrategicConfig {
+    pub fn file_split_block_size_usize(&self) -> usize {
+        self.file_split_block_size.try_into().unwrap()
+    }
+}
 pub struct StrategicConfig {
     pub max_core_in_flight: usize,
     pub max_core_in_compress: usize,
     pub max_mem_allowed: u64,
     pub min_free_memory_ratio: f32,
+    pub file_split_block_size: u64
 }
 
 pub static CONFIG: Lazy<StrategicConfig> = Lazy::new(strategic_config);
@@ -45,5 +50,6 @@ fn strategic_config() -> StrategicConfig {
         max_core_in_compress,
         max_mem_allowed: total_memory,
         min_free_memory_ratio,
+        file_split_block_size: 10 * 1024 * 1024,
     }
 }
