@@ -36,7 +36,7 @@ pub fn compress_dir(input_dir: &Path, output_prefix: &Path, skip_compression: bo
         .map(|e| e.path().to_path_buf())
         .collect());
 
-    let mut sys = System::new_with_specifics(
+    let sys = System::new_with_specifics(
         RefreshKind::everything().with_memory(MemoryRefreshKind::everything()),
     );
     let total_memory = sys.total_memory();
