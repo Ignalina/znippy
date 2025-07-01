@@ -23,8 +23,8 @@ use arrow::{array::*, datatypes::*, ipc::writer::FileWriter, record_batch::Recor
 
 use znippy_common::{
     common_config::CONFIG,
+    index::{znippy_index_schema, build_arrow_batch},
     should_skip_compression,
-    znippy_index_schema,
     CompressionReport,
 };
 
@@ -179,7 +179,13 @@ pub fn compress_dir(input_dir: &Path, output_prefix: &Path, skip_compression: bo
     drop(tx_write);
     writer_handle.join().unwrap();
 
-    // ... (resten av funktionen är oförändrad)
+    let all_file_meta = file_meta.lock();
+    debug!("[main] building Arrow batch with {} file entries", all_file_meta.len());
+    let batch = build_arrow_batch(&all_files, &all_file_meta)?;
+    let mut index_file = BufWriter::new(File::create(&znippy_path)?);
+    let mut writer = FileWriter::try_new(&mut index_file, znippy_index_schema().as_ref())?;
+    writer.write(&batch)?;
+    writer.finish()?;
 
     Ok(CompressionReport {
         total_files: all_files.len(),

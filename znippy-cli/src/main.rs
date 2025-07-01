@@ -72,7 +72,7 @@ fn main() -> Result<()> {
         }
 
         Commands::Decompress { input, output } => {
-            let report: VerifyReport = verify_archive_integrity(&input, true, Some(output))?;
+            let report: VerifyReport = decompress_archive(&input,  &output)?;
             println!("\n✅ Dekomprimering och verifiering klar:");
             println!("📁 Totala filer:       {}", report.total_files);
             println!("🔐 Verifierade filer:  {}", report.verified_files);
@@ -87,7 +87,7 @@ fn main() -> Result<()> {
         }
 
         Commands::Verify { input } => {
-            let report: VerifyReport = verify_archive_integrity(&input, false, None)?;
+            let report: VerifyReport = verify_archive_integrity(&input)?;
             println!("\n🔍 Verifiering klar:");
             println!("📁 Totala filer:       {}", report.total_files);
             println!("🔐 Verifierade filer:  {}", report.verified_files);
