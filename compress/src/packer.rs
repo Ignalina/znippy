@@ -28,7 +28,7 @@ use znippy_common::{
     CompressionReport,
 };
 
-pub fn compress_dir(input_dir: &Path, output_prefix: &Path, skip_compression: bool) -> Result<CompressionReport> {
+pub fn compress_dir(input_dir: &Path, output_prefix: &Path, no_skip: bool) -> Result<CompressionReport> {
     let all_files: Arc<Vec<PathBuf>> = Arc::new(WalkDir::new(input_dir)
         .into_iter()
         .filter_map(Result::ok)
@@ -102,7 +102,7 @@ pub fn compress_dir(input_dir: &Path, output_prefix: &Path, skip_compression: bo
             let mut compressed = Vec::new();
             let uncompressed_size = chunk.len() as u64;
 
-            let should_compress = !skip_compression && !should_skip_compression(&all_files_compress[file_index]);
+            let should_compress = no_skip || !should_skip_compression(&all_files_compress[file_index]);
             let compressed_flag;
 
             if should_compress {
