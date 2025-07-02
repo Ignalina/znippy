@@ -3,7 +3,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::thread;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -11,7 +10,7 @@ use zstd_sys::*;
 
 use znippy_common::chunkpool::ChunkPool;
 use znippy_common::common_config::CONFIG;
-use znippy_common::{CompressionReport};
+use znippy_common::CompressionReport;
 use znippy_common::meta::{ChunkMeta, CompressionStats};
 use zstd_sys::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
 use zstd_sys::ZSTD_ResetDirective::ZSTD_reset_session_only;
@@ -31,9 +30,8 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
         .collect();
 
     let total_files = all_files.len();
-    let mut chunk_pool = ChunkPool::new();
 
-    let (tx_chunk, rx_chunk): (Sender<(usize, u32, Arc<[u8]>, usize)>, Receiver<_>) = unbounded();
+    let (tx_chunk, rx_chunk): (Sender<(usize, u32, usize)>, Receiver<_>) = unbounded();
     let (tx_compressed, rx_compressed): (Sender<(usize, u32, ChunkMeta, Vec<u8>)>, Receiver<_>) = unbounded();
     let (tx_return, rx_return): (Sender<u32>, Receiver<u32>) = unbounded();
 
@@ -47,6 +45,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
         let rx_done = rx_return.clone();
         let all_files = all_files.clone();
         thread::spawn(move || {
+            let mut chunk_pool = ChunkPool::new();
             for (file_index, path) in all_files.iter().enumerate() {
                 let file = match File::open(path) {
                     Ok(f) => f,
@@ -58,8 +57,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
                 let mut reader = BufReader::new(file);
                 loop {
                     let chunk_nr = chunk_pool.get_index();
-                    let mut buf_arc = chunk_pool.get_buffer(chunk_nr);
-                    let buf = Arc::get_mut(&mut buf_arc).expect("Reader must own unique Arc");
+                    let buf = chunk_pool.get_buffer_mut(chunk_nr);
                     let n = match reader.read(&mut buf[..]) {
                         Ok(0) => {
                             chunk_pool.return_index(chunk_nr);
@@ -73,9 +71,8 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
                         }
                     };
                     log::debug!("[reader] file {} → chunk {} ({} bytes)", file_index, chunk_nr, n);
-                    tx_chunk.send((file_index, chunk_nr, buf_arc.into(), n)).unwrap();
+                    tx_chunk.send((file_index, chunk_nr, n)).unwrap();
 
-                    // Block if all chunks are in use
                     if let Ok(returned) = rx_done.try_recv() {
                         chunk_pool.return_index(returned);
                     }
@@ -88,6 +85,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
     let compressor_thread = {
         let tx_ret = tx_return.clone();
         thread::spawn(move || {
+            let chunk_pool = ChunkPool::new();
             unsafe {
                 let cctx = ZSTD_createCCtx();
                 assert!(!cctx.is_null(), "ZSTD_createCCtx failed");
@@ -96,11 +94,11 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
                 ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, CONFIG.max_core_in_compress as i32);
                 log::info!("Compressor ready with level {} and {} workers", CONFIG.compression_level, CONFIG.max_core_in_compress);
 
-                while let Ok((file_index, chunk_nr, arc_buf, used)) = rx_chunk.recv() {
-                    let input_ptr = arc_buf.as_ptr();
+                while let Ok((file_index, chunk_nr, used)) = rx_chunk.recv() {
+                    let input_buf = chunk_pool.get_buffer(chunk_nr);
+                    let input_ptr = input_buf.as_ptr();
 
                     let mut output = vec![0u8; CONFIG.zstd_output_buffer_size];
-                    let mut total_written = 0usize;
 
                     ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only);
 
@@ -128,7 +126,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
                         panic!("ZSTD error: {}", err_str.to_string_lossy());
                     }
 
-                    total_written = output_buffer.pos;
+                    let total_written = output_buffer.pos;
                     let chunk_meta = ChunkMeta {
                         offset: 0,
                         length: total_written as u64,
@@ -177,7 +175,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
     compressor_thread.join().unwrap();
     let stats = writer_thread.join().unwrap();
 
-    let compressed_files = stats.total_chunks; // simplification
+    let compressed_files = stats.total_chunks;
 
     let report = CompressionReport {
         total_files,

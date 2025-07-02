@@ -44,3 +44,11 @@ impl ChunkPool {
         Arc::clone(&self.buffers[index as usize])
     }
 }
+impl ChunkPool {
+    pub fn get_buffer_mut(&mut self, chunk_nr: u32) -> &mut [u8] {
+        let boxed = &mut self.buffers[chunk_nr as usize];
+        Arc::get_mut(boxed)
+            .expect("Only the reader thread should access buffers mutably")
+            .as_mut()
+    }
+}
