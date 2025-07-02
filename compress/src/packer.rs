@@ -3,7 +3,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crossbeam_channel::{bounded, unbounded};
 use zstd_sys::*;
@@ -13,14 +13,13 @@ use znippy_common::common_config::CONFIG;
 use znippy_common::meta::{ChunkMeta, CompressionStats};
 
 pub fn compress_dir(all_files: Vec<PathBuf>) -> anyhow::Result<()> {
-    let chunk_size = CONFIG.file_split_block_size as usize;
     let chunk_pool = Arc::new(ChunkPool::<{ CONFIG.file_split_block_size as usize }>::new(CONFIG.max_chunks));
     let (tx_chunk, rx_chunk) = unbounded::<(usize, usize, usize)>();
     let (tx_compressed, rx_compressed) = unbounded::<(usize, usize, Vec<u8>, usize, usize)>();
     let (tx_meta, rx_meta) = unbounded::<(usize, ChunkMeta)>();
     let (tx_stats, rx_stats) = unbounded::<CompressionStats>();
 
-    log::info!("Starting compression with {} files, {} chunks, chunk size {} bytes", all_files.len(), CONFIG.max_chunks, chunk_size);
+    log::info!("Starting compression with {} files, {} chunks, chunk size {} bytes", all_files.len(), CONFIG.max_chunks, CONFIG.file_split_block_size);
 
     // Writer setup
     let zdata_file = OpenOptions::new()
@@ -28,7 +27,7 @@ pub fn compress_dir(all_files: Vec<PathBuf>) -> anyhow::Result<()> {
         .write(true)
         .truncate(true)
         .open(CONFIG.output_zdata_path())?;
-    let writer = Arc::new(Mutex::new(BufWriter::with_capacity(1 << 20, zdata_file)));
+    let writer = Arc::new(std::sync::Mutex::new(BufWriter::with_capacity(1 << 20, zdata_file)));
 
     // Reader thread
     {
