@@ -54,6 +54,8 @@ pub fn compress_dir(input_dir: &Path, output_prefix: &Path, no_skip: bool) -> Re
         let tx_chunk = tx_chunk.clone();
         let sys = Arc::clone(&sys);
         let all_files = Arc::clone(&all_files);
+
+
         thread::spawn(move || {
             for (index, path) in all_files.iter().enumerate() {
                 loop {

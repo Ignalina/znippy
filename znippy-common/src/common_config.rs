@@ -1,3 +1,4 @@
+use std::cmp::max;
 use once_cell::sync::Lazy;
 use sysinfo::{System, RefreshKind, MemoryRefreshKind};
 impl StrategicConfig {
@@ -11,6 +12,7 @@ pub struct StrategicConfig {
     pub max_mem_allowed: u64,
     pub min_free_memory_ratio: f32,
     pub file_split_block_size: u64,
+    pub max_chunks: u32,
     pub compression_level: i32
 }
 
@@ -28,7 +30,9 @@ fn strategic_config() -> StrategicConfig {
     let max_core_in_compress = cores.saturating_sub(max_core_in_flight);
     let min_free_memory_ratio = 0.25;
     let compression_level = 19;
-
+    let max_mem_allowed= ((total_memory as f32) * (1.0 - min_free_memory_ratio)) as u64;
+    let file_split_block_size=10 * 1024 * 102;
+    let max_chunks:u32= (max_mem_allowed / file_split_block_size) as u32;
     eprintln!(
         "[strategic_config] Detekterade {} kärnor och {} MiB minne",
         cores,
@@ -55,9 +59,10 @@ fn strategic_config() -> StrategicConfig {
     StrategicConfig {
         max_core_in_flight,
         max_core_in_compress,
-        max_mem_allowed: total_memory,
+        max_mem_allowed,
         min_free_memory_ratio,
-        file_split_block_size: 10 * 1024 * 1024,
-        compression_level
+        file_split_block_size,
+        compression_level,
+        max_chunks
     }
 }
