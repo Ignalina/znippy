@@ -140,7 +140,6 @@ pub fn compress_dir(input_dir: &Path, output_prefix: &Path, no_skip: bool) -> Re
                         debug!("[compressor] compression failed: {}", rc);
                         continue;
                     }
-                    ZSTD_freeCCtx(cctx);
                 }
 
                 compressed.truncate(out_buf.pos);
