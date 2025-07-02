@@ -58,7 +58,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Compress { input, output, no_skip } => {
-            let report = compress_dir(&input, &output, !no_skip)?;
+            let report = compress_dir(&input, &output)?;
             println!("\n✅ Komprimering klar:");
             println!("📁 Totalt antal filer:         {}", report.total_files);
             println!("📂 Totalt antal kataloger:     {}", report.total_dirs);
