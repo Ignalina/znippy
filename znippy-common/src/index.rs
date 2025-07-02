@@ -16,7 +16,6 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use zstd_sys::ZSTD_decompress;
 use crate::common_config::CONFIG;
-
 // === Arrow-schema ===
 
 pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
