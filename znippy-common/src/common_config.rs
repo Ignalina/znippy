@@ -13,7 +13,8 @@ pub struct StrategicConfig {
     pub min_free_memory_ratio: f32,
     pub file_split_block_size: u64,
     pub max_chunks: u32,
-    pub compression_level: i32
+    pub compression_level: i32,
+    pub zstd_output_buffer_size: usize,
 }
 
 pub static CONFIG: Lazy<StrategicConfig> = Lazy::new(strategic_config);
@@ -31,7 +32,9 @@ fn strategic_config() -> StrategicConfig {
     let min_free_memory_ratio = 0.25;
     let compression_level = 19;
     let max_mem_allowed= ((total_memory as f32) * (1.0 - min_free_memory_ratio)) as u64;
-    let file_split_block_size=10 * 1024 * 102;
+    let file_split_block_size=10 * 1024 * 1024;
+    let zstd_output_buffer_size = 1 * 1024 * 1024;
+    
     let max_chunks:u32= (max_mem_allowed / file_split_block_size) as u32;
     eprintln!(
         "[strategic_config] Detekterade {} kärnor och {} MiB minne",
@@ -55,6 +58,16 @@ fn strategic_config() -> StrategicConfig {
         compression_level
     );
 
+    eprintln!(
+        "[strategic_config] max_chunks: {}",
+        max_chunks
+    );
+
+    eprintln!(
+        "[strategic_config] zstd_output_buffer_size: {}",
+        zstd_output_buffer_size
+    );
+
 
     StrategicConfig {
         max_core_in_flight,
@@ -63,6 +76,7 @@ fn strategic_config() -> StrategicConfig {
         min_free_memory_ratio,
         file_split_block_size,
         compression_level,
-        max_chunks
+        max_chunks,
+        zstd_output_buffer_size
     }
 }
