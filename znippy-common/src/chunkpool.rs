@@ -1,10 +1,11 @@
 use std::sync::{Arc, Mutex};
+use crate::ChunkQueue;
 use crate::int_ring::RingBuffer;
 
 /// A preallocated pool of fixed-size chunk buffers, managed via chunk indices.
 pub struct ChunkPool<const CHUNK_SIZE: usize> {
     pool: Vec<Arc<[u8; CHUNK_SIZE]>>,
-    ring: Mutex<RingBuffer<usize>>,
+    ring: Mutex<RingBuffer>,
 }
 
 impl<const CHUNK_SIZE: usize> ChunkPool<CHUNK_SIZE> {
@@ -18,7 +19,7 @@ impl<const CHUNK_SIZE: usize> ChunkPool<CHUNK_SIZE> {
 
         let mut ring = RingBuffer::new(num_chunks);
         for i in 0..num_chunks {
-            ring.push(i);
+            ring.push(i as u32);
         }
 
         Self {
