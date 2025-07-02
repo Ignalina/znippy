@@ -3,7 +3,8 @@ pub mod index;
 pub mod common_config;
 mod int_ring;
 pub use int_ring::{RingBuffer, ChunkQueue};
-
+mod chunkpool;
+pub use chunkpool::ChunkPool;
 use serde::{Serialize, Deserialize};
 
 pub use index::{decompress_archive,build_arrow_batch,znippy_index_schema,is_probably_compressed, should_skip_compression, ZNIPPY_INDEX_SCHEMA,verify_archive_integrity,list_archive_contents,VerifyReport,read_znippy_index};
