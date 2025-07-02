@@ -10,7 +10,8 @@ pub struct StrategicConfig {
     pub max_core_in_compress: usize,
     pub max_mem_allowed: u64,
     pub min_free_memory_ratio: f32,
-    pub file_split_block_size: u64
+    pub file_split_block_size: u64,
+    pub compression_level: i32
 }
 
 pub static CONFIG: Lazy<StrategicConfig> = Lazy::new(strategic_config);
@@ -26,6 +27,7 @@ fn strategic_config() -> StrategicConfig {
     let max_core_in_flight = ((cores as f32) * 0.10).ceil() as usize;
     let max_core_in_compress = cores.saturating_sub(max_core_in_flight);
     let min_free_memory_ratio = 0.25;
+    let compression_level = 19;
 
     eprintln!(
         "[strategic_config] Detekterade {} kärnor och {} MiB minne",
@@ -44,6 +46,11 @@ fn strategic_config() -> StrategicConfig {
         "[strategic_config] min_free_memory_ratio: {:.0}%",
         min_free_memory_ratio * 100.0
     );
+    eprintln!(
+        "[strategic_config] compression_level: {}",
+        compression_level
+    );
+
 
     StrategicConfig {
         max_core_in_flight,
@@ -51,5 +58,6 @@ fn strategic_config() -> StrategicConfig {
         max_mem_allowed: total_memory,
         min_free_memory_ratio,
         file_split_block_size: 10 * 1024 * 1024,
+        compression_level
     }
 }
