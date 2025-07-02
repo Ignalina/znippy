@@ -97,6 +97,12 @@ pub fn compress_dir(input_dir: &Path, output_prefix: &Path, no_skip: bool) -> Re
     let all_files_compress = Arc::clone(&all_files);
 
     compressor_pool.spawn(move || {
+        let cctx = unsafe { ZSTD_createCCtx() };
+        unsafe {
+            ZSTD_CCtx_setParameter(cctx, ZSTD_cParameter::ZSTD_c_nbWorkers, CONFIG.max_core_in_compress as i32);
+            ZSTD_CCtx_setParameter(cctx, ZSTD_cParameter::ZSTD_c_compressionLevel, CONFIG.compression_level);
+        }
+
         while let Ok((file_index, offset, chunk)) = rx_chunk.recv() {
             debug!("[compressor] received chunk at offset {} from file index {}", offset, file_index);
             let mut compressed = Vec::new();
@@ -106,11 +112,9 @@ pub fn compress_dir(input_dir: &Path, output_prefix: &Path, no_skip: bool) -> Re
             let compressed_flag;
 
             if should_compress {
-                let cctx = unsafe { ZSTD_createCCtx() };
                 unsafe {
-                    ZSTD_CCtx_setParameter(cctx, ZSTD_cParameter::ZSTD_c_nbWorkers, CONFIG.max_core_in_compress as i32);
+                   ZSTD_CCtx_reset(cctx, ZSTD_ResetDirective::ZSTD_reset_session_only);
                 }
-
                 let dst_capacity = unsafe { ZSTD_compressBound(chunk.len()) };
                 compressed = vec![0u8; dst_capacity];
 
