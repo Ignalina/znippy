@@ -1,14 +1,14 @@
 //! Multithreaded file compressor using preallocated chunk buffers and zero-copy RingBuffer coordination.
 
-use snippy_common::{RingBuffer, ChunkQueue};
+use znippy_common::{RingBuffer, ChunkQueue};
 use crossbeam_channel::{bounded, unbounded};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::sync::Arc;
-use crate::config::CONFIG;
+use znippy_common::common_config::CONFIG;
 
-pub fn run_packer(all_files: Vec<PathBuf>) -> anyhow::Result<()> {
+pub fn compress_dir(all_files: Vec<PathBuf>) -> anyhow::Result<()> {
     let chunk_size = CONFIG.file_split_block_size as usize;
     let max_chunks = CONFIG.max_chunks;
 
@@ -18,8 +18,8 @@ pub fn run_packer(all_files: Vec<PathBuf>) -> anyhow::Result<()> {
         .collect();
 
     let (tx_chunk, rx_chunk) = unbounded();
-    let (tx_free, rx_free) = bounded::<u32>(max_chunks);
-    let mut free_ring = RingBuffer::new(max_chunks);
+    let (tx_free, rx_free) = bounded::<u32>(max_chunks.try_into().unwrap());
+    let mut free_ring = RingBuffer::new(max_chunks as usize);
 
     // Fill initial free chunk IDs
     for i in 0..max_chunks as u32 {
