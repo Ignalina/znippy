@@ -4,7 +4,21 @@ use crate::common_config::CONFIG;
 use crate::int_ring::RingBuffer;
 use std::ops::{Deref, DerefMut};
 use crate::ChunkQueue;
+/// En wrapper runt *const u8 som är markerad som Send
+pub struct SendPtr(*const u8);
 
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {} // om du även vill dela den till flera trådar
+
+impl SendPtr {
+    pub fn new(ptr: *const u8) -> Self {
+        Self(ptr)
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.0
+    }
+}
 /// En hanterad referens till en chunk i ChunkRevolver.
 pub struct RevolverChunk<'a> {
     pub index: u32,
@@ -63,4 +77,24 @@ impl ChunkRevolver {
     pub fn return_chunk(&mut self, index: u32) {
         self.ring.push(index);
     }
+
+    /// Returnerar en råpekare till start av memoryblocket (för användning i andra trådar).
+    pub fn base_ptr(&self) -> *const u8 {
+        self.memory.as_ptr()
+    }
+
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+}
+
+/// Hjälpfunktion för att hämta en slice med `chunk_index`, `used`, och råpekare
+pub unsafe fn get_chunk_slice<'a>(
+    base_ptr: *const u8,
+    chunk_size: usize,
+    chunk_index: u32,
+    used: usize,
+) -> &'a [u8] {
+    let offset = chunk_index as usize * chunk_size;
+    std::slice::from_raw_parts(base_ptr.add(offset), used)
 }
