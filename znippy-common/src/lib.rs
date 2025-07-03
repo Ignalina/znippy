@@ -4,8 +4,8 @@ pub mod common_config;
 mod int_ring;
 pub use int_ring::{RingBuffer, ChunkQueue};
 
-pub mod chunk_revolver;
-pub use chunk_revolver::{ChunkRevolver};
+pub mod chunkrevolver;
+pub use chunkrevolver::{ChunkRevolver};
 pub mod chunkpool;
 pub use chunkpool::ChunkPool;
 
