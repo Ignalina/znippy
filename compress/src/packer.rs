@@ -34,7 +34,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
             }
         })
         .collect();
-    log::debug!("Found {} files to compress in {} directories", all_files.len(), total_dirs);
+    log::info!("Found {} files to compress in {} directories", all_files.len(), total_dirs);
     let total_files = all_files.len();
 
     let (tx_chunk, rx_chunk): (Sender<(usize, u32, usize, bool)>, Receiver<_>) = bounded(CONFIG.max_chunks as usize);
@@ -42,7 +42,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
     let (tx_return, rx_return): (Sender<u32>, Receiver<u32>) = unbounded();
 
     let output_zdata_path = output.with_extension("zdata");
-    log::debug!("Creating zdata file at: {:?}", output_zdata_path);
+    log::info!("Creating zdata file at: {:?}", output_zdata_path);
     let zdata_file = OpenOptions::new().create(true).write(true).truncate(true).open(&output_zdata_path)?;
     let mut writer = BufWriter::with_capacity((CONFIG.file_split_block_size / 2) as usize, zdata_file);
 
@@ -57,11 +57,11 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
         let mut revolver = revolver; // move into thread
         thread::spawn(move || {
             for (file_index, path) in all_files.iter().enumerate() {
-                log::debug!("[reader] Handling file index {}: {:?}", file_index, path);
+                log::info!("[reader] Processing file {}: {:?}", file_index, path);
 
                 let skip = !no_skip && should_skip_compression(path);
                 if skip {
-                    log::debug!("[reader] Skipping compression for file {}", path.display());
+                    log::info!("[reader] Skipping compression for file {}", path.display());
                 }
 
                 let file = match File::open(path) {
@@ -84,9 +84,9 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                         match reader.read(&mut *chunk) {
                             Ok(0) => {
                                 if !has_read_any_data {
-                                    log::debug!("[reader] Detected zero-length file {}", file_index);
+                                    log::info!("[reader] Detected zero-length file {}", file_index);
                                 } else {
-                                    log::debug!("[reader] EOF after data for file {}", file_index);
+                                    log::info!("[reader] EOF after data for file {}", file_index);
                                 }
                                 return_later = Some(chunk.index);
                                 break;
@@ -94,6 +94,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                             Ok(bytes_read) => {
                                 has_read_any_data = true;
                                 n = bytes_read;
+                                log::debug!("[reader] Read {} bytes from file {} into chunk {}", n, file_index, chunk_index);
                             }
                             Err(e) => {
                                 log::warn!("Error reading {:?}: {}", path, e);
@@ -115,7 +116,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                     revolver.return_chunk(index);
                 }
             }
-            log::debug!("Reader thread done");
+            log::info!("Reader thread done");
         })
     };
 
@@ -194,7 +195,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                 }
 
                 ZSTD_freeCCtx(cctx);
-                log::debug!("Compressor thread done");
+                log::info!("Compressor thread done");
             }
         })
     };
@@ -208,6 +209,8 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                 log::error!("Write error: {}", e);
                 continue;
             }
+
+            log::debug!("[writer] Writing file {} chunk at offset {} ({} bytes)", file_index, offset, meta.length);
 
             meta.offset = offset;
             offset += meta.length;
@@ -241,5 +244,6 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
         },
     };
 
+    log::info!("Compression completed: {:?}", report);
     Ok(report)
 }
