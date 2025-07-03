@@ -32,11 +32,14 @@ impl ChunkPool {
 
     /// Hämtar nästa lediga chunk-index från ringen.
     pub fn get_index(&mut self) -> u32 {
-        self.ring.pop().expect("RingBuffer underrun: inga lediga chunk-index kvar")
+        let idx = self.ring.pop().expect("RingBuffer underrun: inga lediga chunk-index kvar");
+        log::trace!("[ChunkPool] get_index → {}", idx);
+        idx 
     }
 
     /// Returnerar ett chunk-index till poolen.
     pub fn return_index(&mut self, index: u32) {
+        log::trace!("[ChunkPool] return_index ← {}", index);
         self.ring.push(index);
     }
 
@@ -49,7 +52,11 @@ impl ChunkPool {
     pub fn get_buffer_mut(&mut self, chunk_nr: u32) -> &mut [u8] {
         let boxed = &mut self.buffers[chunk_nr as usize];
         Arc::get_mut(boxed)
-            .expect("Only the reader thread should access buffers mutably")
-            .as_mut()
+            .map(|b| b.as_mut())
+            .unwrap_or_else(|| {
+                log::error!("Double mutable access to chunk {}", chunk_nr);
+                panic!("Only the reader thread should access buffers mutably");
+            })
     }
 }
+
