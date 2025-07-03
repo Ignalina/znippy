@@ -15,6 +15,7 @@ use blake3::Hasher;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use zstd_sys::ZSTD_decompress;
+use crate::ChunkMeta;
 use crate::common_config::CONFIG;
 // === Arrow-schema ===
 
@@ -82,12 +83,12 @@ pub fn make_chunks_builder(capacity: usize) -> ListBuilder<StructBuilder> {
 
 pub fn build_arrow_batch(
     paths: &[PathBuf],
-    metas: &[Vec<(u64, u64, u64, u64, bool)>],
+    metas: &[Vec<ChunkMeta>],
 ) -> Result<RecordBatch> {
     let mut path_builder = StringBuilder::new();
     let mut compressed_builder = BooleanBuilder::new();
     let mut uncompressed_size_builder = UInt64Builder::new();
-    let mut checksum_builder = FixedSizeBinaryBuilder::new(32);
+    let mut checksum_builder = FixedSizeBinaryBuilder::new(32);  // Use 32 bytes for Blake3
 
     let mut chunks_builder = make_chunks_builder(paths.len());
 
@@ -97,32 +98,40 @@ pub fn build_arrow_batch(
         path_builder.append_value(path.to_string_lossy());
 
         if let Some(first_chunk) = chunks.get(0) {
-            compressed_builder.append_value(first_chunk.4);
-            uncompressed_size_builder.append_value(first_chunk.3);
+            compressed_builder.append_value(first_chunk.compressed);
+            uncompressed_size_builder.append_value(first_chunk.uncompressed_size);
+            if let Some(checksum) = &first_chunk.checksum {
+                checksum_builder.append_value(checksum);
+            } else {
+                checksum_builder.append_null();
+            }
         } else {
             compressed_builder.append_value(false);
             uncompressed_size_builder.append_value(0);
+            checksum_builder.append_null();
         }
-
-        let mut hasher = blake3::Hasher::new();
-        let hash = hasher.finalize();
-        checksum_builder.append_value(hash.as_bytes());
 
         if chunks.is_empty() {
             chunks_builder.append_null();
         } else {
-            for (offset, length, _, _, _) in chunks.iter() {
+            for chunk in chunks.iter() {
                 chunks_builder
                     .values()
                     .field_builder::<UInt64Builder>(0)
                     .unwrap()
-                    .append_value(*offset);
+                    .append_value(chunk.offset);
                 chunks_builder
                     .values()
                     .field_builder::<UInt64Builder>(1)
                     .unwrap()
-                    .append_value(*length);
+                    .append_value(chunk.length);
                 chunks_builder.values().append(true);
+
+                if let Some(checksum) = &chunk.checksum {
+                    checksum_builder.append_value(checksum);
+                } else {
+                    checksum_builder.append_null();
+                }
             }
             chunks_builder.append(true);
         }

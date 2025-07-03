@@ -2,11 +2,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::thread;
-
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use walkdir::WalkDir;
 use zstd_sys::*;
-
+use blake3::Hasher; // Blake3 import
 use znippy_common::chunkrevolver::{ChunkRevolver, RevolverChunk, SendPtr, get_chunk_slice};
 use znippy_common::common_config::CONFIG;
 use znippy_common::{build_arrow_batch, CompressionReport};
@@ -35,9 +34,9 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
     log::debug!("Found {} files to compress in {} directories", all_files.len(), total_dirs);
     let total_files = all_files.len();
     let mut file_paths = Vec::<PathBuf>::with_capacity(total_files);
-    let mut file_chunks_metas = Vec::<Vec<(u64, u64, u64, u64, bool)>>::with_capacity(total_files);
+    let mut file_chunks_metas = Vec::<Vec<ChunkMeta>>::with_capacity(total_files);
 
-    let (tx_chunk, rx_chunk): (Sender<(usize, u32, usize, bool, Vec<(u64, u64, u64, u64, bool)>)>, Receiver<_>) = bounded(CONFIG.max_core_in_flight);
+    let (tx_chunk, rx_chunk): (Sender<(usize, u32, usize, bool, Vec<ChunkMeta>)>, Receiver<_>) = bounded(CONFIG.max_core_in_flight);
     let (tx_compressed, rx_compressed): (Sender<(usize, ChunkMeta)>, Receiver<_>) = unbounded(); // Send metadata
     let (tx_return, rx_return): (Sender<u32>, Receiver<u32>) = unbounded();
 
@@ -59,7 +58,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
         let mut revolver = revolver; // move into thread
         thread::spawn(move || {
             let mut inflight_chunks = 0usize;
-            let mut file_chunks_metas: Vec<Vec<(u64, u64, u64, u64, bool)>> = Vec::with_capacity(all_files.len());
+            let mut file_chunks_metas: Vec<Vec<ChunkMeta>> = Vec::with_capacity(all_files.len());
             let mut uncompressed_files = 0; // Track uncompressed files
             let mut uncompressed_bytes = 0; // Track uncompressed bytes
 
@@ -189,14 +188,18 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                     let chunk_meta;
                     let output;
 
+                    let mut hasher = Hasher::new(); // Blake3 hash initialization
+
                     if skip {
                         log::debug!("[compressor] Skipping compression for chunk {} of file {}", chunk_index, file_index);
                         output = input.to_vec();
+                        hasher.update(&output);  // Update hash for uncompressed data
                         chunk_meta = ChunkMeta {
                             offset: 0,
                             length: used as u64,
                             compressed: false,
                             uncompressed_size: used as u64,
+                            checksum: Some(hasher.finalize().as_bytes().to_vec()),
                         };
                     } else {
                         log::debug!("[compressor] Compressing chunk {} from file {} ({} bytes)", chunk_index, file_index, used);
@@ -232,11 +235,13 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                             }
 
                             output.truncate(output_buffer.pos);
+                            hasher.update(&output); // Update hash for compressed data
                             chunk_meta = ChunkMeta {
                                 offset: 0,
                                 length: output_buffer.pos as u64,
                                 compressed: true,
                                 uncompressed_size: used as u64,
+                                checksum: Some(hasher.finalize().as_bytes().to_vec()), // Store checksum
                             };
 
                             output
