@@ -36,34 +36,35 @@ fn strategic_config() -> StrategicConfig {
     let zstd_output_buffer_size = 1 * 1024 * 1024;
     
     let max_chunks:u32= (max_mem_allowed / file_split_block_size) as u32;
-    eprintln!(
+    log::info!(
         "[strategic_config] Detekterade {} kärnor och {} MiB minne",
         cores,
         total_memory / 1024
     );
-    eprintln!(
+    log::info!(
         "[strategic_config] max_core_in_flight: {} (10%)",
         max_core_in_flight
     );
-    eprintln!(
+
+    log::info!(
         "[strategic_config] max_core_in_compress: {} (90%)",
         max_core_in_compress
     );
-    eprintln!(
+    log::info!(
         "[strategic_config] min_free_memory_ratio: {:.0}%",
         min_free_memory_ratio * 100.0
     );
-    eprintln!(
+    log::info!(
         "[strategic_config] compression_level: {}",
         compression_level
     );
 
-    eprintln!(
+    log::info!(
         "[strategic_config] max_chunks: {}",
         max_chunks
     );
 
-    eprintln!(
+    log::info!(
         "[strategic_config] zstd_output_buffer_size: {}",
         zstd_output_buffer_size
     );
