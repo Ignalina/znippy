@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use walkdir::WalkDir;
 use zstd_sys::*;
 
@@ -28,8 +28,8 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
     log::debug!("Found {} files to compress", all_files.len());
     let total_files = all_files.len();
 
-    let (tx_chunk, rx_chunk): (Sender<(usize, u32, Arc<[u8]>, usize)>, Receiver<_>) = unbounded();
-    let (tx_compressed, rx_compressed): (Sender<(usize, u32, ChunkMeta, Vec<u8>)>, Receiver<_>) = unbounded();
+    let (tx_chunk, rx_chunk): (Sender<(usize, u32, Arc<[u8]>, usize)>, Receiver<_>) = bounded(CONFIG.max_chunks as usize);
+    let (tx_compressed, rx_compressed): (Sender<(usize,  ChunkMeta, Vec<u8>)>, Receiver<_>) = unbounded();
     let (tx_return, rx_return): (Sender<u32>, Receiver<u32>) = unbounded();
 
     let output_zdata_path = output.with_extension("zdata");
@@ -44,7 +44,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
         thread::spawn(move || {
             let mut chunk_pool = ChunkPool::new();
             for (file_index, path) in all_files.iter().enumerate() {
-                log::debug!("Opening file {:?}", path);
+                log::debug!("[reader] Handling file index {}: {:?}", file_index, path);
                 let file = match File::open(path) {
                     Ok(f) => f,
                     Err(e) => {
@@ -53,6 +53,8 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
                     }
                 };
                 let mut reader = BufReader::new(file);
+                let mut has_read_any_data = false;
+
                 loop {
                     log::debug!("[reader] Attempting to get chunk index");
                     let chunk_nr = chunk_pool.get_index();
@@ -60,11 +62,20 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
                     let buf = chunk_pool.get_buffer_mut(chunk_nr);
                     let n = match reader.read(&mut buf[..]) {
                         Ok(0) => {
-                            log::debug!("EOF reached for file {}", file_index);
+                            if !has_read_any_data {
+                                log::debug!("[reader] Detected zero-length file {}", file_index);
+                                // Optional: count as skipped, or send empty compressed data
+                            } else {
+                                log::debug!("[reader] EOF after data for file {}", file_index);
+                            }
+
                             chunk_pool.return_index(chunk_nr);
                             break;
                         }
-                        Ok(n) => n,
+                        Ok(n) => {
+                            has_read_any_data = true;
+                            n
+                        }
                         Err(e) => {
                             log::warn!("Error reading {:?}: {}", path, e);
                             chunk_pool.return_index(chunk_nr);
@@ -139,7 +150,8 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
                     log::debug!("[compressor] file={} chunk={} {} → {} bytes", file_index, chunk_nr, used, total_written);
 
                     output.truncate(total_written);
-                    tx_compressed.send((file_index, chunk_nr, chunk_meta, output)).unwrap();
+                    tx_compressed.send((file_index, chunk_meta, output)).unwrap();
+                    log::debug!("[compressor] Done with chunk {} → returning to reader", chunk_nr);
                     tx_ret.send(chunk_nr).unwrap();
                 }
 
@@ -153,8 +165,8 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
         let mut offset = 0u64;
         let mut stats = CompressionStats::default();
 
-        while let Ok((file_index, _chunk_nr, mut meta, compressed_data)) = rx_compressed.recv() {
-            log::debug!("[writer] Received chunk for file {}: {} bytes", file_index, meta.length);
+        while let Ok((file_index,  mut meta, compressed_data)) = rx_compressed.recv() {
+            log::debug!("[writer] Compressed block for file {}: {} bytes", file_index, meta.length);
             if let Err(e) = writer.write_all(&compressed_data[..]) {
                 log::error!("Write error: {}", e);
                 continue;
