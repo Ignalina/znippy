@@ -30,10 +30,10 @@ fn strategic_config_mini() -> StrategicConfig {
     let total_memory = sys.total_memory();
     let cores = sysinfo::System::physical_core_count().unwrap_or_else(|| sys.cpus().len());
 
-    let max_core_in_flight = ((cores as f32) * 0.10).ceil() as usize;
+    let max_core_in_flight = ((cores as f32) * 0.90).ceil() as usize;
     let max_core_in_compress = cores.saturating_sub(max_core_in_flight);
     let min_free_memory_ratio = 0.0f32;
-    let compression_level = 10;
+    let compression_level = 19;
     let max_mem_allowed= ((total_memory as f32) * (1.0 - min_free_memory_ratio)) as u64;
     let file_split_block_size=10 * 1024 * 1024;
     let zstd_output_buffer_size = 1 * 1024 * 1024;
