@@ -7,6 +7,7 @@ pub struct ChunkMeta {
     pub length: u64,
     pub compressed: bool,
     pub uncompressed_size: u64,
+    pub checksum: Option<Vec<u8>>, // Added checksum to ChunkMeta
 }
 
 /// Samlad statistik över en komprimeringskörning
