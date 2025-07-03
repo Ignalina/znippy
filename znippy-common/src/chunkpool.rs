@@ -11,9 +11,9 @@ pub struct ChunkPool {
 
 impl ChunkPool {
     pub fn new() -> Self {
+        log::debug!("chunkpool new");
 
-
-
+        assert!(CONFIG.max_chunks > 0, "CONFIG.max_chunks must be > 0");
 
         let chunk_size = CONFIG.file_split_block_size_usize();
         let num_chunks = CONFIG.max_chunks;
@@ -25,6 +25,7 @@ impl ChunkPool {
 
             ring.push(i);
         }
+        log::debug!("chunk_ppol new() {} allocated " ,num_chunks);
 
         Self { buffers, ring }
     }

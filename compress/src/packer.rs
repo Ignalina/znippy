@@ -3,9 +3,11 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use walkdir::WalkDir;
 use zstd_sys::*;
 
 use znippy_common::chunkpool::ChunkPool;
@@ -16,30 +18,25 @@ use zstd_sys::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
 use zstd_sys::ZSTD_ResetDirective::ZSTD_reset_session_only;
 
 pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<CompressionReport> {
-    let all_files: Vec<PathBuf> = fs::read_dir(input_dir)?
-        .filter_map(|entry| {
-            entry.ok().and_then(|e| {
-                let path = e.path();
-                if path.is_file() {
-                    Some(path)
-                } else {
-                    None
-                }
-            })
-        })
+    log::debug!("Reading directory: {:?}", input_dir);
+    let all_files: Vec<PathBuf> = WalkDir::new(input_dir)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
         .collect();
-
+    log::debug!("Found {} files to compress", all_files.len());
     let total_files = all_files.len();
 
-    let (tx_chunk, rx_chunk): (Sender<(usize, u32, usize)>, Receiver<_>) = unbounded();
+    let (tx_chunk, rx_chunk): (Sender<(usize, u32, Arc<[u8]>, usize)>, Receiver<_>) = unbounded();
     let (tx_compressed, rx_compressed): (Sender<(usize, u32, ChunkMeta, Vec<u8>)>, Receiver<_>) = unbounded();
     let (tx_return, rx_return): (Sender<u32>, Receiver<u32>) = unbounded();
 
     let output_zdata_path = output.with_extension("zdata");
+    log::debug!("Creating zdata file at: {:?}", output_zdata_path);
     let zdata_file = OpenOptions::new().create(true).write(true).truncate(true).open(&output_zdata_path)?;
     let mut writer = BufWriter::with_capacity((CONFIG.file_split_block_size / 2) as usize, zdata_file);
 
-    // Reader thread (single-threaded, owns &mut chunk_pool)
     let reader_thread = {
         let tx_chunk = tx_chunk.clone();
         let rx_done = rx_return.clone();
@@ -47,6 +44,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
         thread::spawn(move || {
             let mut chunk_pool = ChunkPool::new();
             for (file_index, path) in all_files.iter().enumerate() {
+                log::debug!("Opening file {:?}", path);
                 let file = match File::open(path) {
                     Ok(f) => f,
                     Err(e) => {
@@ -56,10 +54,13 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
                 };
                 let mut reader = BufReader::new(file);
                 loop {
+                    log::debug!("[reader] Attempting to get chunk index");
                     let chunk_nr = chunk_pool.get_index();
+                    log::debug!("[reader] Got chunk index: {}", chunk_nr);
                     let buf = chunk_pool.get_buffer_mut(chunk_nr);
                     let n = match reader.read(&mut buf[..]) {
                         Ok(0) => {
+                            log::debug!("EOF reached for file {}", file_index);
                             chunk_pool.return_index(chunk_nr);
                             break;
                         }
@@ -70,22 +71,23 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
                             break;
                         }
                     };
-                    log::debug!("[reader] file {} → chunk {} ({} bytes)", file_index, chunk_nr, n);
-                    tx_chunk.send((file_index, chunk_nr, n)).unwrap();
+                    let buf_arc = chunk_pool.get_buffer(chunk_nr);
+                    log::debug!("[reader] file={} read {} bytes into chunk {}", file_index, n, chunk_nr);
+                    tx_chunk.send((file_index, chunk_nr, buf_arc, n)).unwrap();
 
                     if let Ok(returned) = rx_done.try_recv() {
+                        log::debug!("[reader] Returned chunk {} to pool", returned);
                         chunk_pool.return_index(returned);
                     }
                 }
             }
+            log::debug!("Reader thread done");
         })
     };
 
-    // Compressor thread
     let compressor_thread = {
         let tx_ret = tx_return.clone();
         thread::spawn(move || {
-            let chunk_pool = ChunkPool::new();
             unsafe {
                 let cctx = ZSTD_createCCtx();
                 assert!(!cctx.is_null(), "ZSTD_createCCtx failed");
@@ -94,9 +96,9 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
                 ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, CONFIG.max_core_in_compress as i32);
                 log::info!("Compressor ready with level {} and {} workers", CONFIG.compression_level, CONFIG.max_core_in_compress);
 
-                while let Ok((file_index, chunk_nr, used)) = rx_chunk.recv() {
-                    let input_buf = chunk_pool.get_buffer(chunk_nr);
-                    let input_ptr = input_buf.as_ptr();
+                while let Ok((file_index, chunk_nr, arc_buf, used)) = rx_chunk.recv() {
+                    log::debug!("[compressor] Received chunk {} from file {} ({} bytes)", chunk_nr, file_index, used);
+                    let input_ptr = arc_buf.as_ptr();
 
                     let mut output = vec![0u8; CONFIG.zstd_output_buffer_size];
 
@@ -142,16 +144,17 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
                 }
 
                 ZSTD_freeCCtx(cctx);
+                log::debug!("Compressor thread done");
             }
         })
     };
 
-    // Writer thread
     let writer_thread = thread::spawn(move || {
         let mut offset = 0u64;
         let mut stats = CompressionStats::default();
 
         while let Ok((file_index, _chunk_nr, mut meta, compressed_data)) = rx_compressed.recv() {
+            log::debug!("[writer] Received chunk for file {}: {} bytes", file_index, meta.length);
             if let Err(e) = writer.write_all(&compressed_data[..]) {
                 log::error!("Write error: {}", e);
                 continue;
@@ -171,9 +174,17 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
         stats
     });
 
+    log::debug!("Waiting for reader thread to finish...");
     reader_thread.join().unwrap();
+    log::debug!("Reader thread joined");
+
+    log::debug!("Waiting for compressor thread to finish...");
     compressor_thread.join().unwrap();
+    log::debug!("Compressor thread joined");
+
+    log::debug!("Waiting for writer thread to finish...");
     let stats = writer_thread.join().unwrap();
+    log::debug!("Writer thread joined");
 
     let compressed_files = stats.total_chunks;
 
@@ -193,5 +204,6 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf) -> anyhow::Result<Com
         },
     };
 
+    log::debug!("Compression report: {:?}", report);
     Ok(report)
 }
