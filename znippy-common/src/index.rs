@@ -32,6 +32,7 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
                 DataType::Struct(Fields::from(vec![
                     Field::new("offset", DataType::UInt64, false),
                     Field::new("length", DataType::UInt64, false),
+                    Field::new("checksum", DataType::FixedSizeBinary(32), true),  
                 ])),
                 true
             ))),
@@ -52,8 +53,10 @@ pub fn is_probably_compressed(path: &Path) -> bool {
             "zip" | "gz" | "bz2" | "xz" | "lz" | "lzma" |
             "7z" | "rar" | "cab" | "jar" | "war" | "ear" |
             "zst" | "sz" | "lz4" | "tgz" | "txz" | "tbz" |
-            "apk" | "dmg" | "deb" | "rpm" | "arrow"
-        )
+            "apk" | "dmg" | "deb" | "rpm" | "arrow" | "mpeg" |
+            "mpg" | "jpeg"| "jpg" | "gif" | "bmp" | "png" |
+            "webp" | "webm"
+         )
     } else {
         false
     }
@@ -66,21 +69,23 @@ pub fn should_skip_compression(path: &Path) -> bool {
 pub fn make_chunks_builder(capacity: usize) -> ListBuilder<StructBuilder> {
     let offset_builder = UInt64Builder::with_capacity(capacity);
     let length_builder = UInt64Builder::with_capacity(capacity);
+    let checksum_builder = FixedSizeBinaryBuilder::new(capacity as i32);  // Cast usize to i32 for checksum builder
 
     let struct_builder = StructBuilder::new(
         vec![
             Field::new("offset", DataType::UInt64, false),
             Field::new("length", DataType::UInt64, false),
+            Field::new("checksum", DataType::FixedSizeBinary(32), true),  // Add the checksum field
         ],
         vec![
             Box::new(offset_builder) as Box<dyn ArrayBuilder>,
             Box::new(length_builder) as Box<dyn ArrayBuilder>,
+            Box::new(checksum_builder) as Box<dyn ArrayBuilder>,  // Include checksum builder
         ],
     );
 
     ListBuilder::new(struct_builder)
 }
-
 pub fn build_arrow_batch(
     paths: &[PathBuf],
     metas: &[Vec<ChunkMeta>],
