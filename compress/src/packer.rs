@@ -1,5 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::net::Shutdown::Write as OtherWrite;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -10,7 +11,7 @@ use blake3::Hasher; // Blake3 import
 use znippy_common::chunkrevolver::{ChunkRevolver, RevolverChunk, SendPtr, get_chunk_slice};
 use znippy_common::common_config::CONFIG;
 use znippy_common::{build_arrow_batch, CompressionReport};
-use znippy_common::meta::{ChunkMeta, CompressionStats};
+use znippy_common::meta::{ChunkMeta, WriterStats};
 use znippy_common::index::should_skip_compression;
 use zstd_sys::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
 use zstd_sys::ZSTD_ResetDirective::ZSTD_reset_session_only;
@@ -33,8 +34,8 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
         })
         .collect();
     log::debug!("Found {} files to compress in {} directories", all_files.len(), total_dirs);
-    let total_files = all_files.len();
-    let mut file_paths = Vec::<PathBuf>::with_capacity(total_files);
+    let total_files:u64 = all_files.len() as u64;
+    let mut file_paths = Vec::<PathBuf>::with_capacity(total_files as usize);
 
     let (tx_chunk, rx_chunk): (Sender<(usize, u32, usize, bool, u16)>, Receiver<_>) = bounded(CONFIG.max_core_in_flight);
 
@@ -60,8 +61,10 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
         thread::spawn(move || {
             let mut inflight_chunks = 0usize;
 //            let mut file_chunks_metas: Vec<Vec<ChunkMeta>> = Vec::with_capacity(all_files.len());
-            let mut uncompressed_files = 0; // Track uncompressed files
-            let mut uncompressed_bytes = 0; // Track uncompressed bytes
+            let mut uncompressed_files:u64 = 0;
+            let mut uncompressed_bytes:u64 = 0;
+            let mut compressed_files:u64=0;
+            let mut compressed_bytes:u64=0;
 
             for (file_index, path) in all_files.iter().enumerate() {
                 log::debug!("[reader] Handling file index {}: {:?}", file_index, path);
@@ -73,13 +76,15 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                     log::debug!("[reader] Skipping compression for file {}", path.display());
                     uncompressed_files += 1; // Increment uncompressed files count
                     uncompressed_bytes += path.metadata().unwrap().len(); // Add to uncompressed bytes
+                } else {
+                    compressed_files += 1;
+                    compressed_bytes += path.metadata().unwrap().len();
                 }
 
                 let file = match File::open(path) {
                     Ok(f) => f,
                     Err(e) => {
-                        log::warn!("Failed to open file {:?}: {}", path, e);
-                        continue;
+                        panic!("Problem opening the file: {:?}: {}", path, e)
                     }
                 };
                 let mut reader = BufReader::new(file);
@@ -163,7 +168,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
             drop(revolver);    // Drop revolver if needed (Rust will also drop it when the thread finishes)
 
             // Return the statistics to the main thread
-            (uncompressed_files, uncompressed_bytes)})
+            (uncompressed_files, uncompressed_bytes,compressed_files,compressed_bytes)})
     };
 
     // Compressor Threads pool
@@ -292,36 +297,34 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
     // Writer thread
     let writer_thread = thread::spawn(move || {
-        let mut offset = 0u64;
-        let mut stats = CompressionStats::default();
+        let mut writerstats=WriterStats {
+            offset: 0,
+            total_chunks: 0,
+            total_written_bytes: 0,
+        };
+ 
 
         while let Ok((file_index,chunk_seq ,compressed_data)) = rx_compressed.recv() {
-            // Log when the writer receives a chunk
-            log::debug!("[writer] Received compressed block from file {}: offset {}, length {}", file_index, offset, compressed_data.len());
+            log::debug!("[writer] Received compressed block from file {}: offset {}, length {}", file_index, writerstats.offset, compressed_data.len());
 
-//            let compressed_data = vec![0u8; compressed_data.len() as usize]; // placeholder
 
             if let Err(e) = writer.write_all(&compressed_data) {
                 log::error!("[writer] Write error: {}", e);
                 continue;
             }
+            writerstats.offset += compressed_data.len() as u64;
+            writerstats.total_chunks += 1;
+            writerstats.total_written_bytes += compressed_data.len() as u64; // Update the total output bytes
 
-//            chunk_meta.offset = offset;
-            offset += compressed_data.len() as u64;
-
-            stats.total_chunks += 1;
-//            stats.total_input_bytes += chunk_meta.uncompressed_size;
-//            stats.total_output_bytes += chunk_meta.length;
-
-            log::debug!("[writer] Writing compressed chunk at offset {} ({} bytes)", offset, compressed_data.len());
+            log::debug!("[writer] Writing compressed chunk at offset {} ({} bytes)", writerstats.offset, compressed_data.len());
         }
 
-        log::info!("[writer] Writer done. Compressed {} chunks ({} → {} bytes)", stats.total_chunks, stats.total_input_bytes, stats.total_output_bytes);
-        stats
+        log::info!("[writer] Writer done. Compressed {} chunks , total written {} bytes)", writerstats.total_chunks,  writerstats.total_written_bytes);
+        writerstats
     });
 
     // Wait for reader thread to finish
-    let (uncompressed_files, uncompressed_bytes) = reader_thread.join().unwrap();
+    let (uncompressed_files, uncompressed_bytes,compressed_files,compressed_bytes) = reader_thread.join().unwrap();
     log::debug!("[reader] reader_thread joined");
 
     // Drop the sender-side channels after the reader and compressor threads finish
@@ -338,21 +341,22 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
     log::debug!("[compressor] tx_compressed dropped after compressors finished");
 
     log::debug!("[writer] Waiting for writer thread to finish");
-    let stats = writer_thread.join().unwrap();
+    let writerstats = writer_thread.join().unwrap();
     log::debug!("[writer] writer_thread finished");
+
 
 
     let report = CompressionReport {
         total_files,
-        compressed_files: stats.total_chunks,
+        compressed_files ,
         uncompressed_files,
         total_dirs,
-        total_bytes_in: uncompressed_bytes,  // Adjusted to the uncompressed bytes
-        total_bytes_out: stats.total_output_bytes,
-        compressed_bytes: stats.total_output_bytes,
+        total_bytes_in : compressed_bytes+uncompressed_bytes,
+        total_bytes_out: writerstats.total_written_bytes,
+        compressed_bytes,
         uncompressed_bytes,
         compression_ratio: if uncompressed_bytes > 0 {
-            (stats.total_output_bytes as f32 / uncompressed_bytes as f32) * 100.0
+            (compressed_bytes as f32 / (writerstats.total_written_bytes-uncompressed_bytes)  as f32) * 100.0
         } else {
             0.0
         },
@@ -360,3 +364,5 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
     Ok(report)
 }
+
+

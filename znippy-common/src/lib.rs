@@ -10,7 +10,7 @@ pub mod chunkpool;
 pub use chunkpool::ChunkPool;
 
 pub mod meta;
-pub use meta::{ChunkGroup,ChunkMeta,CompressionStats,FileMeta};
+pub use meta::{ChunkGroup,ChunkMeta,FileMeta};
 
 use serde::{Serialize, Deserialize};
 
@@ -24,10 +24,10 @@ pub struct StrategicConfig {
 
 #[derive(Debug)]
 pub struct CompressionReport {
-    pub total_files: usize,
-    pub compressed_files: usize,
-    pub uncompressed_files: usize,
-    pub total_dirs: usize,
+    pub total_files: u64,
+    pub compressed_files: u64,
+    pub uncompressed_files: u64,
+    pub total_dirs: u64,
     pub total_bytes_in: u64,
     pub total_bytes_out: u64,
     pub compressed_bytes: u64,
