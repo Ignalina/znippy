@@ -10,12 +10,11 @@ pub struct ChunkMeta {
     pub checksum: Option<Vec<u8>>, // Added checksum to ChunkMeta
 }
 
-/// Samlad statistik över en komprimeringskörning
-#[derive(Debug, Default)]
-pub struct CompressionStats {
-    pub total_chunks: usize,
-    pub total_input_bytes: u64,
-    pub total_output_bytes: u64,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriterStats {
+    pub offset: u64,
+    pub total_chunks: u64,
+    pub total_written_bytes:u64
 }
 
 /// Metadata för en hel fil (en eller flera chunks)
@@ -31,3 +30,4 @@ pub struct ChunkGroup {
     pub file_index: usize,
     pub chunks: Vec<ChunkMeta>,
 }
+
