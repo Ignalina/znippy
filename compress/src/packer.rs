@@ -10,7 +10,7 @@ use zstd_sys::*;
 use blake3::Hasher; // Blake3 import
 use znippy_common::chunkrevolver::{ChunkRevolver, RevolverChunk, SendPtr, get_chunk_slice};
 use znippy_common::common_config::CONFIG;
-use znippy_common::{build_arrow_batch, CompressionReport};
+use znippy_common::{add_file_checksums_and_cleanup, build_arrow_batch, CompressionReport};
 use znippy_common::meta::{ChunkMeta, WriterStats};
 use znippy_common::index::should_skip_compression;
 use zstd_sys::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
@@ -376,7 +376,12 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
             metas_per_file[meta.file_index as usize].push(meta.clone());
         }
     }
-    let batch = build_arrow_batch(&all_files, &metas_per_file)?;
+
+    let mut batch = build_arrow_batch(&all_files, &metas_per_file)?;
+    println!("Before cleanup: {} rows", batch.num_rows());
+    add_file_checksums_and_cleanup(&mut batch, true)?;
+    println!("After cleanup: {} rows", batch.num_rows());
+
     let index_path = output.with_extension("znippy");
     let index_file = File::create(&index_path)?;
     let mut writer = arrow::ipc::writer::FileWriter::try_new(index_file, &batch.schema())?;
