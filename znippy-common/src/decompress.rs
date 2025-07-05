@@ -158,10 +158,10 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 fn extract_file_checksums(batches: &[arrow::record_batch::RecordBatch]) -> Result<Vec<[u8; 32]>> {
     let mut all = vec![];
     for batch in batches {
-        let arr = batch.column_by_name("file_checksum")
-            .context("Missing 'file_checksum' column")?
+        let arr = batch.column_by_name("checksum")
+            .context("Missing 'checksum' column")?
             .as_any().downcast_ref::<FixedSizeBinaryArray>()
-            .context("'file_checksum' is not FixedSizeBinaryArray")?;
+            .context("'checksum' is not FixedSizeBinaryArray")?;
 
         for row in 0..arr.len() {
             if arr.is_null(row) {

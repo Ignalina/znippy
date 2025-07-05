@@ -15,7 +15,8 @@ use znippy_common::meta::{ChunkMeta, WriterStats};
 use znippy_common::index::should_skip_compression;
 use zstd_sys::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
 use zstd_sys::ZSTD_ResetDirective::ZSTD_reset_session_only;
-
+use arrow::ipc::writer::{FileWriter, IpcWriteOptions};
+use arrow::ipc::MetadataVersion;
 pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> anyhow::Result<CompressionReport> {
     log::debug!("Reading directory: {:?}", input_dir);
     let mut total_dirs = 0;
@@ -385,6 +386,9 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
     let index_path = output.with_extension("znippy");
     let index_file = File::create(&index_path)?;
     let mut writer = arrow::ipc::writer::FileWriter::try_new(index_file, &batch.schema())?;
+
+
+
     writer.write(&batch)?;
     writer.finish()?;
     log::info!("[reader] Index written to {:?}", index_path);
