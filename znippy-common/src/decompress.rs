@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use arrow::array::{FixedSizeBinaryArray, ListArray, StringArray, StructArray, UInt64Array};
+use arrow::array::{BinaryArray, ListArray, StringArray, StructArray, UInt64Array};
 use arrow_array::Array;
 use blake3::Hasher;
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -38,7 +38,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
     let out_dir = Arc::new(out_dir.to_path_buf());
     let mut report = VerifyReport::default();
 
-    // 📝 Writer tråd – flyttad utanför batch-loopen
+    // 📍 Writer tråd – flyttad utanför batch-loopen
     let rx = chunk_rx.clone();
     let out_dir_cloned = Arc::clone(&out_dir);
     let file_checksums_cloned = Arc::clone(&file_checksums);
@@ -65,7 +65,8 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
                 let mut hasher = Hasher::new();
                 for i in 0..expected {
-                    hasher.update(&entry_chk.remove(&i).unwrap());
+                    let part = entry_chk.remove(&i).unwrap();
+                    hasher.update(&part);
                 }
 
                 let calculated = hasher.finalize();
@@ -82,6 +83,8 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                     }
                 } else {
                     eprintln!("❌ Checksum mismatch for file index {}", file_index);
+                    eprintln!("  expected: {:x?}", expected_bytes);
+                    eprintln!("  calculated: {:x?}", calculated.as_bytes());
                 }
 
                 done_tx_cloned.send(file_index).unwrap();
@@ -160,8 +163,8 @@ fn extract_file_checksums(batches: &[arrow::record_batch::RecordBatch]) -> Resul
     for batch in batches {
         let arr = batch.column_by_name("checksum")
             .context("Missing 'checksum' column")?
-            .as_any().downcast_ref::<FixedSizeBinaryArray>()
-            .context("'checksum' is not FixedSizeBinaryArray")?;
+            .as_any().downcast_ref::<BinaryArray>()
+            .context("'checksum' is not BinaryArray")?;
 
         for row in 0..arr.len() {
             if arr.is_null(row) {
@@ -169,7 +172,7 @@ fn extract_file_checksums(batches: &[arrow::record_batch::RecordBatch]) -> Resul
             } else {
                 let bytes = arr.value(row);
                 let mut fixed = [0u8; 32];
-                fixed.copy_from_slice(bytes);
+                fixed[..bytes.len().min(32)].copy_from_slice(&bytes[..bytes.len().min(32)]);
                 all.push(fixed);
             }
         }
