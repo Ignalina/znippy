@@ -14,7 +14,7 @@ pub use meta::{ChunkGroup,ChunkMeta,FileMeta};
 
 use serde::{Serialize, Deserialize};
 
-pub use index::{decompress_archive,build_arrow_batch,znippy_index_schema,is_probably_compressed, should_skip_compression, ZNIPPY_INDEX_SCHEMA,verify_archive_integrity,list_archive_contents,VerifyReport,read_znippy_index};
+pub use index::{add_file_checksums_and_cleanup,decompress_archive,build_arrow_batch,znippy_index_schema,is_probably_compressed, should_skip_compression, ZNIPPY_INDEX_SCHEMA,verify_archive_integrity,list_archive_contents,VerifyReport,read_znippy_index};
 #[derive(Debug, Clone)]
 pub struct StrategicConfig {
     pub max_core_in_flight: usize,

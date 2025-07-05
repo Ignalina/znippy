@@ -4,11 +4,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use arrow::array::*;
+
+
+
 
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use arrow::datatypes::{DataType, Field, Fields, Schema};
-use arrow::array::{ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, ListBuilder, StringBuilder, StructBuilder, UInt64Builder, ArrayBuilder, FixedSizeBinaryArray, ListArray, StructArray, UInt64Array, StringArray, BooleanArray, make_builder};
+use arrow::array::{ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, ListBuilder, StringBuilder, StructBuilder, UInt64Builder, ArrayBuilder, FixedSizeBinaryArray, ListArray, StructArray, UInt64Array, StringArray, BooleanArray, make_builder, Array};
 use arrow::record_batch::RecordBatch;
 use arrow::ipc::reader::FileReader;
 use blake3::Hasher;
@@ -33,7 +37,7 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
                 DataType::Struct(Fields::from(vec![
                     Field::new("offset", DataType::UInt64, false),
                     Field::new("length", DataType::UInt64, false),
-                    Field::new("checksum", DataType::FixedSizeBinary(32), false),
+                    Field::new("checksum", DataType::FixedSizeBinary(32), true),
                 ])),
                 true
             ))),
@@ -75,7 +79,7 @@ pub fn make_chunks_builder(capacity: usize) -> ListBuilder<StructBuilder> {
         vec![
             Field::new("offset", DataType::UInt64, false),
             Field::new("length", DataType::UInt64, false),
-            Field::new("checksum", DataType::FixedSizeBinary(32), false),  // Add the checksum field
+            Field::new("checksum", DataType::FixedSizeBinary(32), true),  // Add the checksum field
         ],
         vec![
             Box::new(offset_builder) as Box<dyn ArrayBuilder>,
@@ -392,3 +396,101 @@ pub fn decompress_archive(archive_path: &Path, save_data: bool, output_dir: &Pat
 
     Ok(report)
 }
+
+
+
+
+/// Muterar en batch: lägger till kolumn med fil-checksummor beräknade från chunkar,
+/// och ersätter chunk-checksum med null om `nuke_chunk_checksums` är `true`.
+/// Muterar en batch: lägger till kolumn med fil-checksummor beräknade från chunkar,
+/// och ersätter chunk-checksum med null om `nuke_chunk_checksums` är `true`.
+use arrow::array::*;
+
+pub fn add_file_checksums_and_cleanup(
+    batch: &mut RecordBatch,
+    nuke_chunk_checksums: bool,
+) -> Result<()> {
+    // Hämta "chunks" kolumnen
+    let chunks_array = batch
+        .column_by_name("chunks")
+        .context("Missing 'chunks' column")?;
+
+    let chunks = chunks_array
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .context("'chunks' is not ListArray")?;
+
+    let structs = chunks.values()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .context("'chunks' inner values not StructArray")?;
+
+    // Hitta checksum-fältet
+    let checksum_index = structs
+        .column_names()
+        .iter()
+        .position(|name| *name == "checksum")
+        .context("No 'checksum' field in struct")?;
+
+    let checksum_array = structs
+        .column(checksum_index)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .context("'checksum' is not FixedSizeBinaryArray")?;
+
+    // Initiera file_checksum builder
+    let mut file_checksum_builder = FixedSizeBinaryBuilder::with_capacity(batch.num_rows(), 32);
+
+    let offsets = chunks.value_offsets();
+    for row in 0..batch.num_rows() {
+        let start = offsets[row] as usize;
+        let end = offsets[row + 1] as usize;
+
+        if start == end {
+            file_checksum_builder.append_null();
+        } else {
+            let mut hasher = blake3::Hasher::new();
+            for i in start..end {
+                hasher.update(checksum_array.value(i));
+            }
+            file_checksum_builder.append_value(hasher.finalize().as_bytes())?;
+        }
+    }
+
+    let file_checksum_array = Arc::new(file_checksum_builder.finish()) as ArrayRef;
+
+    // Eventuellt nolla checksums
+    let new_struct_columns = {
+        let mut cols = structs.columns().to_vec();
+        if nuke_chunk_checksums {
+            let null_checksums = Arc::new(FixedSizeBinaryArray::new_null(32, structs.len())) as ArrayRef;
+            cols[checksum_index] = null_checksums;
+        }
+        cols
+    };
+
+    let new_struct_fields = structs.fields().to_vec();
+    let new_struct = StructArray::new(
+        new_struct_fields.into(),
+        new_struct_columns,
+        None,
+    );
+
+    let new_chunks_array = Arc::new(ListArray::new(
+        Arc::new(Field::new("chunks", new_struct.data_type().clone(), true)),
+        chunks.offsets().clone(),
+        Arc::new(new_struct),
+        chunks.nulls().cloned(),
+    )) as ArrayRef;
+
+    let mut new_columns = batch.columns().to_vec();
+    new_columns.push(file_checksum_array);
+    let mut new_fields = batch.schema().fields().to_vec();
+    new_fields.push(Arc::new(Field::new("file_checksum", DataType::FixedSizeBinary(32), true)));
+    let schema = Schema::new(Fields::from(new_fields));
+    *batch = RecordBatch::try_new(Arc::new(schema), new_columns)?;
+    
+    Ok(())
+}
+
+
