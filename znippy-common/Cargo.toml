@@ -13,6 +13,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 log = "0.4.27"
 hex = "0.4.3"
 arrow = "55.2.0"
+arrow-array = "55.2.0"
 zstd-sys = "2.0.15+zstd.1.5.7"
 crossbeam-channel = "0.5.15"
 rayon = "1.10.0"

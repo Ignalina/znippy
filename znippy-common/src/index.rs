@@ -6,6 +6,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use arrow::array::*;
 
+use parking_lot::Mutex;
+use zstd_sys::*;
 
 
 
@@ -19,7 +21,7 @@ use blake3::Hasher;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use zstd_sys::ZSTD_decompress;
-use crate::ChunkMeta;
+use crate::{decompress_archive, ChunkMeta};
 use crate::common_config::CONFIG;
 use crate::meta::ChunkMetaCompact;
 // === Arrow-schema ===
@@ -207,8 +209,10 @@ pub fn verify_archive_integrity(path: &Path) -> Result<VerifyReport> {
     decompress_archive(path, false, &out_dir)
 }
 
+
+
 // decompress_archive är kvar intakt och orörd
-pub fn decompress_archive(archive_path: &Path, save_data: bool, output_dir: &Path) -> Result<VerifyReport> {
+pub fn decompress_archive_old2(archive_path: &Path, save_data: bool, output_dir: &Path) -> Result<VerifyReport> {
     let (_schema, batches) = read_znippy_index(archive_path)?;
     let znippy_file = File::open(archive_path.with_extension("zdata"))?;
     let znippy_file = Arc::new(znippy_file);
@@ -489,7 +493,7 @@ pub fn add_file_checksums_and_cleanup(
     new_fields.push(Arc::new(Field::new("file_checksum", DataType::FixedSizeBinary(32), true)));
     let schema = Schema::new(Fields::from(new_fields));
     *batch = RecordBatch::try_new(Arc::new(schema), new_columns)?;
-    
+
     Ok(())
 }
 
