@@ -25,7 +25,7 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
         Field::new("relative_path", DataType::Utf8, false),
         Field::new("compressed", DataType::Boolean, true),
         Field::new("uncompressed_size", DataType::UInt64, false),
-        Field::new("checksum", DataType::FixedSizeBinary(32), false),
+        Field::new("checksum", DataType::FixedSizeBinary(32), true),
         Field::new(
             "chunks",
             DataType::List(Arc::new(Field::new(
@@ -98,7 +98,7 @@ pub fn convert_to_compact(
             let compact = ChunkMetaCompact {
                 offset: meta.offset,
                 length: meta.length,
-                checksum: [0u8; 32],
+                checksum: meta.checksum,
                 compressed: meta.compressed,
                 uncompressed_size: meta.uncompressed_size,
             };
@@ -114,14 +114,10 @@ pub fn build_arrow_batch(
     paths: &[PathBuf],
     metas: &Vec<Vec<ChunkMeta>>
 ) -> Result<RecordBatch> {
-
-    let metas: Vec<Vec<ChunkMetaCompact>> =convert_to_compact(metas, paths.len());
-    // create a fast lookuptable from 28 vector of ChunkMeta (in case of 28 cores)
-    // that is fileindex=key , value={ChunkMeta}
     let mut path_builder = StringBuilder::new();
     let mut compressed_builder = BooleanBuilder::new();
     let mut uncompressed_size_builder = UInt64Builder::new();
-    let mut checksum_builder = FixedSizeBinaryBuilder::new(32);  // Use 32 bytes for Blake3
+    let mut checksum_builder = FixedSizeBinaryBuilder::new(32);  // nullable column
 
     let mut chunks_builder = make_chunks_builder(paths.len());
 
@@ -130,40 +126,35 @@ pub fn build_arrow_batch(
 
         path_builder.append_value(path.to_string_lossy());
 
-        if let Some(first_chunk) = chunks.get(0) {
-            compressed_builder.append_value(first_chunk.compressed);
-            uncompressed_size_builder.append_value(first_chunk.uncompressed_size);
-            checksum_builder.append_value(first_chunk.checksum).expect("TODO: panic message");
-        } else {
+        if chunks.is_empty() {
             compressed_builder.append_value(false);
             uncompressed_size_builder.append_value(0);
             checksum_builder.append_null();
-        }
-
-        if chunks.is_empty() {
             chunks_builder.append_null();
-        } else {
-            for chunk in chunks.iter() {
-                chunks_builder
-                    .values()
-                    .field_builder::<UInt64Builder>(0)
-                    .unwrap()
-                    .append_value(chunk.offset);
-                chunks_builder
-                    .values()
-                    .field_builder::<UInt64Builder>(1)
-                    .unwrap()
-                    .append_value(chunk.length);
-                chunks_builder
-                    .values()
-                    .field_builder::<FixedSizeBinaryBuilder>(2)
-                    .unwrap()
-                    .append_value(&chunk.checksum)?;
-
-                chunks_builder.values().append(true);
-            }
-            chunks_builder.append(true);
+            continue;
         }
+
+        let total_uncompressed: u64 = chunks.iter().map(|c| c.uncompressed_size).sum();
+        compressed_builder.append_value(chunks[0].compressed);
+        uncompressed_size_builder.append_value(total_uncompressed);
+        checksum_builder.append_null();  // per-file checksum not written yet
+
+        for chunk in chunks {
+            chunks_builder
+                .values()
+                .field_builder::<UInt64Builder>(0).unwrap()
+                .append_value(chunk.offset);
+            chunks_builder
+                .values()
+                .field_builder::<UInt64Builder>(1).unwrap()
+                .append_value(chunk.length);
+            chunks_builder
+                .values()
+                .field_builder::<FixedSizeBinaryBuilder>(2).unwrap()
+                .append_value(&chunk.checksum)?;
+            chunks_builder.values().append(true);
+        }
+        chunks_builder.append(true);
     }
 
     let batch = RecordBatch::try_new(
@@ -179,7 +170,6 @@ pub fn build_arrow_batch(
 
     Ok(batch)
 }
-
 // === Återlagda funktioner ===
 
 pub fn read_znippy_index(path: &Path) -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
