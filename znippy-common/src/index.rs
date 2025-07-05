@@ -14,7 +14,7 @@ use zstd_sys::*;
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use arrow::datatypes::{DataType, Field, Fields, Schema};
-use arrow::array::{ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, ListBuilder, StringBuilder, StructBuilder, UInt64Builder, ArrayBuilder, FixedSizeBinaryArray, ListArray, StructArray, UInt64Array, StringArray, BooleanArray, make_builder, Array};
+use arrow::array::{ArrayRef, BooleanBuilder, ListBuilder, StringBuilder, StructBuilder, UInt64Builder, ArrayBuilder, FixedSizeBinaryArray, ListArray, StructArray, UInt64Array, StringArray, BooleanArray, make_builder, Array};
 use arrow::record_batch::RecordBatch;
 use arrow::ipc::reader::FileReader;
 use blake3::Hasher;
@@ -31,7 +31,7 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
         Field::new("relative_path", DataType::Utf8, false),
         Field::new("compressed", DataType::Boolean, true),
         Field::new("uncompressed_size", DataType::UInt64, false),
-        Field::new("checksum", DataType::FixedSizeBinary(32), true),
+        Field::new("checksum", DataType::Binary, true),
         Field::new(
             "chunks",
             DataType::List(Arc::new(Field::new(
@@ -39,7 +39,7 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
                 DataType::Struct(Fields::from(vec![
                     Field::new("offset", DataType::UInt64, false),
                     Field::new("length", DataType::UInt64, false),
-                    Field::new("checksum", DataType::FixedSizeBinary(32), true),
+                    Field::new("checksum", DataType::Binary, true),
                 ])),
                 true
             ))),
@@ -76,12 +76,12 @@ pub fn should_skip_compression(path: &Path) -> bool {
 pub fn make_chunks_builder(capacity: usize) -> ListBuilder<StructBuilder> {
     let offset_builder = UInt64Builder::with_capacity(capacity);
     let length_builder = UInt64Builder::with_capacity(capacity);
-    let checksum_builder = FixedSizeBinaryBuilder::with_capacity(capacity, 32);
+    let checksum_builder = BinaryBuilder::new();
     let struct_builder = StructBuilder::new(
         vec![
             Field::new("offset", DataType::UInt64, false),
             Field::new("length", DataType::UInt64, false),
-            Field::new("checksum", DataType::FixedSizeBinary(32), true),  // Add the checksum field
+            Field::new("checksum", DataType::Binary, true),  // Add the checksum field
         ],
         vec![
             Box::new(offset_builder) as Box<dyn ArrayBuilder>,
@@ -123,8 +123,7 @@ pub fn build_arrow_batch(
     let mut path_builder = StringBuilder::new();
     let mut compressed_builder = BooleanBuilder::new();
     let mut uncompressed_size_builder = UInt64Builder::new();
-    let mut checksum_builder = FixedSizeBinaryBuilder::new(32);  // nullable column
-
+    let mut checksum_builder = BinaryBuilder::with_capacity(paths.len(), 32);
     let mut chunks_builder = make_chunks_builder(paths.len());
 
     for (i, path) in paths.iter().enumerate() {
@@ -156,8 +155,8 @@ pub fn build_arrow_batch(
                 .append_value(chunk.length);
             chunks_builder
                 .values()
-                .field_builder::<FixedSizeBinaryBuilder>(2).unwrap()
-                .append_value(&chunk.checksum)?;
+                .field_builder::<BinaryBuilder>(2).unwrap()
+                .append_value(&chunk.checksum);
             chunks_builder.values().append(true);
         }
         chunks_builder.append(true);
@@ -183,6 +182,8 @@ pub fn read_znippy_index(path: &Path) -> Result<(Arc<Schema>, Vec<RecordBatch>)>
     let reader = FileReader::try_new(BufReader::new(file), None)?;
     let schema = reader.schema();
     let batches = reader.collect::<Result<Vec<_>, _>>()?;
+    eprintln!("Batch schema fields: {:?}", schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+
     Ok((schema, batches))
 }
 
@@ -211,198 +212,6 @@ pub fn verify_archive_integrity(path: &Path) -> Result<VerifyReport> {
 
 
 
-// decompress_archive är kvar intakt och orörd
-pub fn decompress_archive_old2(archive_path: &Path, save_data: bool, output_dir: &Path) -> Result<VerifyReport> {
-    let (_schema, batches) = read_znippy_index(archive_path)?;
-    let znippy_file = File::open(archive_path.with_extension("zdata"))?;
-    let znippy_file = Arc::new(znippy_file);
-
-    let (tx, rx): (Sender<(PathBuf, Vec<u8>, bool, u64, Vec<u8>)>, Receiver<_>) =
-        bounded(CONFIG.max_core_in_flight);
-
-    let mut report = VerifyReport::default();
-
-    let mut sys = System::new_with_specifics(
-        RefreshKind::everything().with_memory(MemoryRefreshKind::everything()),
-    );
-    let total_memory = sys.total_memory();
-    let sys = Arc::new(parking_lot::Mutex::new(sys));
-
-    std::thread::scope(|s| {
-        s.spawn({
-            let znippy_file = znippy_file.clone();
-            let tx = tx.clone();
-            let sys = sys.clone();
-            move || {
-                for batch in &batches {
-                    let paths = batch
-                        .column_by_name("relative_path")
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .unwrap();
-
-                    let compressed_flags = batch
-                        .column_by_name("compressed")
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<BooleanArray>()
-                        .unwrap();
-
-                    let sizes = batch
-                        .column_by_name("uncompressed_size")
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<UInt64Array>()
-                        .unwrap();
-
-                    let checksums = batch
-                        .column_by_name("checksum")
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<FixedSizeBinaryArray>()
-                        .unwrap();
-
-                    let chunks_array = batch
-                        .column_by_name("chunks")
-                        .unwrap()
-                        .as_any()
-                        .downcast_ref::<ListArray>()
-                        .unwrap();
-
-                    for row in 0..batch.num_rows() {
-                        report.total_files += 1;
-                        let path = PathBuf::from(paths.value(row));
-                        let compressed = compressed_flags.value(row);
-                        let size = sizes.value(row);
-                        let checksum_bytes = checksums.value(row).to_vec();
-
-                        let chunk_offsets: Vec<(u64, u64)> = {
-                            let list = chunks_array.value(row);
-                            let struct_array = list
-                                .as_any()
-                                .downcast_ref::<StructArray>()
-                                .unwrap();
-                            let offsets = struct_array
-                                .column_by_name("offset")
-                                .unwrap()
-                                .as_any()
-                                .downcast_ref::<UInt64Array>()
-                                .unwrap();
-                            let lengths = struct_array
-                                .column_by_name("length")
-                                .unwrap()
-                                .as_any()
-                                .downcast_ref::<UInt64Array>()
-                                .unwrap();
-                            (0..offsets.len())
-                                .map(|i| (offsets.value(i), lengths.value(i)))
-                                .collect()
-                        };
-
-                        let result = (|| -> Result<()> {
-                            loop {
-                                let mut sys = sys.lock();
-                                sys.refresh_memory();
-                                let used = sys.used_memory();
-                                let free_ratio = (total_memory - used) as f32 / total_memory as f32;
-                                if free_ratio > CONFIG.min_free_memory_ratio {
-                                    break;
-                                } else {
-                                    eprintln!(
-                                        "[verify] Low memory ({:.2}%), throttling reader...",
-                                        free_ratio * 100.0
-                                    );
-                                    std::thread::sleep(std::time::Duration::from_millis(100));
-                                }
-                            }
-
-                            let mut buf = vec![0u8;
-                                               chunk_offsets.iter().map(|(_, len)| len).sum::<u64>() as usize];
-                            let mut file = znippy_file
-                                .try_clone()
-                                .context("failed to clone zdata file")?;
-                            let mut pos = 0;
-                            for (offset, length) in &chunk_offsets {
-                                file.seek(SeekFrom::Start(*offset)).context("seek failed")?;
-                                file.read_exact(&mut buf[pos..(pos + *length as usize)])
-                                    .context("read failed")?;
-                                pos += *length as usize;
-                            }
-                            tx.send((path.clone(), buf, compressed, size, checksum_bytes.clone()))
-                                .context("channel send failed")?;
-                            Ok(())
-                        })();
-
-                        if let Err(err) = result {
-                            eprintln!(
-                                "[verify_archive_integrity] error processing file {:?}: {:#}",
-                                path, err
-                            );
-                            report.corrupt_files += 1;
-                        }
-                    }
-                }
-            }
-        });
-
-        for _ in 0..CONFIG.max_core_in_compress {
-            let rx = rx.clone();
-            let output_dir = output_dir.to_path_buf();
-            s.spawn(move || {
-                while let Ok((path, data, compressed, size, checksum_bytes)) = rx.recv() {
-                    report.total_bytes += size;
-                    let decompressed = if compressed {
-                        let mut out = vec![0u8; size as usize];
-                        unsafe {
-                            ZSTD_decompress(
-                                out.as_mut_ptr() as *mut _,
-                                out.len(),
-                                data.as_ptr() as *const _,
-                                data.len(),
-                            );
-                        }
-                        out
-                    } else {
-                        data
-                    };
-
-                    let mut hasher = Hasher::new();
-                    hasher.update(&decompressed);
-                    let hash = hasher.finalize();
-
-                    if hash.as_bytes() == checksum_bytes.as_slice() {
-                        report.verified_files += 1;
-                        report.verified_bytes += size;
-
-                        if save_data {
-                            let full_path = output_dir.join(&path);
-                            if let Some(parent) = full_path.parent() {
-                                std::fs::create_dir_all(parent).unwrap();
-                            }
-                            let mut f = OpenOptions::new()
-                                .create(true)
-                                .write(true)
-                                .truncate(true)
-                                .open(&full_path)
-                                .unwrap();
-                            f.write_all(&decompressed).unwrap();
-                        }
-                    } else {
-                        report.corrupt_files += 1;
-                        report.corrupt_bytes += size;
-                        eprintln!("❌ Checksum mismatch for {:?}", path);
-                    }
-                }
-            });
-        }
-    });
-
-    Ok(report)
-}
-
-
-
 
 /// Muterar en batch: lägger till kolumn med fil-checksummor beräknade från chunkar,
 /// och ersätter chunk-checksum med null om `nuke_chunk_checksums` är `true`.
@@ -414,7 +223,8 @@ pub fn add_file_checksums_and_cleanup(
     batch: &mut RecordBatch,
     nuke_chunk_checksums: bool,
 ) -> Result<()> {
-    // Hämta "chunks" kolumnen
+    log::info!("Batch schema fields: {:?}", batch.schema().fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+
     let chunks_array = batch
         .column_by_name("chunks")
         .context("Missing 'chunks' column")?;
@@ -429,72 +239,80 @@ pub fn add_file_checksums_and_cleanup(
         .downcast_ref::<StructArray>()
         .context("'chunks' inner values not StructArray")?;
 
-    // Hitta checksum-fältet
     let checksum_index = structs
         .column_names()
         .iter()
         .position(|name| *name == "checksum")
         .context("No 'checksum' field in struct")?;
 
+
     let checksum_array = structs
         .column(checksum_index)
         .as_any()
-        .downcast_ref::<FixedSizeBinaryArray>()
-        .context("'checksum' is not FixedSizeBinaryArray")?;
+        .downcast_ref::<BinaryArray>()
+        .context("'checksum' is not BinaryArray")?;
 
-    // Initiera file_checksum builder
-    let mut file_checksum_builder = FixedSizeBinaryBuilder::with_capacity(batch.num_rows(), 32);
 
     let offsets = chunks.value_offsets();
+//    let mut new_checksums = FixedSizeBinaryBuilder::with_capacity(batch.num_rows(), 32);
+    let mut new_checksums = BinaryBuilder::new();
+
     for row in 0..batch.num_rows() {
         let start = offsets[row] as usize;
         let end = offsets[row + 1] as usize;
 
         if start == end {
-            file_checksum_builder.append_null();
+            new_checksums.append_value(&[0u8; 32]);
         } else {
             let mut hasher = blake3::Hasher::new();
             for i in start..end {
                 hasher.update(checksum_array.value(i));
             }
-            file_checksum_builder.append_value(hasher.finalize().as_bytes())?;
+            let hash = hasher.finalize();
+            new_checksums.append_value(hash.as_bytes());
         }
     }
 
-    let file_checksum_array = Arc::new(file_checksum_builder.finish()) as ArrayRef;
+    let new_checksum_array = Arc::new(new_checksums.finish()) as ArrayRef;
 
-    // Eventuellt nolla checksums
-    let new_struct_columns = {
+    let mut columns = batch.columns().to_vec();
+    let checksum_col_index = batch
+        .schema()
+        .fields()
+        .iter()
+        .position(|f| f.name() == "checksum")
+        .context("Can't find 'checksum' column")?;
+    columns[checksum_col_index] = new_checksum_array;
+
+    if nuke_chunk_checksums {
         let mut cols = structs.columns().to_vec();
-        if nuke_chunk_checksums {
-            let null_checksums = Arc::new(FixedSizeBinaryArray::new_null(32, structs.len())) as ArrayRef;
-            cols[checksum_index] = null_checksums;
-        }
-        cols
-    };
+        let nulls = Arc::new(BinaryArray::from(vec![None; structs.len()])) as ArrayRef;
+        cols[checksum_index] = nulls;
 
-    let new_struct_fields = structs.fields().to_vec();
-    let new_struct = StructArray::new(
-        new_struct_fields.into(),
-        new_struct_columns,
-        None,
-    );
+        let new_struct = StructArray::new(
+            structs.fields().clone().into(),
+            cols,
+            None,
+        );
 
-    let new_chunks_array = Arc::new(ListArray::new(
-        Arc::new(Field::new("chunks", new_struct.data_type().clone(), true)),
-        chunks.offsets().clone(),
-        Arc::new(new_struct),
-        chunks.nulls().cloned(),
-    )) as ArrayRef;
+        let new_chunks_array = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", structs.data_type().clone(), true)),
+            chunks.offsets().clone(),
+            Arc::new(new_struct),
+            chunks.nulls().cloned(),
+        )) as ArrayRef;
 
-    let mut new_columns = batch.columns().to_vec();
-    new_columns.push(file_checksum_array);
-    let mut new_fields = batch.schema().fields().to_vec();
-    new_fields.push(Arc::new(Field::new("file_checksum", DataType::FixedSizeBinary(32), true)));
-    let schema = Schema::new(Fields::from(new_fields));
-    *batch = RecordBatch::try_new(Arc::new(schema), new_columns)?;
+        let chunk_col_index = batch
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == "chunks")
+            .context("Can't find 'chunks' column")?;
 
+        columns[chunk_col_index] = new_chunks_array;
+    }
+
+
+    *batch = RecordBatch::try_new(batch.schema().clone(), columns)?;
     Ok(())
 }
-
-
