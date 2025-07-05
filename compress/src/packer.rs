@@ -1,10 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
-<<<<<<< Updated upstream
 use std::net::Shutdown::Write as OtherWrite;
-=======
-use std::net::Shutdown::Write;
->>>>>>> Stashed changes
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -57,7 +53,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
     // Reader Thread with inflight counter
     let reader_thread = {
-        let mut local_file_paths = Vec::with_capacity(all_files.len());
+        let local_file_paths = Vec::with_capacity(all_files.len());
         let tx_chunk = tx_chunk.clone();
         let rx_done = rx_return.clone();
         let all_files = all_files.clone();
@@ -173,11 +169,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
             drop(revolver);    // Drop revolver if needed (Rust will also drop it when the thread finishes)
 
             // Return the statistics to the main thread
-<<<<<<< Updated upstream
             (uncompressed_files, uncompressed_bytes,compressed_files,compressed_bytes,local_file_paths)})
-=======
-            (uncompressed_files, uncompressed_bytes,compressed_files,compressed_bytes)})
->>>>>>> Stashed changes
     };
 
     // Compressor Threads pool
@@ -194,7 +186,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
         let chunk_size = chunk_size;
 
         let handle = thread::spawn(move || {
-            let mut local_chunkmeta: Vec<ChunkMeta> = Vec::new();
+            let local_chunkmeta: Vec<ChunkMeta> = Vec::new();
 
             unsafe {
                 let cctx = ZSTD_createCCtx();
@@ -325,11 +317,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
  
 
         while let Ok((file_index,chunk_seq ,compressed_data)) = rx_compressed.recv() {
-<<<<<<< Updated upstream
             log::debug!("[writer] Received compressed block from file {}: offset {}, length {}", file_index, writerstats.offset, compressed_data.len());
-=======
-            log::debug!("[writer] Received compressed block from file {}: offset {}, length {}", file_index, offset, compressed_data.len());
->>>>>>> Stashed changes
 
 
             if let Err(e) = writer.write_all(&compressed_data) {
@@ -337,16 +325,9 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                 continue;
             }
             writerstats.offset += compressed_data.len() as u64;
-<<<<<<< Updated upstream
             writerstats.total_chunks += 1;
             writerstats.total_written_bytes += compressed_data.len() as u64; // Update the total output bytes
 
-=======
-
-            writerstats.total_chunks += 1;
-            writerstats.total_written_bytes += compressed_data.len() as u64; // Update the total output bytes
-
->>>>>>> Stashed changes
             log::debug!("[writer] Writing compressed chunk at offset {} ({} bytes)", writerstats.offset, compressed_data.len());
         }
 
@@ -356,11 +337,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
 
     // Wait for reader thread to finish
-<<<<<<< Updated upstream
     let (uncompressed_files, uncompressed_bytes,compressed_files,compressed_bytes,file_paths) = reader_thread.join().unwrap();
-=======
-    let (uncompressed_files, uncompressed_bytes,compressed_files,compressed_bytes) = reader_thread.join().unwrap();
->>>>>>> Stashed changes
     log::debug!("[reader] reader_thread joined");
 
     // Drop the sender-side channels after the reader and compressor threads finish
@@ -393,7 +370,6 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
 
 
-<<<<<<< Updated upstream
     // After reading all data, prepare and write the index
     // Kanske flyttar denna till main då måste file_paths skickas ut tuppeln nedan
 
@@ -406,8 +382,6 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
     writer.finish()?;
     log::info!("[reader] Index written to {:?}", index_path);
 
-=======
->>>>>>> Stashed changes
     let report = CompressionReport {
         total_files,
         compressed_files ,

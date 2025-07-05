@@ -12,7 +12,6 @@ pub struct ChunkMeta {
     pub checksum: [u8; 32], // Added checksum to ChunkMeta
 }
 
-<<<<<<< Updated upstream
 #[derive(Debug, Clone)]
 pub struct ChunkMetaCompact {
     pub offset: u64,
@@ -22,8 +21,6 @@ pub struct ChunkMetaCompact {
     pub uncompressed_size: u64,
 }
 
-=======
->>>>>>> Stashed changes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriterStats {
     pub offset: u64,
