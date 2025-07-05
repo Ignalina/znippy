@@ -70,8 +70,7 @@ pub fn should_skip_compression(path: &Path) -> bool {
 pub fn make_chunks_builder(capacity: usize) -> ListBuilder<StructBuilder> {
     let offset_builder = UInt64Builder::with_capacity(capacity);
     let length_builder = UInt64Builder::with_capacity(capacity);
-    let checksum_builder = FixedSizeBinaryBuilder::new(capacity as i32);  // Cast usize to i32 for checksum builder
-
+    let checksum_builder = FixedSizeBinaryBuilder::with_capacity(capacity, 32);
     let struct_builder = StructBuilder::new(
         vec![
             Field::new("offset", DataType::UInt64, false),
