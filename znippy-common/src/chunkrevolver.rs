@@ -21,7 +21,7 @@ impl SendPtr {
 }
 /// En hanterad referens till en chunk i ChunkRevolver.
 pub struct RevolverChunk<'a> {
-    pub index: u32,
+    pub index: u64,
     pub data: &'a mut [u8],
 }
 
@@ -41,20 +41,20 @@ impl<'a> DerefMut for RevolverChunk<'a> {
 /// En chunk-revolver: förallokerat minnesblock delat i fasta slices, återanvänds via ring.
 pub struct ChunkRevolver {
     memory: Box<[u8]>,
-    chunk_size: usize,
+    chunk_size: u64,
     ring: RingBuffer,
 }
 
 impl ChunkRevolver {
     pub fn new() -> Self {
-        let chunk_size = CONFIG.file_split_block_size_usize();
-        let num_chunks = CONFIG.max_chunks as usize;
+        let chunk_size = CONFIG.file_split_block_size_usize() as u64;
+        let num_chunks = CONFIG.max_chunks as u64;
         let total_size = chunk_size * num_chunks;
 
-        let memory = vec![0u8; total_size].into_boxed_slice();
-        let mut ring = RingBuffer::new(num_chunks);
+        let memory = vec![0u8; total_size as usize].into_boxed_slice();
+        let mut ring = RingBuffer::new(num_chunks as usize);
         for i in 0..num_chunks as u32 {
-            ring.push(i);
+            ring.push(i.into());
         }
 
         Self {
@@ -66,16 +66,16 @@ impl ChunkRevolver {
 
     /// Få nästa tillgängliga chunk som en mutbar slice.
     pub fn get_chunk(&mut self) -> RevolverChunk {
-        let index = self.ring.pop().expect("ChunkRevolver underrun");
-        let offset = index as usize * self.chunk_size;
-        let data = &mut self.memory[offset..offset + self.chunk_size];
+        let index:u64 = self.ring.pop().expect("ChunkRevolver underrun");
+        let offset = index as usize * self.chunk_size as usize;
+        let data = &mut self.memory[offset..offset + self.chunk_size as usize];
 
         RevolverChunk { index, data }
     }
 
     /// Returnera en chunk för återanvändning.
-    pub fn return_chunk(&mut self, index: u32) {
-        self.ring.push(index);
+    pub fn return_chunk(&mut self, index: u64) {
+        self.ring.push(index.into());
     }
 
     /// Returnerar en råpekare till start av memoryblocket (för användning i andra trådar).
@@ -84,7 +84,7 @@ impl ChunkRevolver {
     }
 
     pub fn chunk_size(&self) -> usize {
-        self.chunk_size
+        self.chunk_size as usize
     }
 }
 

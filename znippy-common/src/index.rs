@@ -17,6 +17,7 @@ use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use zstd_sys::ZSTD_decompress;
 use crate::ChunkMeta;
 use crate::common_config::CONFIG;
+use crate::meta::ChunkMetaCompact;
 // === Arrow-schema ===
 
 pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
@@ -32,7 +33,7 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
                 DataType::Struct(Fields::from(vec![
                     Field::new("offset", DataType::UInt64, false),
                     Field::new("length", DataType::UInt64, false),
-                    Field::new("checksum", DataType::FixedSizeBinary(32), true),  
+                    Field::new("checksum", DataType::FixedSizeBinary(32), false),
                 ])),
                 true
             ))),
@@ -75,7 +76,7 @@ pub fn make_chunks_builder(capacity: usize) -> ListBuilder<StructBuilder> {
         vec![
             Field::new("offset", DataType::UInt64, false),
             Field::new("length", DataType::UInt64, false),
-            Field::new("checksum", DataType::FixedSizeBinary(32), true),  // Add the checksum field
+            Field::new("checksum", DataType::FixedSizeBinary(32), false),  // Add the checksum field
         ],
         vec![
             Box::new(offset_builder) as Box<dyn ArrayBuilder>,
@@ -86,10 +87,38 @@ pub fn make_chunks_builder(capacity: usize) -> ListBuilder<StructBuilder> {
 
     ListBuilder::new(struct_builder)
 }
+pub fn convert_to_compact(
+    nested: &[Vec<ChunkMeta>],
+    total_files: usize,
+) -> Vec<Vec<ChunkMetaCompact>> {
+    let mut result: Vec<Vec<ChunkMetaCompact>> = vec![Vec::new(); total_files];
+
+    for thread_vec in nested.iter() {
+        for meta in thread_vec {
+            let file_index = meta.file_index as usize;
+            let compact = ChunkMetaCompact {
+                offset: meta.offset,
+                length: meta.length,
+                checksum: [0u8; 32],
+                compressed: meta.compressed,
+                uncompressed_size: meta.uncompressed_size,
+            };
+            result[file_index].push(compact);
+        }
+    }
+
+    result
+}
+
+
 pub fn build_arrow_batch(
     paths: &[PathBuf],
-    metas: &[Vec<ChunkMeta>],
+    metas: &Vec<Vec<ChunkMeta>>
 ) -> Result<RecordBatch> {
+
+    let metas: Vec<Vec<ChunkMetaCompact>> =convert_to_compact(metas, paths.len());
+    // create a fast lookuptable from 28 vector of ChunkMeta (in case of 28 cores)
+    // that is fileindex=key , value={ChunkMeta}
     let mut path_builder = StringBuilder::new();
     let mut compressed_builder = BooleanBuilder::new();
     let mut uncompressed_size_builder = UInt64Builder::new();
@@ -105,11 +134,7 @@ pub fn build_arrow_batch(
         if let Some(first_chunk) = chunks.get(0) {
             compressed_builder.append_value(first_chunk.compressed);
             uncompressed_size_builder.append_value(first_chunk.uncompressed_size);
-            if let Some(checksum) = &first_chunk.checksum {
-                checksum_builder.append_value(checksum);
-            } else {
-                checksum_builder.append_null();
-            }
+            checksum_builder.append_value(first_chunk.checksum).expect("TODO: panic message");
         } else {
             compressed_builder.append_value(false);
             uncompressed_size_builder.append_value(0);
@@ -130,13 +155,13 @@ pub fn build_arrow_batch(
                     .field_builder::<UInt64Builder>(1)
                     .unwrap()
                     .append_value(chunk.length);
-                chunks_builder.values().append(true);
+                chunks_builder
+                    .values()
+                    .field_builder::<FixedSizeBinaryBuilder>(2)
+                    .unwrap()
+                    .append_value(&chunk.checksum)?;
 
-                if let Some(checksum) = &chunk.checksum {
-                    checksum_builder.append_value(checksum);
-                } else {
-                    checksum_builder.append_null();
-                }
+                chunks_builder.values().append(true);
             }
             chunks_builder.append(true);
         }

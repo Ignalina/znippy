@@ -2,7 +2,7 @@
 
 pub const MINI_SIZE: usize = 64; //  ~1G * 0.75 / 10MB
 pub const MEDIUM_SIZE: usize = 512; // ~8GB * 0.75 / 10MB
-pub const LARGE_SIZE: usize = 2048; // ~32GB * 0.75 / 10MB 
+pub const LARGE_SIZE: usize = 2048; // ~32GB * 0.75 / 10MB
 pub const STORLEK_ENORM: usize = 256_000; // ~2.44 TB @ 10MB per chunk
 
 struct RingState {
@@ -12,15 +12,15 @@ struct RingState {
 }
 
 struct RingInner<const N: usize> {
-    buf: Box<[u32; N]>,
+    buf: Box<[u64; N ]>,
     state: RingState,
 }
 
 impl<const N: usize> RingInner<N> {
     fn new() -> Self {
-        let mut array = Box::new([0u32; N]);
+        let mut array = Box::new([0u64; N]);
         for i in 0..N {
-             array[i] = i as u32;
+             array[i] = i as u64;
         }
         Self {
             buf: array,
@@ -32,7 +32,7 @@ impl<const N: usize> RingInner<N> {
         }
     }
 
-    fn pop(&mut self) -> Option<u32> {
+    fn pop(&mut self) -> Option<u64> {
         if self.state.len == 0 {
             None
         } else {
@@ -43,7 +43,7 @@ impl<const N: usize> RingInner<N> {
         }
     }
 
-    fn push(&mut self, val: u32) {
+    fn push(&mut self, val: u64) {
         self.buf[self.state.head] = val;
         self.state.head = (self.state.head + 1) % N;
         self.state.len += 1;
@@ -66,8 +66,8 @@ pub enum RingBuffer {
 }
 
 pub trait ChunkQueue {
-    fn pop(&mut self) -> Option<u32>;
-    fn push(&mut self, val: u32);
+    fn pop(&mut self) -> Option<u64>;
+    fn push(&mut self, val: u64);
     fn is_empty(&self) -> bool;
     fn capacity(&self) -> usize;
 }
@@ -87,7 +87,7 @@ impl RingBuffer {
 }
 
 impl ChunkQueue for RingBuffer {
-    fn pop(&mut self) -> Option<u32> {
+    fn pop(&mut self) -> Option<u64> {
         match self {
             RingBuffer::Mini(inner) => inner.pop(),
             RingBuffer::Large(inner) => inner.pop(),
@@ -96,7 +96,7 @@ impl ChunkQueue for RingBuffer {
         }
     }
 
-    fn push(&mut self, val: u32) {
+    fn push(&mut self, val: u64) {
         match self {
             RingBuffer::Mini(inner) => inner.push(val),
             RingBuffer::Large(inner) => inner.push(val),

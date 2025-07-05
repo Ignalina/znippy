@@ -23,7 +23,7 @@ impl ChunkPool {
             let buf: Box<[u8]> = vec![0u8; chunk_size].into_boxed_slice();
             buffers.push(buf.into()); // konverterar Box<[u8]> → Arc<[u8]>
 
-            ring.push(i);
+            ring.push(i.into());
         }
         log::debug!("chunk_ppol new() {} allocated " ,num_chunks);
 
@@ -31,14 +31,14 @@ impl ChunkPool {
     }
 
     /// Hämtar nästa lediga chunk-index från ringen.
-    pub fn get_index(&mut self) -> u32 {
+    pub fn get_index(&mut self) -> u64 {
         let idx = self.ring.pop().expect("RingBuffer underrun: inga lediga chunk-index kvar");
         log::trace!("[ChunkPool] get_index → {}", idx);
-        idx 
+        idx
     }
 
     /// Returnerar ett chunk-index till poolen.
-    pub fn return_index(&mut self, index: u32) {
+    pub fn return_index(&mut self, index: u64) {
         log::trace!("[ChunkPool] return_index ← {}", index);
         self.ring.push(index);
     }
