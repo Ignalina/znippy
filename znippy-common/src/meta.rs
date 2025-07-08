@@ -4,9 +4,8 @@ use serde::{Serialize, Deserialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkMeta {
     pub file_index: u64,
-    pub chunk_index: u64,
+    pub chunk_seq: u64,
     pub checksum_group: u16, // Added checksum to ChunkMeta
-    pub offset: u64,
     pub length: u64,
     pub compressed: bool,
     pub uncompressed_size: u64,

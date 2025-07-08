@@ -35,8 +35,9 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
             DataType::List(Arc::new(Field::new(
                 "item",
                 DataType::Struct(Fields::from(vec![
-                    Field::new("offset", DataType::UInt64, false),
+                    Field::new("zdata_offset", DataType::UInt64, false),
                     Field::new("length", DataType::UInt64, false),
+                    Field::new("chunk_seq", DataType::UInt64, false),
                     Field::new("checksum_group", DataType::UInt16, false),
                 ])),
                 true
@@ -66,7 +67,7 @@ pub fn is_probably_compressed(path: &Path) -> bool {
             "7z" | "rar" | "cab" | "jar" | "war" | "ear" |
             "zst" | "sz" | "lz4" | "tgz" | "txz" | "tbz" |
             "apk" | "dmg" | "deb" | "rpm" | "arrow" | "mpeg" |
-            "mpg" | "jpeg"| "jpg" | "gif" | "bmp" | "png" |
+            "mpg" | "jpeg"| "jpg" | "gif" | "bmp" | "png" | "znippy" | "zdata" | "parquet" |
             "webp" | "webm"
          )
     } else {
@@ -79,18 +80,22 @@ pub fn should_skip_compression(path: &Path) -> bool {
 }
 
 pub fn make_chunks_builder(capacity: usize) -> ListBuilder<StructBuilder> {
-    let offset_builder = UInt64Builder::with_capacity(capacity);
+    let zdata_offset_builder = UInt64Builder::with_capacity(capacity);
     let length_builder = UInt64Builder::with_capacity(capacity);
+    let chunk_seq_builder = UInt64Builder::with_capacity(capacity);
     let checksum_group_builder =UInt16Builder::with_capacity(capacity);
+
     let struct_builder = StructBuilder::new(
         vec![
-            Field::new("offset", DataType::UInt64, false),
+            Field::new("zdata_offset", DataType::UInt64, false),
             Field::new("length", DataType::UInt64, false),
+            Field::new("chunk_seq", DataType::UInt64, false),
             Field::new("checksum_group", DataType::UInt16, false),
         ],
         vec![
-            Box::new(offset_builder) as Box<dyn ArrayBuilder>,
+            Box::new(zdata_offset_builder) as Box<dyn ArrayBuilder>,
             Box::new(length_builder) as Box<dyn ArrayBuilder>,
+            Box::new(chunk_seq_builder) as Box<dyn ArrayBuilder>,
             Box::new(checksum_group_builder) as Box<dyn ArrayBuilder>,  // Include checksum builder
         ],
     );
@@ -127,18 +132,29 @@ pub fn build_arrow_batch(
         uncompressed_size_builder.append_value(total_uncompressed);
         checksum_group_builder.append_null();  // per-file checksum not written yet
 
+
+        Field::new("zdata_offset", DataType::UInt64, false),
+        Field::new("length", DataType::UInt64, false),
+        Field::new("chunk_seq", DataType::UInt64, false),
+        Field::new("checksum_group", DataType::UInt16, false),
+
+
         for chunk in chunks {
             chunks_builder
                 .values()
-                .field_builder::<UInt64Builder>(0).unwrap()
-                .append_value(chunk.offset);
+                .field_builder::<UInt64Builder>(1).unwrap()
+                .append_value(0);
             chunks_builder
                 .values()
-                .field_builder::<UInt64Builder>(1).unwrap()
+                .field_builder::<UInt64Builder>(2).unwrap()
                 .append_value(chunk.length);
             chunks_builder
                 .values()
-                .field_builder::<UInt16Builder>(2).unwrap()
+                .field_builder::<UInt64Builder>(3).unwrap()
+                .append_value(chunk.chunk_seq);
+            chunks_builder
+                .values()
+                .field_builder::<UInt16Builder>(4).unwrap()
                 .append_value(chunk.checksum_group);
             chunks_builder.values().append(true);
         }

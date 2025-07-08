@@ -43,7 +43,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
     let total_files:u64 = all_files.len() as u64;
 
-    let (tx_chunk, rx_chunk): (Sender<(u64, u64, u64, bool, u64)>, Receiver<_>) = bounded(CONFIG.max_core_in_flight);
+    let (tx_chunk, rx_chunk): (Sender<(u64, u64, u64, bool)>, Receiver<_>) = bounded(CONFIG.max_core_in_flight);
 
     let (tx_compressed, rx_compressed): (Sender<(u64,u64, Arc<[u8]>)>, Receiver<(u64,u64, Arc<[u8]>)>) = unbounded();
     let (tx_return, rx_return): (Sender<u64>, Receiver<u64>) = unbounded();
@@ -95,7 +95,6 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                 };
                 let mut reader = BufReader::new(file);
                 let mut has_read_any_data = false;
-                let chunk_seq:u64=0;
                 loop {
                     // Handle returned chunk numbers to prevent reader from blocking
                     while let Ok(returned) = rx_done.try_recv() {
@@ -114,7 +113,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                 if !has_read_any_data {
                                     log::debug!("[reader] Zero-length file {}", file_index);
                                     // ⬇️ Skicka en chunk med 0 bytes för att markera tom fil
-                                    tx_chunk.send((file_index as u64, chunk_index, 0, skip, chunk_seq)).unwrap();
+                                    tx_chunk.send((file_index as u64, chunk_index, 0, skip)).unwrap();
                                     inflight_chunks += 1;
                                 } else {
                                     log::debug!("[reader] EOF after data for file {}", file_index);
@@ -127,7 +126,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                 has_read_any_data = true;
                                 log::debug!("[reader] Read {} bytes from file {}", bytes_read, file_index);
                                 log::debug!("[reader] Sending chunk {} from file {} to compressor", chunk_index, file_index);
-                                tx_chunk.send((file_index as u64, chunk_index, bytes_read as u64, skip, chunk_seq)).unwrap();
+                                tx_chunk.send((file_index as u64, chunk_index, bytes_read as u64, skip)).unwrap();
                                 inflight_chunks += 1;
                             }
                             Err(e) => {
@@ -182,7 +181,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
 
     let mut compressor_threads = Vec::with_capacity(CONFIG.max_core_in_flight as usize);
-    for _ in 0..CONFIG.max_core_in_flight {
+    for compressor_group in 0..CONFIG.max_core_in_flight {
         let rx_chunk = rx_chunk.clone();
         let tx_compressed = tx_compressed.clone();
         let tx_ret = tx_return.clone();
@@ -192,7 +191,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
         let handle = thread::spawn(move || {
             let mut local_chunkmeta: Vec<ChunkMeta> = Vec::new();
             let mut hasher = Hasher::new(); // Blake3 hash initialization
-
+            let mut chunk_seq:u64=0;
             unsafe {
                 let cctx = ZSTD_createCCtx();
                 assert!(!cctx.is_null(), "ZSTD_createCCtx failed");
@@ -203,7 +202,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
                 loop {
                     match rx_chunk.recv() {
-                        Ok((file_index, chunk_nr, used, skip, chunk_index)) => {
+                        Ok((file_index, chunk_nr, used, skip)) => {
                             log::debug!("[compressor] Processing chunk {} from file {}: {} bytes", chunk_nr, file_index, used);
                             let input = get_chunk_slice(base_ptr.as_ptr(), chunk_size, chunk_nr as u32, used as usize);
                             let chunk_meta;
@@ -211,21 +210,20 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
 
                             if skip {
-                                log::debug!("[compressor] Skipping compression for chunk {} of file {}", chunk_index, file_index);
+                                log::debug!("[compressor] Skipping compression for chunk {} of file {}", chunk_nr,file_index);
                                 output = Arc::from(input);
                                 hasher.update(&output);
 
                                 chunk_meta = ChunkMeta {
                                     file_index: file_index as u64,
-                                    chunk_index: chunk_index ,
-                                    checksum_group: 0,
-                                    offset: 0,
-                                    length: used as u64,
+                                    chunk_seq: chunk_seq ,
+                                    checksum_group: compressor_group as u16,
+                                    length: used ,
                                     compressed: false,
                                     uncompressed_size: used as u64,
                                 };
                             } else {
-                                log::debug!("[compressor] Compressing chunk {} from file {} ({} bytes)", chunk_index, file_index, used);
+                                log::debug!("[compressor] Compressing chunk {} from file {} ({} bytes)", chunk_nr, file_index, used);
 
                                 output = {
                                     let input_ptr = input.as_ptr();
@@ -268,9 +266,8 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
                                     chunk_meta = ChunkMeta {
                                         file_index,
-                                        chunk_index,
+                                        chunk_seq,
                                         checksum_group: 0,
-                                        offset: 0,
                                         length: output_buffer.pos as u64,
                                         compressed: true,
                                         uncompressed_size: used as u64,
@@ -280,11 +277,11 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                 };
                             }
                             local_chunkmeta.push(chunk_meta.clone());                            // Send compressed metadata to the next thread (writer)
-                            log::debug!("[compressor] Sending chunk {} of file {} to writer", chunk_index, file_index);
-                            tx_compressed.send((file_index, chunk_index, output)).unwrap();
+                            log::debug!("[compressor] Sending chunk {} of file {} to writer", chunk_nr, file_index);
+                            tx_compressed.send((file_index, chunk_nr, output)).unwrap();
                             //                    tx_ret.send(chunk_index).unwrap();
                             // Send **metadata** (with checksum) to the reader for aggregation and indexing
-                            log::debug!("[compressor] Sending metadata for chunk {} of file {} to reader", chunk_index, file_index);
+                            log::debug!("[compressor] Sending metadata for chunk {} of file {} to reader", chunk_nr, file_index);
                             tx_ret.send(chunk_nr);  // Send chunk metadata to reader (including checksum)
                         }
                         Err(_) => {
@@ -293,6 +290,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                             break;
                         }
                     }
+                    chunk_seq+=1;
                 }
 
                 ZSTD_freeCCtx(cctx);
@@ -309,7 +307,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
             }
             log::info!("📦 Compressor thread returning {} ChunkMeta", local_chunkmeta.len());
 
-            ( local_chunkmeta,*hasher.finalize().as_bytes())
+            ( compressor_group, local_chunkmeta,*hasher.finalize().as_bytes())
         });
         compressor_threads.push(handle);
     }
@@ -354,13 +352,13 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
 
     let mut all_chunkmeta: Vec<Vec<ChunkMeta>> = Vec::with_capacity(CONFIG.max_core_in_compress as usize);
-    let mut all_checksum_group: Vec<[u8;32]>  = Vec::with_capacity(CONFIG.max_core_in_compress as usize);
+    let mut all_checksum: Vec<[u8;32]>  = Vec::with_capacity(CONFIG.max_core_in_compress as usize);
 
     let mut  i=0;
     for handle in compressor_threads {
-        let (metas,checksumm) = handle.join().unwrap();
-        all_chunkmeta.push(metas);
-        all_checksum_group.push(checksumm)
+        let (compressor_group,metas,checksum) = handle.join().unwrap();
+        all_checksum.insert(compressor_group,checksum);
+        all_chunkmeta.insert(compressor_group,metas);
     }
 
     log::info!("📦 Compressor thread returning {} ChunkMeta", all_chunkmeta.len());
