@@ -21,7 +21,7 @@ use blake3::Hasher;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use zstd_sys::ZSTD_decompress;
-use crate::{decompress_archive, ChunkMeta};
+use crate::{decompress_archive, ChunkMeta, FileMeta};
 use crate::common_config::CONFIG;
 // === Arrow-schema ===
 
@@ -37,8 +37,8 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
                 DataType::Struct(Fields::from(vec![
                     Field::new("zdata_offset", DataType::UInt64, false),
                     Field::new("length", DataType::UInt64, false),
-                    Field::new("chunk_seq", DataType::UInt64, false),
-                    Field::new("checksum_group", DataType::UInt16, false),
+                    Field::new("chunk_seq", DataType::UInt32, false),
+                    Field::new("checksum_group", DataType::UInt8, false),
                 ])),
                 true
             ))),
@@ -48,7 +48,7 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
 });
 pub static ZNIPPY_INDEX_BLAKE3_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
     Arc::new(Schema::new(vec![
-        Field::new("checksum_group", DataType::UInt16, false),
+        Field::new("checksum_group", DataType::UInt8, false),
         Field::new("checksum", DataType::Binary, true),
     ]))
 });
@@ -79,102 +79,74 @@ pub fn should_skip_compression(path: &Path) -> bool {
     is_probably_compressed(path)
 }
 
-pub fn make_chunks_builder(capacity: usize) -> ListBuilder<StructBuilder> {
-    let zdata_offset_builder = UInt64Builder::with_capacity(capacity);
-    let length_builder = UInt64Builder::with_capacity(capacity);
-    let chunk_seq_builder = UInt64Builder::with_capacity(capacity);
-    let checksum_group_builder =UInt16Builder::with_capacity(capacity);
 
-    let struct_builder = StructBuilder::new(
+
+pub fn build_arrow_batch_from_files(files: &[FileMeta]) -> arrow::error::Result<RecordBatch> {
+    let mut relative_path_builder = StringBuilder::new();
+    let mut compressed_builder = BooleanBuilder::new();
+    let mut uncompressed_size_builder = UInt64Builder::new();
+
+    // Create the StructBuilder for chunk data
+    let chunk_struct_builder = StructBuilder::new(
         vec![
             Field::new("zdata_offset", DataType::UInt64, false),
             Field::new("length", DataType::UInt64, false),
-            Field::new("chunk_seq", DataType::UInt64, false),
-            Field::new("checksum_group", DataType::UInt16, false),
+            Field::new("chunk_seq", DataType::UInt32, false),
+            Field::new("checksum_group", DataType::UInt8, false),
         ],
         vec![
-            Box::new(zdata_offset_builder) as Box<dyn ArrayBuilder>,
-            Box::new(length_builder) as Box<dyn ArrayBuilder>,
-            Box::new(chunk_seq_builder) as Box<dyn ArrayBuilder>,
-            Box::new(checksum_group_builder) as Box<dyn ArrayBuilder>,  // Include checksum builder
+            Box::new(UInt64Builder::new()),
+            Box::new(UInt64Builder::new()),
+            Box::new(UInt32Builder::new()),
+            Box::new(UInt8Builder::new()),
         ],
     );
 
-    ListBuilder::new(struct_builder)
-}
+    let mut chunks_builder = ListBuilder::new(chunk_struct_builder);
 
+    for file in files {
+        // Append each file's path, compression status, and uncompressed size
+        relative_path_builder.append_value(&file.relative_path);
+        compressed_builder.append_value(file.compressed);
+        uncompressed_size_builder.append_value(file.uncompressed_size);
 
-pub fn build_arrow_batch(
-    paths: &[PathBuf],
-    metas: &Vec<Vec<ChunkMeta>>
-) -> Result<RecordBatch> {
-    let mut path_builder = StringBuilder::new();
-    let mut compressed_builder = BooleanBuilder::new();
-    let mut uncompressed_size_builder = UInt64Builder::new();
-    let mut checksum_group_builder = UInt16Builder::new();
-    let mut chunks_builder = make_chunks_builder(paths.len());
+        // Access the values for appending chunk data
+        let struct_builder = chunks_builder.values();
 
-    for (i, path) in paths.iter().enumerate() {
-        let chunks = &metas[i];
-
-        path_builder.append_value(path.to_string_lossy());
-
-        if chunks.is_empty() {
-            compressed_builder.append_value(false);
-            uncompressed_size_builder.append_value(0);
-            checksum_group_builder.append_null();
+        // If there are no chunks, append null for this file's chunk list
+        if file.chunks.is_empty() {
             chunks_builder.append_null();
             continue;
         }
 
-        let total_uncompressed: u64 = chunks.iter().map(|c| c.uncompressed_size).sum();
-        compressed_builder.append_value(chunks[0].compressed);
-        uncompressed_size_builder.append_value(total_uncompressed);
-        checksum_group_builder.append_null();  // per-file checksum not written yet
+        // Iterate over the chunks in the file and append the data to the struct
+        for chunk in &file.chunks {
+            // Check and append values to the struct builder
+            let zdata_offset_builder = struct_builder.field_builder::<UInt64Builder>(0).unwrap();
+            zdata_offset_builder.append_value(chunk.zdata_offset);
 
+            let length_builder = struct_builder.field_builder::<UInt64Builder>(1).unwrap();
+            length_builder.append_value(chunk.length);
 
-        Field::new("zdata_offset", DataType::UInt64, false),
-        Field::new("length", DataType::UInt64, false),
-        Field::new("chunk_seq", DataType::UInt64, false),
-        Field::new("checksum_group", DataType::UInt16, false),
+            let chunk_seq_builder = struct_builder.field_builder::<UInt32Builder>(2).unwrap();
+            chunk_seq_builder.append_value(chunk.chunk_seq);
 
+            let checksum_group_builder = struct_builder.field_builder::<UInt8Builder>(3).unwrap();
+            checksum_group_builder.append_value(chunk.checksum_group);
 
-        for chunk in chunks {
-            chunks_builder
-                .values()
-                .field_builder::<UInt64Builder>(1).unwrap()
-                .append_value(0);
-            chunks_builder
-                .values()
-                .field_builder::<UInt64Builder>(2).unwrap()
-                .append_value(chunk.length);
-            chunks_builder
-                .values()
-                .field_builder::<UInt64Builder>(3).unwrap()
-                .append_value(chunk.chunk_seq);
-            chunks_builder
-                .values()
-                .field_builder::<UInt16Builder>(4).unwrap()
-                .append_value(chunk.checksum_group);
-            chunks_builder.values().append(true);
+            struct_builder.append(true); // Append this chunk
         }
-        chunks_builder.append(true);
+
+        chunks_builder.append(true); // Append this file's chunks to the list
     }
 
-    let batch = RecordBatch::try_new(
-        znippy_index_schema().clone(),
-        vec![
-            Arc::new(path_builder.finish()) as ArrayRef,
-            Arc::new(compressed_builder.finish()),
-            Arc::new(uncompressed_size_builder.finish()),
-            Arc::new(checksum_group_builder.finish()),
-            Arc::new(chunks_builder.finish()),
-        ],
-    )?;
-
-    Ok(batch)
+    RecordBatch::try_from_iter(vec![
+        ("relative_path", Arc::new(relative_path_builder.finish()) as ArrayRef),
+        ("compressed", Arc::new(compressed_builder.finish()) as ArrayRef),
+        ("uncompressed_size", Arc::new(uncompressed_size_builder.finish()) as ArrayRef),
+        ("chunks", Arc::new(chunks_builder.finish()) as ArrayRef),
+    ])
 }
-// === Återlagda funktioner ===
 
 pub fn read_znippy_index(path: &Path) -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
     let file = File::open(path)?;
