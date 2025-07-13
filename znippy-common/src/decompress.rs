@@ -38,7 +38,6 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
     let out_dir = Arc::new(out_dir.to_path_buf());
     let mut report = VerifyReport::default();
 
-    // 📍 Writer tråd – flyttad utanför batch-loopen
     let rx = chunk_rx.clone();
     let out_dir_cloned = Arc::clone(&out_dir);
     let file_checksums_cloned = Arc::clone(&file_checksums);
