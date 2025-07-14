@@ -11,8 +11,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use arrow::array::{BinaryArray, ListArray, StringArray, StructArray, UInt64Array};
-use arrow_array::Array;
+use arrow_array::{Array, BinaryArray, ListArray, StringArray, StructArray, UInt64Array};
+
 use blake3::Hasher;
 use crossbeam_channel::{bounded, Receiver, Sender};
 
@@ -23,12 +23,12 @@ use crate::{
 };
 
 pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) -> Result<VerifyReport> {
+    let zdata_path = index_path.with_extension("zdata");
+
     let (_schema, batches) = read_znippy_index(index_path)?;
     let file_checksums = extract_file_checksums(&batches)?;
     let file_checksums = Arc::new(file_checksums);
 
-    let zdata_path = index_path.with_extension("zdata");
-    let zdata_file = Arc::new(Mutex::new(File::open(&zdata_path)?));
 
     let (work_tx, work_rx): (Sender<(usize, u16, Vec<u8>)>, Receiver<_>) = bounded(CONFIG.max_core_in_flight);
     let (chunk_tx, chunk_rx): (Sender<(usize, u16, Vec<u8>, [u8; 32])>, Receiver<_>) = bounded(CONFIG.max_core_in_flight);
@@ -47,23 +47,27 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
 
 // READER
-    for batch in batches {
-        let file_count = batch.num_rows();
-        let paths = batch.column_by_name("relative_path").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-        let chunks_array = batch.column_by_name("chunks").unwrap().as_any().downcast_ref::<ListArray>().unwrap();
-        let struct_array = chunks_array.values().as_any().downcast_ref::<StructArray>().unwrap();
-        let offsets_arr = struct_array.column_by_name("offset").unwrap().as_any().downcast_ref::<UInt64Array>().unwrap();
-        let lengths_arr = struct_array.column_by_name("length").unwrap().as_any().downcast_ref::<UInt64Array>().unwrap();
-        let chunk_offsets = chunks_array.value_offsets();
 
         let cc = Arc::clone(&chunk_counts);
         let tx = work_tx.clone();
-        let file = Arc::clone(&zdata_file);
         let done_rx = done_rx.clone();
 
-        thread::scope(|s| {
-            s.spawn(move || {
-                for file_index in 0..file_count {
+        thread::spawn(move || {
+            let mut zdata_file = File::open(&zdata_path).expect("Failed to open .zdata file");
+
+            let Some(batch) = batches.get(0) else {
+                eprintln!("❌ No batch found in index");
+                return;
+            };
+            let file_count = batch.num_rows();
+                let paths = batch.column_by_name("relative_path").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+                let chunks_array = batch.column_by_name("chunks").unwrap().as_any().downcast_ref::<ListArray>().unwrap();
+                let struct_array = chunks_array.values().as_any().downcast_ref::<StructArray>().unwrap();
+                let offsets_arr = struct_array.column_by_name("offset").unwrap().as_any().downcast_ref::<UInt64Array>().unwrap();
+                let lengths_arr = struct_array.column_by_name("length").unwrap().as_any().downcast_ref::<UInt64Array>().unwrap();
+                let chunk_offsets = chunks_array.value_offsets();
+
+            for file_index in 0..file_count {
                     let start = chunk_offsets[file_index] as usize;
                     let end = chunk_offsets[file_index + 1] as usize;
                     let n_chunks = (end - start) as u16;
@@ -76,24 +80,21 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
                         let mut buf = vec![0u8; length as usize];
                         {
-                            let mut f = file.lock().unwrap();
-                            f.seek(SeekFrom::Start(offset)).unwrap();
-                            f.read_exact(&mut buf).unwrap();
+                            zdata_file.seek(SeekFrom::Start(offset)).unwrap();
+                            zdata_file.read_exact(&mut buf).unwrap();
                         }
 
                         tx.send((file_index, local_idx, buf)).unwrap();
                     }
 
                     done_rx.recv().unwrap();
-                }
+
+            }
+
             });
 
-
-        });
-    }
 // DECOMPRESSOR
     let mut decompressor_threads = Vec::with_capacity(CONFIG.max_core_in_compress as u8 as usize);
-
     for _ in 0..CONFIG.max_core_in_compress {
         let rx = work_rx.clone();
         let tx = chunk_tx.clone();
