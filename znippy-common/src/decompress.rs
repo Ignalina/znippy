@@ -44,6 +44,79 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
     let cc_cloned = Arc::clone(&chunk_counts);
     let done_tx_cloned = done_tx.clone();
 
+
+
+// READER
+    for batch in batches {
+        let file_count = batch.num_rows();
+        let paths = batch.column_by_name("relative_path").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let chunks_array = batch.column_by_name("chunks").unwrap().as_any().downcast_ref::<ListArray>().unwrap();
+        let struct_array = chunks_array.values().as_any().downcast_ref::<StructArray>().unwrap();
+        let offsets_arr = struct_array.column_by_name("offset").unwrap().as_any().downcast_ref::<UInt64Array>().unwrap();
+        let lengths_arr = struct_array.column_by_name("length").unwrap().as_any().downcast_ref::<UInt64Array>().unwrap();
+        let chunk_offsets = chunks_array.value_offsets();
+
+        let cc = Arc::clone(&chunk_counts);
+        let tx = work_tx.clone();
+        let file = Arc::clone(&zdata_file);
+        let done_rx = done_rx.clone();
+
+        thread::scope(|s| {
+            s.spawn(move || {
+                for file_index in 0..file_count {
+                    let start = chunk_offsets[file_index] as usize;
+                    let end = chunk_offsets[file_index + 1] as usize;
+                    let n_chunks = (end - start) as u16;
+                    cc.lock().unwrap().insert(file_index, n_chunks);
+
+                    for local_idx in 0..n_chunks {
+                        let global_idx = start + local_idx as usize;
+                        let offset = offsets_arr.value(global_idx);
+                        let length = lengths_arr.value(global_idx);
+
+                        let mut buf = vec![0u8; length as usize];
+                        {
+                            let mut f = file.lock().unwrap();
+                            f.seek(SeekFrom::Start(offset)).unwrap();
+                            f.read_exact(&mut buf).unwrap();
+                        }
+
+                        tx.send((file_index, local_idx, buf)).unwrap();
+                    }
+
+                    done_rx.recv().unwrap();
+                }
+            });
+
+
+        });
+    }
+// DECOMPRESSOR
+    let mut decompressor_threads = Vec::with_capacity(CONFIG.max_core_in_compress as u8 as usize);
+
+    for _ in 0..CONFIG.max_core_in_compress {
+        let rx = work_rx.clone();
+        let tx = chunk_tx.clone();
+        let handle=thread::spawn(move || {
+            while let Ok((file_index, chunk_idx, data)) = rx.recv() {
+                match decompress_chunk_stream(&data) {
+                    Ok(decompressed) => {
+                        let mut hasher = Hasher::new();
+                        hasher.update(&decompressed);
+                        let checksum = hasher.finalize().into();
+                        tx.send((file_index, chunk_idx, decompressed, checksum)).unwrap();
+                    }
+                    Err(e) => {
+                        eprintln!("Decompression failed: {}", e);
+                    }
+                }
+            }
+        });
+        decompressor_threads.push(handle);
+    }
+
+
+    // [WRITER]
     thread::spawn(move || {
         let mut per_file_chunks: HashMap<usize, HashMap<u16, Vec<u8>>> = HashMap::new();
         let mut per_file_partial: HashMap<usize, HashMap<u16, [u8; 32]>> = HashMap::new();
@@ -90,69 +163,6 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
             }
         }
     });
-
-    for batch in batches {
-        let file_count = batch.num_rows();
-        let paths = batch.column_by_name("relative_path").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-        let chunks_array = batch.column_by_name("chunks").unwrap().as_any().downcast_ref::<ListArray>().unwrap();
-        let struct_array = chunks_array.values().as_any().downcast_ref::<StructArray>().unwrap();
-        let offsets_arr = struct_array.column_by_name("offset").unwrap().as_any().downcast_ref::<UInt64Array>().unwrap();
-        let lengths_arr = struct_array.column_by_name("length").unwrap().as_any().downcast_ref::<UInt64Array>().unwrap();
-        let chunk_offsets = chunks_array.value_offsets();
-
-        let cc = Arc::clone(&chunk_counts);
-        let tx = work_tx.clone();
-        let file = Arc::clone(&zdata_file);
-        let done_rx = done_rx.clone();
-
-        thread::scope(|s| {
-            s.spawn(move || {
-                for file_index in 0..file_count {
-                    let start = chunk_offsets[file_index] as usize;
-                    let end = chunk_offsets[file_index + 1] as usize;
-                    let n_chunks = (end - start) as u16;
-                    cc.lock().unwrap().insert(file_index, n_chunks);
-
-                    for local_idx in 0..n_chunks {
-                        let global_idx = start + local_idx as usize;
-                        let offset = offsets_arr.value(global_idx);
-                        let length = lengths_arr.value(global_idx);
-
-                        let mut buf = vec![0u8; length as usize];
-                        {
-                            let mut f = file.lock().unwrap();
-                            f.seek(SeekFrom::Start(offset)).unwrap();
-                            f.read_exact(&mut buf).unwrap();
-                        }
-
-                        tx.send((file_index, local_idx, buf)).unwrap();
-                    }
-
-                    done_rx.recv().unwrap();
-                }
-            });
-
-            for _ in 0..CONFIG.max_core_in_compress {
-                let rx = work_rx.clone();
-                let tx = chunk_tx.clone();
-                s.spawn(move || {
-                    while let Ok((file_index, chunk_idx, data)) = rx.recv() {
-                        match decompress_chunk_stream(&data) {
-                            Ok(decompressed) => {
-                                let mut hasher = Hasher::new();
-                                hasher.update(&decompressed);
-                                let checksum = hasher.finalize().into();
-                                tx.send((file_index, chunk_idx, decompressed, checksum)).unwrap();
-                            }
-                            Err(e) => {
-                                eprintln!("Decompression failed: {}", e);
-                            }
-                        }
-                    }
-                });
-            }
-        });
-    }
 
     Ok(report)
 }
