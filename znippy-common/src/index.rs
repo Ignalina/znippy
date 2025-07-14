@@ -36,6 +36,7 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
                 "item",
                 DataType::Struct(Fields::from(vec![
                     Field::new("zdata_offset", DataType::UInt64, false),
+                    Field::new("fdata_offset", DataType::UInt64, false),
                     Field::new("length", DataType::UInt64, false),
                     Field::new("chunk_seq", DataType::UInt32, false),
                     Field::new("checksum_group", DataType::UInt8, false),
@@ -90,11 +91,13 @@ pub fn build_arrow_batch_from_files(files: &[FileMeta]) -> arrow::error::Result<
     let chunk_struct_builder = StructBuilder::new(
         vec![
             Field::new("zdata_offset", DataType::UInt64, false),
+            Field::new("fdata_offset", DataType::UInt64, false),
             Field::new("length", DataType::UInt64, false),
             Field::new("chunk_seq", DataType::UInt32, false),
             Field::new("checksum_group", DataType::UInt8, false),
         ],
         vec![
+            Box::new(UInt64Builder::new()),
             Box::new(UInt64Builder::new()),
             Box::new(UInt64Builder::new()),
             Box::new(UInt32Builder::new()),
@@ -125,8 +128,12 @@ pub fn build_arrow_batch_from_files(files: &[FileMeta]) -> arrow::error::Result<
             let zdata_offset_builder = struct_builder.field_builder::<UInt64Builder>(0).unwrap();
             zdata_offset_builder.append_value(chunk.zdata_offset);
 
+            // Check and append values to the struct builder
+            let fdata_offset_builder = struct_builder.field_builder::<UInt64Builder>(0).unwrap();
+            fdata_offset_builder.append_value(chunk.fdata_offset);
+
             let length_builder = struct_builder.field_builder::<UInt64Builder>(1).unwrap();
-            length_builder.append_value(chunk.length);
+            length_builder.append_value(chunk.compressed_size);
 
             let chunk_seq_builder = struct_builder.field_builder::<UInt32Builder>(2).unwrap();
             chunk_seq_builder.append_value(chunk.chunk_seq);
