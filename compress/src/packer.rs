@@ -12,7 +12,7 @@ use znippy_common::chunkrevolver::{ChunkRevolver, RevolverChunk, SendPtr, get_ch
 use znippy_common::common_config::CONFIG;
 use znippy_common::{build_arrow_batch_from_files, CompressionReport, FileMeta};
 use znippy_common::meta::{ChunkMeta, WriterStats};
-use znippy_common::index::should_skip_compression;
+use znippy_common::index::{build_arrow_batch_for_checksums, should_skip_compression};
 use zstd_sys::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
 use zstd_sys::ZSTD_ResetDirective::ZSTD_reset_session_only;
 use arrow::ipc::writer::{FileWriter, IpcWriteOptions};
@@ -445,6 +445,10 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
 
 
+    // After compressor threads are done and you have the checksums
+    let checksum_batch = build_arrow_batch_for_checksums(checksums)?;
+
+
     // After compressor threads are done, drop tx_compressed
     drop(tx_compressed);
     log::debug!("[compressor] tx_compressed dropped after compressors finished");
@@ -452,13 +456,19 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
     log::debug!("[writer] Waiting for writer thread to finish");
     let (writerstats, maybe_writer) = writer_thread.join().unwrap();
 
+    log::debug!("[writer] writer_thread finished");
+
+    // Write the checksum batch to the same FileWriter used for metadata
     if let Some(mut writer) = maybe_writer {
+        // Write the checksum batch to the existing writer
+        writer.write(&checksum_batch)?;
+        log::info!("[writer] Successfully wrote checksum batch to Arrow file.");
         writer.finish()?;
         log::info!("[main] Arrow index written and finished.");
     } else {
-        log::warn!("[main] No writer returned, index was likely not written.");
+        log::error!("[writer] FileWriter is not available, unable to write checksum batch.");
     }
-    log::debug!("[writer] writer_thread finished");
+
 
     let report = CompressionReport {
         total_files,

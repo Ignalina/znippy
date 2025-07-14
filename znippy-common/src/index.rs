@@ -155,6 +155,30 @@ pub fn build_arrow_batch_from_files(files: &[FileMeta]) -> arrow::error::Result<
     ])
 }
 
+
+//let mut checksums: Vec<[u8;32]>
+pub fn build_arrow_batch_for_checksums(checksums: Vec<[u8;32]>) -> arrow::error::Result<RecordBatch> {
+    let mut checksum_group_builder = UInt8Builder::new();
+    let mut checksum_builder = BinaryBuilder::new();
+
+    for (checksum_group, checksum) in checksums.iter().enumerate() {
+    // Append the checksum group and checksum to their respective builders
+        checksum_group_builder.append_value(checksum_group as u8);
+        checksum_builder.append_value(checksum);
+    }
+
+    // Create a schema for the checksum record batch
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("checksum_group", DataType::UInt8, false),
+        Field::new("checksum", DataType::Binary, true),
+    ]));
+
+    // Create the RecordBatch from the builders
+    RecordBatch::try_from_iter(vec![
+        ("checksum" ,Arc::new(checksum_group_builder.finish()) as ArrayRef),
+        ("checksum" ,   Arc::new(checksum_builder.finish()) as ArrayRef),
+        ])
+}
 pub fn read_znippy_index(path: &Path) -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
     let file = File::open(path)?;
     let reader = FileReader::try_new(BufReader::new(file), None)?;
@@ -164,6 +188,8 @@ pub fn read_znippy_index(path: &Path) -> Result<(Arc<Schema>, Vec<RecordBatch>)>
 
     Ok((schema, batches))
 }
+
+
 
 #[derive(Debug, Default)]
 pub struct VerifyReport {
