@@ -129,16 +129,16 @@ pub fn build_arrow_batch_from_files(files: &[FileMeta]) -> arrow::error::Result<
             zdata_offset_builder.append_value(chunk.zdata_offset);
 
             // Check and append values to the struct builder
-            let fdata_offset_builder = struct_builder.field_builder::<UInt64Builder>(0).unwrap();
+            let fdata_offset_builder = struct_builder.field_builder::<UInt64Builder>(1).unwrap();
             fdata_offset_builder.append_value(chunk.fdata_offset);
 
-            let length_builder = struct_builder.field_builder::<UInt64Builder>(1).unwrap();
+            let length_builder = struct_builder.field_builder::<UInt64Builder>(2).unwrap();
             length_builder.append_value(chunk.compressed_size);
 
-            let chunk_seq_builder = struct_builder.field_builder::<UInt32Builder>(2).unwrap();
+            let chunk_seq_builder = struct_builder.field_builder::<UInt32Builder>(3).unwrap();
             chunk_seq_builder.append_value(chunk.chunk_seq);
 
-            let checksum_group_builder = struct_builder.field_builder::<UInt8Builder>(3).unwrap();
+            let checksum_group_builder = struct_builder.field_builder::<UInt8Builder>(4).unwrap();
             checksum_group_builder.append_value(chunk.checksum_group);
 
             struct_builder.append(true); // Append this chunk
