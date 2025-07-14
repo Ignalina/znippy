@@ -1,3 +1,4 @@
+extern crate core;
 
 pub mod index;
 pub mod common_config;
