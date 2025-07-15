@@ -11,16 +11,14 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use arrow_array::{Array, BinaryArray, ListArray, StringArray, StructArray, UInt64Array};
+use arrow_array::{Array, BinaryArray, ListArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array};
 
 use blake3::Hasher;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 
-use crate::{
-    common_config::CONFIG,
-    index::read_znippy_index,
-    index::VerifyReport,
-};
+use crate::{common_config::CONFIG, index::read_znippy_index, index::VerifyReport, ChunkMeta, ChunkRevolver};
+
+use crate::chunkrevolver::{get_chunk_slice, SendPtr,Chunk};
 
 pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) -> Result<VerifyReport> {
     let zdata_path = index_path.with_extension("zdata");
@@ -30,9 +28,18 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
     let file_checksums = Arc::new(file_checksums);
 
 
-    let (work_tx, work_rx): (Sender<(usize, u16, Vec<u8>)>, Receiver<_>) = bounded(CONFIG.max_core_in_flight);
-    let (chunk_tx, chunk_rx): (Sender<(usize, u16, Vec<u8>, [u8; 32])>, Receiver<_>) = bounded(CONFIG.max_core_in_flight);
-    let (done_tx, done_rx): (Sender<usize>, Receiver<usize>) = bounded(8);
+    let revolver = ChunkRevolver::new();
+    let base_ptr = SendPtr::new(revolver.base_ptr());
+    let chunk_size = revolver.chunk_size();
+
+
+
+    let (work_tx, work_rx): (Sender<(ChunkMeta,u32)>, Receiver<(ChunkMeta,u32 )>) = bounded(CONFIG.max_core_in_flight);
+
+    let (chunk_tx, chunk_rx): (Sender<(ChunkMeta, Vec<u8>)>, Receiver<_>) = bounded(CONFIG.max_core_in_flight);
+
+    let (done_tx, done_rx): (Sender<u64>, Receiver<u64>) = unbounded();
+
     let chunk_counts = Arc::new(Mutex::new(HashMap::new()));
 
     let out_dir = Arc::new(out_dir.to_path_buf());
@@ -52,60 +59,141 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
         let tx = work_tx.clone();
         let done_rx = done_rx.clone();
 
-        thread::spawn(move || {
-            let mut zdata_file = File::open(&zdata_path).expect("Failed to open .zdata file");
+    thread::spawn(move || {
+        let mut inflight_chunks = 0usize;
 
-            let Some(batch) = batches.get(0) else {
-                eprintln!("❌ No batch found in index");
-                return;
-            };
-            let file_count = batch.num_rows();
-                let paths = batch.column_by_name("relative_path").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-                let chunks_array = batch.column_by_name("chunks").unwrap().as_any().downcast_ref::<ListArray>().unwrap();
-                let struct_array = chunks_array.values().as_any().downcast_ref::<StructArray>().unwrap();
-                let offsets_arr = struct_array.column_by_name("offset").unwrap().as_any().downcast_ref::<UInt64Array>().unwrap();
-                let lengths_arr = struct_array.column_by_name("length").unwrap().as_any().downcast_ref::<UInt64Array>().unwrap();
-                let chunk_offsets = chunks_array.value_offsets();
+        let mut zdata_file = File::open(&zdata_path).expect("Failed to open .zdata file");
+        let mut revolver = revolver; // move into thread
 
-            for file_index in 0..file_count {
-                    let start = chunk_offsets[file_index] as usize;
-                    let end = chunk_offsets[file_index + 1] as usize;
-                    let n_chunks = (end - start) as u16;
-                    cc.lock().unwrap().insert(file_index, n_chunks);
+        let Some(batch) = batches.get(0) else {
+            eprintln!("❌ No batch found in index");
+            return;
+        };
 
-                    for local_idx in 0..n_chunks {
-                        let global_idx = start + local_idx as usize;
-                        let offset = offsets_arr.value(global_idx);
-                        let length = lengths_arr.value(global_idx);
+        let file_count = batch.num_rows();
 
-                        let mut buf = vec![0u8; length as usize];
-                        {
-                            zdata_file.seek(SeekFrom::Start(offset)).unwrap();
-                            zdata_file.read_exact(&mut buf).unwrap();
-                        }
+        let paths = batch
+            .column_by_name("relative_path").unwrap()
+            .as_any().downcast_ref::<StringArray>().unwrap();
 
-                        tx.send((file_index, local_idx, buf)).unwrap();
-                    }
+        let chunks_array = batch
+            .column_by_name("chunks").unwrap()
+            .as_any().downcast_ref::<ListArray>().unwrap();
 
-                    done_rx.recv().unwrap();
+        let struct_array = chunks_array.values().as_any().downcast_ref::<StructArray>().unwrap();
 
+        let zdata_offsets = struct_array.column_by_name("zdata_offset").unwrap()
+            .as_any().downcast_ref::<UInt64Array>().unwrap();
+
+        let fdata_offsets = struct_array.column_by_name("fdata_offset").unwrap()
+            .as_any().downcast_ref::<UInt64Array>().unwrap();
+
+        let lengths = struct_array.column_by_name("length").unwrap()
+            .as_any().downcast_ref::<UInt64Array>().unwrap();
+
+        let chunk_seqs = struct_array.column_by_name("chunk_seq").unwrap()
+            .as_any().downcast_ref::<UInt32Array>().unwrap();
+
+        let checksum_groups = struct_array.column_by_name("checksum_group").unwrap()
+            .as_any().downcast_ref::<UInt8Array>().unwrap();
+
+        let uncompressed_size_arr = batch
+            .column_by_name("uncompressed_size")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        let fdata_offsets = struct_array
+            .column_by_name("fdata_offset")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+
+        let chunk_offsets = chunks_array.value_offsets();
+
+        for file_index in 0..file_count as u64 {
+            let start = chunk_offsets[file_index as usize] as usize;
+            let end = chunk_offsets[file_index as usize  + 1] as usize;
+            let n_chunks = (end - start) as u16;
+            cc.lock().unwrap().insert(file_index, n_chunks);
+
+            for local_idx in 0..n_chunks {
+
+
+
+                while let Ok(returned) = done_rx.try_recv() {
+                    log::debug!("[reader] Returned chunk {} to pool", returned);
+                    revolver.return_chunk(returned);
+                    inflight_chunks = inflight_chunks.checked_sub(1).expect("inflight_chunks underflow");
+                }
+
+                let mut chunk = revolver.get_chunk();
+                let chunk_index = chunk.index;
+
+                let global_idx = start + local_idx as usize;
+
+                let zdata_offset = zdata_offsets.value(global_idx);
+                let fdata_offset = fdata_offsets.value(global_idx);
+                let compressed_size = lengths.value(global_idx);
+                let chunk_seq = chunk_seqs.value(global_idx);
+                let checksum_group = checksum_groups.value(global_idx);
+                let fdata_offset = fdata_offsets.value(global_idx);
+                let uncompressed_size = uncompressed_size_arr.value(file_index as usize);
+
+                zdata_file.seek(SeekFrom::Start(zdata_offset)).unwrap();
+//                let compressed_len = compressed_size as usize;
+                zdata_file.read_exact(&mut chunk[..compressed_size as usize]).unwrap();
+
+                let meta = ChunkMeta {
+                    zdata_offset,
+                    fdata_offset,
+                    compressed_size,
+                    chunk_seq,
+                    checksum_group,
+                    compressed: false,
+                    file_index,
+                    uncompressed_size,
+                };
+
+                tx.send(( meta, chunk_index as u32)).unwrap();  // du kan byta till `ChunkWork { meta, raw_data }` om du vill senare
             }
 
-            });
+            done_rx.recv().unwrap();
+        }
+    });
 
-// DECOMPRESSOR
+
+//    match rx_chunk.recv() {
+//        Ok((file_index,fdata_offset, chunk_nr, length, skip)) => {
+//            log::debug!("[compressor] Processing chunk {} from file {}: {} bytes", chunk_nr, file_index, length);
+//            let input = get_chunk_slice(base_ptr.as_ptr(), chunk_size, chunk_nr as u32, length as usize);
+
+    // DECOMPRESSOR
     let mut decompressor_threads = Vec::with_capacity(CONFIG.max_core_in_compress as u8 as usize);
+
     for _ in 0..CONFIG.max_core_in_compress {
         let rx = work_rx.clone();
         let tx = chunk_tx.clone();
-        let handle=thread::spawn(move || {
-            while let Ok((file_index, chunk_idx, data)) = rx.recv() {
+        let base_ptr = SendPtr::new(base_ptr.as_ptr()); // create new SendPtr for each thread
+
+        let handle = thread::spawn(move || unsafe {
+
+            while let Ok((chunk_meta, chunk_nr)) = rx.recv() {
+                let data = get_chunk_slice(
+                    base_ptr.as_ptr(),
+                    chunk_size,
+                    chunk_nr as u32,
+                    chunk_meta.compressed_size as usize,
+                );
+
                 match decompress_chunk_stream(&data) {
                     Ok(decompressed) => {
                         let mut hasher = Hasher::new();
                         hasher.update(&decompressed);
-                        let checksum = hasher.finalize().into();
-                        tx.send((file_index, chunk_idx, decompressed, checksum)).unwrap();
+                        tx.send((chunk_meta, decompressed)).unwrap();
                     }
                     Err(e) => {
                         eprintln!("Decompression failed: {}", e);
@@ -119,52 +207,25 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
     // [WRITER]
     thread::spawn(move || {
-        let mut per_file_chunks: HashMap<usize, HashMap<u16, Vec<u8>>> = HashMap::new();
-        let mut per_file_partial: HashMap<usize, HashMap<u16, [u8; 32]>> = HashMap::new();
+        while let Ok((chunk_meta, data)) = rx.recv() {
+            let path = out_dir_cloned.join(format!("file_{}", chunk_meta.file_index));
 
-        while let Ok((file_index, chunk_index, data, checksum)) = rx.recv() {
-            let entry = per_file_chunks.entry(file_index).or_default();
-            entry.insert(chunk_index, data);
-
-            let entry_chk = per_file_partial.entry(file_index).or_default();
-            entry_chk.insert(chunk_index, checksum);
-
-            let expected = cc_cloned.lock().unwrap().get(&file_index).cloned().unwrap_or(0);
-            if entry.len() == expected as usize {
-                let mut all_chunks = vec![];
-                for i in 0..expected {
-                    all_chunks.extend(entry.remove(&i).unwrap());
-                }
-
-                let mut hasher = Hasher::new();
-                for i in 0..expected {
-                    let part = entry_chk.remove(&i).unwrap();
-                    hasher.update(&part);
-                }
-
-                let calculated = hasher.finalize();
-                let expected_bytes = &file_checksums_cloned[file_index];
-
-                if expected_bytes == calculated.as_bytes() {
-                    if save_data {
-                        let path = out_dir_cloned.join(format!("file_{}", file_index));
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent).unwrap();
-                        }
-                        let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&path).unwrap();
-                        f.write_all(&all_chunks).unwrap();
-                    }
-                } else {
-                    eprintln!("❌ Checksum mismatch for file index {}", file_index);
-                    eprintln!("  expected: {:x?}", expected_bytes);
-                    eprintln!("  calculated: {:x?}", calculated.as_bytes());
-                }
-
-                done_tx_cloned.send(file_index).unwrap();
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
             }
+
+            let mut f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+
+            f.seek(SeekFrom::Start(chunk_meta.fdata_offset)).unwrap();
+            f.write_all(&data).unwrap();
+
+            done_tx_cloned.send(chunk_meta.file_index).unwrap();
         }
     });
-
     Ok(report)
 }
 
