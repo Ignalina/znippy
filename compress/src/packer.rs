@@ -8,11 +8,11 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use walkdir::WalkDir;
 use zstd_sys::*;
 use blake3::Hasher; // Blake3 import
-use znippy_common::chunkrevolver::{ChunkRevolver, RevolverChunk, SendPtr, get_chunk_slice};
+use znippy_common::chunkrevolver::{ChunkRevolver, Chunk, SendPtr, get_chunk_slice};
 use znippy_common::common_config::CONFIG;
-use znippy_common::{build_arrow_batch_from_files, CompressionReport, FileMeta};
+use znippy_common::{attach_metadata, build_arrow_batch_from_files, CompressionReport, FileMeta};
 use znippy_common::meta::{ChunkMeta, WriterStats};
-use znippy_common::index::{build_arrow_batch_for_checksums, should_skip_compression};
+use znippy_common::index::{build_arrow_metadata_for_checksums_and_config, should_skip_compression};
 use zstd_sys::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
 use zstd_sys::ZSTD_ResetDirective::ZSTD_reset_session_only;
 use arrow::ipc::writer::{FileWriter, IpcWriteOptions};
@@ -109,7 +109,6 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                     }
 
                     let chunk_index:u64;
-                    let n:u64;
                     {
                         let mut chunk = revolver.get_chunk();
                         chunk_index = chunk.index;
@@ -385,6 +384,8 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
         log::info!("[writer] Writer don compressing {} chunks , total written {} bytes)", writerstats.total_chunks,  writerstats.total_written_bytes);
 
+        let batch= build_arrow_batch_from_files(&file_metadata);
+  /*
         let mut maybe_writer: Option<FileWriter<File>> = match build_arrow_batch_from_files(&file_metadata) {
             Ok(batch) => {
                 let index_path = output.with_extension("znippy");
@@ -416,8 +417,8 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                 None
             }
         };
-
-        (writerstats,maybe_writer)
+*/
+        (writerstats,batch)
     });
 
 
@@ -444,30 +445,32 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
     log::info!("📦 Compressor threads returning blake3 checksums from {} compressor threads", checksums.len());
 
 
-
-    // After compressor threads are done and you have the checksums
-    let checksum_batch = build_arrow_batch_for_checksums(checksums)?;
-
-
     // After compressor threads are done, drop tx_compressed
     drop(tx_compressed);
     log::debug!("[compressor] tx_compressed dropped after compressors finished");
-
     log::debug!("[writer] Waiting for writer thread to finish");
-    let (writerstats, maybe_writer) = writer_thread.join().unwrap();
+    let (writerstats, batch) = writer_thread.join().unwrap();
+
+    // Build metadata
+    let metadata = build_arrow_metadata_for_checksums_and_config(&checksums, &CONFIG);
+
+    // Attach metadata to batch
+    let final_batch = attach_metadata(batch?, metadata)?;
 
     log::debug!("[writer] writer_thread finished");
 
-    // Write the checksum batch to the same FileWriter used for metadata
-    if let Some(mut writer) = maybe_writer {
-        // Write the checksum batch to the existing writer
-        writer.write(&checksum_batch)?;
-        log::info!("[writer] Successfully wrote checksum batch to Arrow file.");
-        writer.finish()?;
-        log::info!("[main] Arrow index written and finished.");
-    } else {
-        log::error!("[writer] FileWriter is not available, unable to write checksum batch.");
-    }
+    // Create index file
+    let index_path = output.with_extension("znippy");
+    let index_file = File::create(&index_path)?;
+
+    // Create FileWriter
+    let mut writer = FileWriter::try_new(index_file, &final_batch.schema())?;
+
+    // Write batch
+    writer.write(&final_batch)?;
+    writer.finish()?; // ← Ensure writer is properly finished
+
+    log::info!("[main] Arrow index written and finished.");
 
 
     let report = CompressionReport {

@@ -20,19 +20,19 @@ impl SendPtr {
     }
 }
 /// En hanterad referens till en chunk i ChunkRevolver.
-pub struct RevolverChunk<'a> {
+pub struct Chunk<'a> {
     pub index: u64,
     pub data: &'a mut [u8],
 }
 
-impl<'a> Deref for RevolverChunk<'a> {
+impl<'a> Deref for Chunk<'a> {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
         self.data
     }
 }
 
-impl<'a> DerefMut for RevolverChunk<'a> {
+impl<'a> DerefMut for Chunk<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.data
     }
@@ -65,12 +65,12 @@ impl ChunkRevolver {
     }
 
     /// Få nästa tillgängliga chunk som en mutbar slice.
-    pub fn get_chunk(&mut self) -> RevolverChunk {
+    pub fn get_chunk(&mut self) -> Chunk {
         let index:u64 = self.ring.pop().expect("ChunkRevolver underrun");
         let offset = index as usize * self.chunk_size as usize;
         let data = &mut self.memory[offset..offset + self.chunk_size as usize];
 
-        RevolverChunk { index, data }
+        Chunk { index, data }
     }
 
     /// Returnera en chunk för återanvändning.
