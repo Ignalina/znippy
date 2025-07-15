@@ -68,7 +68,43 @@ pub fn build_arrow_metadata_for_checksums_and_config(
 }
 
 
+pub fn extract_config_from_arrow_metadata(
+    metadata: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<StrategicConfig> {
+    Ok(StrategicConfig {
+        max_core_in_flight: metadata.get("max_core_in_flight")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'max_core_in_flight' in metadata"))?
+            .parse()?,
 
+        max_core_in_compress: metadata.get("max_core_in_compress")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'max_core_in_compress' in metadata"))?
+            .parse()?,
+
+        max_mem_allowed: metadata.get("max_mem_allowed")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'max_mem_allowed' in metadata"))?
+            .parse()?,
+
+        min_free_memory_ratio: metadata.get("min_free_memory_ratio")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'min_free_memory_ratio' in metadata"))?
+            .parse()?,
+
+        file_split_block_size: metadata.get("file_split_block_size")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'file_split_block_size' in metadata"))?
+            .parse()?,
+
+        max_chunks: metadata.get("max_chunks")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'max_chunks' in metadata"))?
+            .parse()?,
+
+        compression_level: metadata.get("compression_level")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'compression_level' in metadata"))?
+            .parse()?,
+
+        zstd_output_buffer_size: metadata.get("zstd_output_buffer_size")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'zstd_output_buffer_size' in metadata"))?
+            .parse()?,
+    })
+}
 
 pub fn znippy_index_schema() -> &'static Arc<Schema> {
     &ZNIPPY_INDEX_SCHEMA

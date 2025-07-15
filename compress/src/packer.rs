@@ -60,7 +60,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
     let zdata_file = OpenOptions::new().create(true).write(true).truncate(true).open(&output_zdata_path)?;
     let mut writer = BufWriter::with_capacity((CONFIG.file_split_block_size / 2) as usize, zdata_file);
 
-    let revolver = ChunkRevolver::new();
+    let revolver = ChunkRevolver::new(&CONFIG);
     let base_ptr = SendPtr::new(revolver.base_ptr());
     let chunk_size = revolver.chunk_size();
 

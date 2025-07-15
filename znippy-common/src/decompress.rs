@@ -11,44 +11,47 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use arrow::datatypes::SchemaRef;
+use arrow::ipc::RecordBatch;
 use arrow_array::{Array, BinaryArray, ListArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array};
 
 use blake3::Hasher;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-
-use crate::{common_config::CONFIG, index::read_znippy_index, index::VerifyReport, ChunkMeta, ChunkRevolver};
+use hex::FromHex;
+use crate::{common_config::CONFIG, extract_config_from_arrow_metadata, index::read_znippy_index, index::VerifyReport, ChunkMeta, ChunkRevolver};
 
 use crate::chunkrevolver::{get_chunk_slice, SendPtr,Chunk};
 
 pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) -> Result<VerifyReport> {
     let zdata_path = index_path.with_extension("zdata");
 
-    let (_schema, batches) = read_znippy_index(index_path)?;
-    let file_checksums = extract_file_checksums(&batches)?;
+    let (schema, batches) = read_znippy_index(index_path)?;
+    let file_checksums = extract_file_checksums_from_metadata(&schema);
+    let config = extract_config_from_arrow_metadata(schema.metadata())?;
+
+
     let file_checksums = Arc::new(file_checksums);
 
 
-    let revolver = ChunkRevolver::new();
+    let revolver = ChunkRevolver::new(&config);
     let base_ptr = SendPtr::new(revolver.base_ptr());
     let chunk_size = revolver.chunk_size();
 
 
 
-    let (work_tx, work_rx): (Sender<(ChunkMeta,u32)>, Receiver<(ChunkMeta,u32 )>) = bounded(CONFIG.max_core_in_flight);
+    let (work_tx, work_rx): (Sender<(ChunkMeta,u32)>, Receiver<(ChunkMeta,u32 )>) = bounded(config.max_core_in_flight);
 
-    let (chunk_tx, chunk_rx): (Sender<(ChunkMeta, Vec<u8>)>, Receiver<_>) = bounded(CONFIG.max_core_in_flight);
+    let (chunk_tx, chunk_rx): (Sender<(ChunkMeta, Vec<u8>)>, Receiver<_>) = bounded(config.max_core_in_flight);
 
     let (done_tx, done_rx): (Sender<u64>, Receiver<u64>) = unbounded();
 
     let chunk_counts = Arc::new(Mutex::new(HashMap::new()));
 
     let out_dir = Arc::new(out_dir.to_path_buf());
-    let mut report = VerifyReport::default();
+    let  report = VerifyReport::default();
 
     let rx = chunk_rx.clone();
     let out_dir_cloned = Arc::clone(&out_dir);
-    let file_checksums_cloned = Arc::clone(&file_checksums);
-    let cc_cloned = Arc::clone(&chunk_counts);
     let done_tx_cloned = done_tx.clone();
 
 
@@ -166,15 +169,11 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
     });
 
 
-//    match rx_chunk.recv() {
-//        Ok((file_index,fdata_offset, chunk_nr, length, skip)) => {
-//            log::debug!("[compressor] Processing chunk {} from file {}: {} bytes", chunk_nr, file_index, length);
-//            let input = get_chunk_slice(base_ptr.as_ptr(), chunk_size, chunk_nr as u32, length as usize);
 
     // DECOMPRESSOR
-    let mut decompressor_threads = Vec::with_capacity(CONFIG.max_core_in_compress as u8 as usize);
+    let mut decompressor_threads = Vec::with_capacity(config.max_core_in_compress as u8 as usize);
 
-    for _ in 0..CONFIG.max_core_in_compress {
+    for _ in 0..config.max_core_in_compress {
         let rx = work_rx.clone();
         let tx = chunk_tx.clone();
         let base_ptr = SendPtr::new(base_ptr.as_ptr()); // create new SendPtr for each thread
@@ -229,26 +228,29 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
     Ok(report)
 }
 
-fn extract_file_checksums(batches: &[arrow::record_batch::RecordBatch]) -> Result<Vec<[u8; 32]>> {
-    let mut all = vec![];
-    for batch in batches {
-        let arr = batch.column_by_name("checksum")
-            .context("Missing 'checksum' column")?
-            .as_any().downcast_ref::<BinaryArray>()
-            .context("'checksum' is not BinaryArray")?;
+pub fn extract_file_checksums_from_metadata(schema: &SchemaRef) -> Result<Vec<[u8; 32]>> {
+    let metadata: &HashMap<String, String> = schema.metadata();
+    let mut checksums: Vec<[u8; 32]> = Vec::new();
 
-        for row in 0..arr.len() {
-            if arr.is_null(row) {
-                all.push([0u8; 32]);
-            } else {
-                let bytes = arr.value(row);
-                let mut fixed = [0u8; 32];
-                fixed[..bytes.len().min(32)].copy_from_slice(&bytes[..bytes.len().min(32)]);
-                all.push(fixed);
-            }
-        }
+    let mut sorted_keys: Vec<_> = metadata.keys()
+        .filter(|k| k.starts_with("checksum_"))
+        .collect();
+
+    // Sort by numerical suffix to preserve order
+    sorted_keys.sort_by_key(|k| {
+        k.trim_start_matches("checksum_")
+            .parse::<usize>()
+            .unwrap_or(usize::MAX)
+    });
+
+    for key in sorted_keys {
+        let hexstr = metadata.get(key).context("Missing metadata entry")?;
+        let bytes = <[u8; 32]>::from_hex(hexstr)
+            .with_context(|| format!("Invalid hex in key {}: {}", key, hexstr))?;
+        checksums.push(bytes);
     }
-    Ok(all)
+
+    Ok(checksums)
 }
 
 pub fn decompress_chunk_stream(input: &[u8]) -> Result<Vec<u8>> {

@@ -1,6 +1,6 @@
 // znippy-common/src/chunkrevolver.rs
 
-use crate::common_config::CONFIG;
+use crate::common_config::{StrategicConfig, CONFIG};
 use crate::int_ring::RingBuffer;
 use std::ops::{Deref, DerefMut};
 use crate::ChunkQueue;
@@ -46,9 +46,9 @@ pub struct ChunkRevolver {
 }
 
 impl ChunkRevolver {
-    pub fn new() -> Self {
-        let chunk_size = CONFIG.file_split_block_size_usize() as u64;
-        let num_chunks = CONFIG.max_chunks as u64;
+    pub fn new(config: &StrategicConfig) -> Self {
+        let chunk_size = config.file_split_block_size_usize() as u64;
+        let num_chunks = config.max_chunks as u64;
         let total_size = chunk_size * num_chunks;
 
         let memory = vec![0u8; total_size as usize].into_boxed_slice();
@@ -63,6 +63,8 @@ impl ChunkRevolver {
             ring,
         }
     }
+
+
 
     /// Få nästa tillgängliga chunk som en mutbar slice.
     pub fn get_chunk(&mut self) -> Chunk {
