@@ -9,11 +9,11 @@ use std::{
     sync::{Arc, Mutex},
     thread,
 };
-
+use std::any::{type_name, Any};
 use anyhow::{Context, Result};
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::RecordBatch;
-use arrow_array::{Array, BinaryArray, Datum, ListArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array};
+use arrow_array::{Array, BinaryArray, BooleanArray, Datum, ListArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array};
 
 use blake3::Hasher;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
@@ -57,10 +57,9 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
 
 
-// READER
-
-        let tx = work_tx.clone();
-        let done_rx = done_rx.clone();
+    // READER
+    let tx = work_tx.clone();
+    let done_rx = done_rx.clone();
     let mut reader_thread = thread::spawn(move || {
         let mut inflight_chunks = 0usize;
 
@@ -72,9 +71,9 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
             return;
         };
 
-        let file_count = batch.num_rows();
+        let file_count = batch.num_rows(); // Get file_count here
 
-
+        // Fetch columns only once for later use
         let paths = batch
             .column_by_name("relative_path").unwrap()
             .as_any().downcast_ref::<StringArray>().unwrap();
@@ -85,137 +84,98 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
         let struct_array = chunks_array.values().as_any().downcast_ref::<StructArray>().unwrap();
 
-        let zdata_offsets = struct_array.column_by_name("zdata_offset").unwrap()
-            .as_any().downcast_ref::<UInt64Array>().unwrap();
-
-        let fdata_offsets = struct_array.column_by_name("fdata_offset").unwrap()
-            .as_any().downcast_ref::<UInt64Array>().unwrap();
-
-        let lengths = struct_array.column_by_name("length").unwrap()
-            .as_any().downcast_ref::<UInt64Array>().unwrap();
-
-        let chunk_seqs = struct_array.column_by_name("chunk_seq").unwrap()
-            .as_any().downcast_ref::<UInt32Array>().unwrap();
-
-        let checksum_groups = struct_array.column_by_name("checksum_group").unwrap()
-            .as_any().downcast_ref::<UInt8Array>().unwrap();
-
         let uncompressed_size_arr = batch
             .column_by_name("uncompressed_size")
             .unwrap()
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap();
+        let chunk_offsets = chunks_array.value_offsets(); // Get chunk offsets once before the loop
 
-        let fdata_offsets = struct_array
-            .column_by_name("fdata_offset")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
+        // Iterate over files, using Arrow's ListArray to access chunks directly
+        for file_index in 0..file_count as u64 {
 
+            // Ensure we access the correct chunk array for the current file
+            let chunks_array_for_file = chunks_array.value(file_index as usize); // This gives us the StructArray for the current file
 
-        let chunk_offsets = chunks_array.value_offsets();
+            // Check if we are dealing with a StructArray
+            if let Some(struct_array) = chunks_array_for_file.as_any().downcast_ref::<StructArray>() {
+                // Define the number of chunks
+                let n_chunks = struct_array.len() as u16; // Number of chunks in this file
 
-        log::debug!(
-    "Batch schema stats → files: {}, paths: {}, chunks: {}, zdata_offsets: {}, fdata_offsets: {}, lengths: {}, chunk_seqs: {}, checksum_groups: {}, uncompressed_sizes: {}",
-    file_count,
-    paths.len(),
-    chunks_array.len(),
-    zdata_offsets.len(),
-    fdata_offsets.len(),
-    lengths.len(),
-    chunk_seqs.len(),
-    checksum_groups.len(),
-    uncompressed_size_arr.len()
-);
+                for local_idx in 0..n_chunks {
+                    // Access the individual child arrays (fields) within the StructArray
+                    let zdata_offset_arr = struct_array.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    let fdata_offset_arr = struct_array.column(1).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    let length_arr = struct_array.column(2).as_any().downcast_ref::<UInt64Array>().unwrap();
+                    let chunk_seq_arr = struct_array.column(3).as_any().downcast_ref::<UInt32Array>().unwrap();
+                    let checksum_group_arr = struct_array.column(4).as_any().downcast_ref::<UInt8Array>().unwrap();
 
+                    // Access values for the current chunk at local_idx
+                    let zdata_offset = zdata_offset_arr.value(local_idx as usize);
+                    let fdata_offset = fdata_offset_arr.value(local_idx as usize);
+                    let compressed_size = length_arr.value(local_idx as usize);
+                    let chunk_seq = chunk_seq_arr.value(local_idx as usize);
+                    let checksum_group = checksum_group_arr.value(local_idx as usize);
 
+                    log::debug!(
+                    "[reader] reading file {} chunk {:?}",
+                    paths.value(file_index as usize),
+                    (zdata_offset, fdata_offset, compressed_size, chunk_seq, checksum_group)
+                );
 
-        for file_index in 0..file_count as u64 - 1 {
-
-            // Use the idiomatic way to navigate chunks in Arrow 55+
-            let chunks_array = batch
-                .column_by_name("chunks")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .unwrap();
-
-            let struct_array = chunks_array.values().as_any().downcast_ref::<StructArray>().unwrap();
-            let chunk_offsets = chunks_array.value_offsets();
-
-            // For each chunk in a file, use chunk_offsets directly
-            for local_idx in chunk_offsets[file_index as usize] as usize..chunk_offsets[file_index as usize + 1] as usize {
-
-                // Log which chunk we are reading
-                log::debug!("[reader] reading file {} chunk {:?}",
-            paths.value(file_index as usize),
-            chunks_array.value(local_idx)
-        );
-
-                // Try to get a chunk – if none are available, wait for one to be returned
-                let (mut chunk, chunk_index): (Chunk, u64) = loop {
-                    match revolver.try_get_chunk() {
-                        Some(c) => {
-                            let idx = c.index;
-                            break (c, idx);
+                    // Try to get a chunk – if none are available, wait for one to be returned
+                    let (mut chunk_data, chunk_index): (Chunk, u64) = loop {
+                        match revolver.try_get_chunk() {
+                            Some(c) => {
+                                let idx = c.index;
+                                break (c, idx);
+                            }
+                            None => {
+                                // Block until a chunk is returned
+                                let returned = done_rx.recv().expect("rx_done channel closed unexpectedly");
+                                log::debug!("[reader] Blocking wait — returned chunk {} to pool", returned);
+                                revolver.return_chunk(returned);
+                                inflight_chunks = inflight_chunks.checked_sub(1).expect("inflight_chunks underflow");
+                            }
                         }
-                        None => {
-                            // Block until a chunk is returned
-                            let returned = done_rx.recv().expect("rx_done channel closed unexpectedly");
-                            log::debug!("[reader] Blocking wait — returned chunk {} to pool", returned);
-                            revolver.return_chunk(returned);
-                            inflight_chunks = inflight_chunks.checked_sub(1).expect("inflight_chunks underflow");
-                        }
-                    }
-                };
+                    };
 
-                // Retrieve the metadata for the current chunk
-                let zdata_offset = struct_array.column_by_name("zdata_offset").unwrap()
-                    .as_any().downcast_ref::<UInt64Array>().unwrap()
-                    .value(local_idx);
+                    let uncompressed_size = uncompressed_size_arr.value(file_index as usize);
 
-                let fdata_offset = struct_array.column_by_name("fdata_offset").unwrap()
-                    .as_any().downcast_ref::<UInt64Array>().unwrap()
-                    .value(local_idx);
+                    // Extract the "compressed" status for the chunk from the file metadata
+                    let compressed = batch
+                        .column_by_name("compressed")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .unwrap()
+                        .value(file_index as usize);
 
-                let compressed_size = struct_array.column_by_name("length").unwrap()
-                    .as_any().downcast_ref::<UInt64Array>().unwrap()
-                    .value(local_idx);
+                    // Read and process the chunk data from zdata file
+                    zdata_file.seek(SeekFrom::Start(zdata_offset)).unwrap();
+                    zdata_file.read_exact(&mut chunk_data[..compressed_size as usize]).unwrap();
 
-                let chunk_seq = struct_array.column_by_name("chunk_seq").unwrap()
-                    .as_any().downcast_ref::<UInt32Array>().unwrap()
-                    .value(local_idx);
+                    // Prepare metadata for chunk
+                    let meta = ChunkMeta {
+                        zdata_offset,
+                        fdata_offset,
+                        compressed_size,
+                        chunk_seq,
+                        checksum_group,
+                        compressed, // Use the value from the metadata
+                        file_index,
+                        uncompressed_size,
+                    };
 
-                let checksum_group = struct_array.column_by_name("checksum_group").unwrap()
-                    .as_any().downcast_ref::<UInt8Array>().unwrap()
-                    .value(local_idx);
-
-                let uncompressed_size = uncompressed_size_arr.value(file_index as usize);
-
-                // Read and process the chunk data
-                zdata_file.seek(SeekFrom::Start(zdata_offset)).unwrap();
-                zdata_file.read_exact(&mut chunk[..compressed_size as usize]).unwrap();
-
-                // Prepare metadata for chunk
-                let meta = ChunkMeta {
-                    zdata_offset,
-                    fdata_offset,
-                    compressed_size,
-                    chunk_seq,
-                    checksum_group,
-                    compressed: false,
-                    file_index,
-                    uncompressed_size,
-                };
-
-                // Send chunk to the decompressor
-                tx.send((meta, chunk_index as u32)).unwrap();  // You can switch to `ChunkWork { meta, raw_data }` if needed
-                inflight_chunks += 1;
+                    // Send chunk to the decompressor
+                    tx.send((meta, chunk_index as u32)).unwrap();
+                    inflight_chunks += 1;
+                }
+            } else {
+                eprintln!("❌ The chunks array is not a StructArray.");
             }
         }
-
 
         // Reader thread cleanup
         log::debug!("[reader] Reader thread done about to drain writer returning chunks ");
@@ -236,8 +196,6 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
         }
 
     });
-
-
 
     // DECOMPRESSOR
     let mut decompressor_threads = Vec::with_capacity(config.max_core_in_compress as u8 as usize);
