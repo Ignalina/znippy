@@ -192,9 +192,13 @@ pub fn build_arrow_batch_from_files(files: &[FileMeta]) -> arrow::error::Result<
             chunks_builder.append_null();
             continue;
         }
+        log::debug!("Batch schema stats → file: {} has  {} chunks",file.relative_path,file.chunks.len());
 
         // Iterate over the chunks in the file and append the data to the struct
         for chunk in &file.chunks {
+
+
+
             // Check and append values to the struct builder
             let zdata_offset_builder = struct_builder.field_builder::<UInt64Builder>(0).unwrap();
             zdata_offset_builder.append_value(chunk.zdata_offset);

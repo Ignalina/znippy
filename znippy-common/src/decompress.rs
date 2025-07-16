@@ -61,8 +61,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
         let tx = work_tx.clone();
         let done_rx = done_rx.clone();
-
-    thread::spawn(move || {
+    let mut reader_thread = thread::spawn(move || {
         let mut inflight_chunks = 0usize;
 
         let mut zdata_file = File::open(&zdata_path).expect("Failed to open .zdata file");
@@ -133,52 +132,73 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
 
 
-        for file_index in 0..file_count as u64 {
+        for file_index in 0..file_count as u64 - 1 {
 
-            let start = chunk_offsets[file_index as usize] as usize;
-            let end = chunk_offsets[file_index as usize  + 1] as usize;
-            let n_chunks = (end - start) as u16;
+            // Use the idiomatic way to navigate chunks in Arrow 55+
+            let chunks_array = batch
+                .column_by_name("chunks")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
 
-            for local_idx in 0..n_chunks {
+            let struct_array = chunks_array.values().as_any().downcast_ref::<StructArray>().unwrap();
+            let chunk_offsets = chunks_array.value_offsets();
 
+            // For each chunk in a file, use chunk_offsets directly
+            for local_idx in chunk_offsets[file_index as usize] as usize..chunk_offsets[file_index as usize + 1] as usize {
 
-                let global_idx = start + local_idx as usize;
-                log::debug!("[reader] reading file {} chunk {:?}",paths.value(file_index as usize),chunks_array.value(global_idx.into()),);
+                // Log which chunk we are reading
+                log::debug!("[reader] reading file {} chunk {:?}",
+            paths.value(file_index as usize),
+            chunks_array.value(local_idx)
+        );
 
-                let mut chunk;
-                let chunk_index:u64;
-
-
-                // försök få en chunk – om inga tillgängliga, vänta in en retur
-                match revolver.try_get_chunk() {
-                    Some(c) => {
-                        chunk_index = c.index;
-                        chunk = c;
+                // Try to get a chunk – if none are available, wait for one to be returned
+                let (mut chunk, chunk_index): (Chunk, u64) = loop {
+                    match revolver.try_get_chunk() {
+                        Some(c) => {
+                            let idx = c.index;
+                            break (c, idx);
+                        }
+                        None => {
+                            // Block until a chunk is returned
+                            let returned = done_rx.recv().expect("rx_done channel closed unexpectedly");
+                            log::debug!("[reader] Blocking wait — returned chunk {} to pool", returned);
+                            revolver.return_chunk(returned);
+                            inflight_chunks = inflight_chunks.checked_sub(1).expect("inflight_chunks underflow");
+                        }
                     }
-                    None => {
-                        // Blockera tills en chunk returneras
-                        let returned = done_rx.recv().expect("rx_done channel closed unexpectedly");
-                        log::debug!("[reader] Blocking wait — returned chunk {} to pool", returned);
-                        revolver.return_chunk(returned);
-                        inflight_chunks = inflight_chunks.checked_sub(1).expect("inflight_chunks underflow");
-                        continue;
-                    }
-                }
+                };
 
+                // Retrieve the metadata for the current chunk
+                let zdata_offset = struct_array.column_by_name("zdata_offset").unwrap()
+                    .as_any().downcast_ref::<UInt64Array>().unwrap()
+                    .value(local_idx);
 
-                let global_idx = start + local_idx as usize;
+                let fdata_offset = struct_array.column_by_name("fdata_offset").unwrap()
+                    .as_any().downcast_ref::<UInt64Array>().unwrap()
+                    .value(local_idx);
 
-                let zdata_offset = zdata_offsets.value(global_idx);
-                let fdata_offset = fdata_offsets.value(global_idx);
-                let compressed_size = lengths.value(global_idx);
-                let chunk_seq = chunk_seqs.value(global_idx);
-                let checksum_group = checksum_groups.value(global_idx);
-                let fdata_offset = fdata_offsets.value(global_idx);
+                let compressed_size = struct_array.column_by_name("length").unwrap()
+                    .as_any().downcast_ref::<UInt64Array>().unwrap()
+                    .value(local_idx);
+
+                let chunk_seq = struct_array.column_by_name("chunk_seq").unwrap()
+                    .as_any().downcast_ref::<UInt32Array>().unwrap()
+                    .value(local_idx);
+
+                let checksum_group = struct_array.column_by_name("checksum_group").unwrap()
+                    .as_any().downcast_ref::<UInt8Array>().unwrap()
+                    .value(local_idx);
+
                 let uncompressed_size = uncompressed_size_arr.value(file_index as usize);
 
+                // Read and process the chunk data
                 zdata_file.seek(SeekFrom::Start(zdata_offset)).unwrap();
                 zdata_file.read_exact(&mut chunk[..compressed_size as usize]).unwrap();
 
+                // Prepare metadata for chunk
                 let meta = ChunkMeta {
                     zdata_offset,
                     fdata_offset,
@@ -190,14 +210,13 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                     uncompressed_size,
                 };
 
-                tx.send(( meta, chunk_index as u32)).unwrap();  // du kan byta till `ChunkWork { meta, raw_data }` om du vill senare
+                // Send chunk to the decompressor
+                tx.send((meta, chunk_index as u32)).unwrap();  // You can switch to `ChunkWork { meta, raw_data }` if needed
                 inflight_chunks += 1;
-
-
             }
-
-
         }
+
+
         // Reader thread cleanup
         log::debug!("[reader] Reader thread done about to drain writer returning chunks ");
 
@@ -226,6 +245,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
     for _ in 0..config.max_core_in_compress {
         let rx = work_rx.clone();
         let tx = chunk_tx.clone();
+        let done_tx = done_tx.clone(); // ✅ klona in
         let base_ptr = SendPtr::new(base_ptr.as_ptr()); // create new SendPtr for each thread
 
         let handle = thread::spawn(move || unsafe {
@@ -244,9 +264,11 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                         let mut hasher = Hasher::new();
                         hasher.update(&decompressed);
                         tx.send((chunk_meta, decompressed)).unwrap();
+                        done_tx.send(chunk_nr as u64).unwrap(); // ✅ viktigt
                     }
                     Err(e) => {
                         eprintln!("Decompression failed: {}", e);
+                        done_tx.send(chunk_nr as u64).unwrap(); // ✅ viktigt
                     }
                 }
             }
@@ -256,7 +278,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
 
     // [WRITER]
-    thread::spawn(move || {
+    let writer_thread=thread::spawn(move || {
         while let Ok((chunk_meta, data)) = rx.recv() {
             let path = out_dir_cloned.join(format!("file_{}", chunk_meta.file_index));
 
@@ -273,9 +295,17 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
             f.seek(SeekFrom::Start(chunk_meta.fdata_offset)).unwrap();
             f.write_all(&data).unwrap();
 
-            done_tx_cloned.send(chunk_meta.file_index).unwrap();
         }
     });
+
+    reader_thread.join();
+
+    for handle in  decompressor_threads  {
+         handle.join();
+    }
+
+    writer_thread.join();
+
     Ok(report)
 }
 
