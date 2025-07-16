@@ -67,12 +67,22 @@ impl ChunkRevolver {
 
 
     /// Få nästa tillgängliga chunk som en mutbar slice.
+
+/*
     pub fn get_chunk(&mut self) -> Chunk {
         let index:u64 = self.ring.pop().expect("ChunkRevolver underrun");
         let offset = index as usize * self.chunk_size as usize;
         let data = &mut self.memory[offset..offset + self.chunk_size as usize];
 
         Chunk { index, data }
+    }
+*/
+    pub fn try_get_chunk(&mut self) -> Option<Chunk> {
+        self.ring.pop().map(|index| {
+            let offset = index as usize * self.chunk_size as usize;
+            let data = &mut self.memory[offset..offset + self.chunk_size as usize];
+            Chunk { index, data }
+        })
     }
 
     /// Returnera en chunk för återanvändning.

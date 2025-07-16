@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, Result};
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::RecordBatch;
-use arrow_array::{Array, BinaryArray, ListArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array};
+use arrow_array::{Array, BinaryArray, Datum, ListArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array};
 
 use blake3::Hasher;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
@@ -28,6 +28,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
     let (schema, batches) = read_znippy_index(index_path)?;
     let file_checksums = extract_file_checksums_from_metadata(&schema);
     let config = extract_config_from_arrow_metadata(schema.metadata())?;
+    log::debug!("read config from meta {:?}\n and checksums {:?}", config,file_checksums);
 
 
     let file_checksums = Arc::new(file_checksums);
@@ -45,7 +46,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
     let (done_tx, done_rx): (Sender<u64>, Receiver<u64>) = unbounded();
 
-    let chunk_counts = Arc::new(Mutex::new(HashMap::new()));
+//    let chunk_counts = Arc::new(Mutex::new(HashMap::new()));
 
     let out_dir = Arc::new(out_dir.to_path_buf());
     let  report = VerifyReport::default();
@@ -58,7 +59,6 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
 // READER
 
-        let cc = Arc::clone(&chunk_counts);
         let tx = work_tx.clone();
         let done_rx = done_rx.clone();
 
@@ -74,6 +74,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
         };
 
         let file_count = batch.num_rows();
+
 
         let paths = batch
             .column_by_name("relative_path").unwrap()
@@ -117,24 +118,53 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
         let chunk_offsets = chunks_array.value_offsets();
 
+        log::debug!(
+    "Batch schema stats → files: {}, paths: {}, chunks: {}, zdata_offsets: {}, fdata_offsets: {}, lengths: {}, chunk_seqs: {}, checksum_groups: {}, uncompressed_sizes: {}",
+    file_count,
+    paths.len(),
+    chunks_array.len(),
+    zdata_offsets.len(),
+    fdata_offsets.len(),
+    lengths.len(),
+    chunk_seqs.len(),
+    checksum_groups.len(),
+    uncompressed_size_arr.len()
+);
+
+
+
         for file_index in 0..file_count as u64 {
+
             let start = chunk_offsets[file_index as usize] as usize;
             let end = chunk_offsets[file_index as usize  + 1] as usize;
             let n_chunks = (end - start) as u16;
-            cc.lock().unwrap().insert(file_index, n_chunks);
 
             for local_idx in 0..n_chunks {
 
 
+                let global_idx = start + local_idx as usize;
+                log::debug!("[reader] reading file {} chunk {:?}",paths.value(file_index as usize),chunks_array.value(global_idx.into()),);
 
-                while let Ok(returned) = done_rx.try_recv() {
-                    log::debug!("[reader] Returned chunk {} to pool", returned);
-                    revolver.return_chunk(returned);
-                    inflight_chunks = inflight_chunks.checked_sub(1).expect("inflight_chunks underflow");
+                let mut chunk;
+                let chunk_index:u64;
+
+
+                // försök få en chunk – om inga tillgängliga, vänta in en retur
+                match revolver.try_get_chunk() {
+                    Some(c) => {
+                        chunk_index = c.index;
+                        chunk = c;
+                    }
+                    None => {
+                        // Blockera tills en chunk returneras
+                        let returned = done_rx.recv().expect("rx_done channel closed unexpectedly");
+                        log::debug!("[reader] Blocking wait — returned chunk {} to pool", returned);
+                        revolver.return_chunk(returned);
+                        inflight_chunks = inflight_chunks.checked_sub(1).expect("inflight_chunks underflow");
+                        continue;
+                    }
                 }
 
-                let mut chunk = revolver.get_chunk();
-                let chunk_index = chunk.index;
 
                 let global_idx = start + local_idx as usize;
 
@@ -147,7 +177,6 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                 let uncompressed_size = uncompressed_size_arr.value(file_index as usize);
 
                 zdata_file.seek(SeekFrom::Start(zdata_offset)).unwrap();
-//                let compressed_len = compressed_size as usize;
                 zdata_file.read_exact(&mut chunk[..compressed_size as usize]).unwrap();
 
                 let meta = ChunkMeta {
@@ -162,10 +191,31 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                 };
 
                 tx.send(( meta, chunk_index as u32)).unwrap();  // du kan byta till `ChunkWork { meta, raw_data }` om du vill senare
+                inflight_chunks += 1;
+
+
             }
 
-            done_rx.recv().unwrap();
+
         }
+        // Reader thread cleanup
+        log::debug!("[reader] Reader thread done about to drain writer returning chunks ");
+
+        // Wait for all inflight chunks to return before finishing
+        while inflight_chunks > 0 {
+            match done_rx.recv() {
+                Ok(returned) => {
+                    log::debug!("[reader] Returned chunk {} to pool during draining", returned);
+                    revolver.return_chunk(returned);
+                    inflight_chunks -= 1;
+                }
+                Err(_) => {
+                    log::debug!("[reader] rx_done channel closed, exiting draining loop");
+                    break;
+                }
+            }
+        }
+
     });
 
 
@@ -181,6 +231,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
         let handle = thread::spawn(move || unsafe {
 
             while let Ok((chunk_meta, chunk_nr)) = rx.recv() {
+                log::debug!("[Decompressor] got chunk_nr {}",chunk_nr);
                 let data = get_chunk_slice(
                     base_ptr.as_ptr(),
                     chunk_size,
