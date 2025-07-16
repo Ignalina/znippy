@@ -217,18 +217,26 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                     chunk_meta.compressed_size as usize,
                 );
 
-                match decompress_chunk_stream(&data) {
-                    Ok(decompressed) => {
-                        let mut hasher = Hasher::new();
-                        hasher.update(&decompressed);
-                        tx.send((chunk_meta, decompressed)).unwrap();
-                        done_tx.send(chunk_nr as u64).unwrap(); // ✅ viktigt
+                if(chunk_meta.compressed) {
+                    match decompress_chunk_stream(&data) {
+                        Ok(decompressed) => {
+                            let mut hasher = Hasher::new();
+                            hasher.update(&decompressed);
+                            tx.send((chunk_meta, decompressed)).unwrap();
+                            done_tx.send(chunk_nr as u64).unwrap(); // ✅ viktigt
+                        }
+                        Err(e) => {
+                            eprintln!("Decompression failed: {}", e);
+                            done_tx.send(chunk_nr as u64).unwrap(); // ✅ viktigt
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("Decompression failed: {}", e);
-                        done_tx.send(chunk_nr as u64).unwrap(); // ✅ viktigt
-                    }
+                } else {
+                    log::debug!("Saving non compressed chunk with len: {}",data.len());
+                    tx.send((chunk_meta, data.to_vec())).unwrap();
+                    done_tx.send(chunk_nr as u64).unwrap(); // ✅ viktigt
+
                 }
+
             }
         });
         decompressor_threads.push(handle);
