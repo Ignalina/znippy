@@ -101,17 +101,30 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                 let mut has_read_any_data = false;
                 let mut fdata_offset:u64=0;
                 loop {
-                    // Handle returned chunk numbers to prevent reader from blocking
-                    while let Ok(returned) = rx_done.try_recv() {
-                        log::debug!("[reader] Returned chunk {} to pool", returned);
-                        revolver.return_chunk(returned);
-                        inflight_chunks = inflight_chunks.checked_sub(1).expect("inflight_chunks underflow");
-                    }
 
+
+                    let mut chunk;
                     let chunk_index:u64;
+
                     {
-                        let mut chunk = revolver.get_chunk();
-                        chunk_index = chunk.index;
+                        // get a free chunk, if non is free , block wait for 1 to get free 
+
+                        match revolver.try_get_chunk() {
+                            Some(c) => {
+                                chunk_index = c.index;
+                                chunk = c;
+                            }
+                            None => {
+                                // Blockera tills en chunk returneras
+                                let returned = rx_done.recv().expect("rx_done channel closed unexpectedly");
+                                log::debug!("[reader] Blocking wait — returned chunk {} to pool", returned);
+                                revolver.return_chunk(returned);
+                                inflight_chunks = inflight_chunks.checked_sub(1).expect("inflight_chunks underflow");
+                                continue;
+                            }
+                        }
+
+//                        chunk_index = chunk.index;
                         match reader.read(&mut *chunk) {
                             Ok(0) => {
                                 if !has_read_any_data {
@@ -143,12 +156,11 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                         };
 
                     }
-                    // Send chunk index, size, and metadata via tx_chunk
                 }
 
             }
             // Reader thread cleanup
-            log::debug!("[reader] Reader thread done, tx_chunk dropped");
+            log::debug!("[reader] Reader thread done about to drain writer returning chunks ");
 
             // Wait for all inflight chunks to return before finishing
             while inflight_chunks > 0 {
