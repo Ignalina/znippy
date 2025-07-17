@@ -61,6 +61,8 @@ fn main() -> Result<()> {
             let report = compress_dir(&input, &output,no_skip)?;
             println!("\n✅ Komprimering klar:");
             println!("📁 Totalt antal filer:         {}", report.total_files);
+            println!("📁 Totalt antal chunks:         {}", report.chunks);
+
             println!("📂 Totalt antal kataloger:     {}", report.total_dirs);
             println!("📦 Filer komprimerade:         {}", report.compressed_files);
             println!("📄 Filer ej komprimerade:      {}", report.uncompressed_files);

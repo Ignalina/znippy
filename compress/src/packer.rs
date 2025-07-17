@@ -517,6 +517,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
         total_files,
         compressed_files ,
         uncompressed_files,
+        chunks: writerstats.total_chunks,
         total_dirs,
         total_bytes_in : compressed_bytes+uncompressed_bytes,
         total_bytes_out: writerstats.total_written_bytes,
