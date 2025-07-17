@@ -1,3 +1,4 @@
+use std::ffi::c_void;
 use std::ptr;
 use zstd_sys::*;
 
@@ -118,11 +119,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                     let chunk_seq = chunk_seq_arr.value(local_idx as usize);
                     let checksum_group = checksum_group_arr.value(local_idx as usize);
 
-                    log::debug!(
-                    "[reader] reading file {} chunk {:?}",
-                    paths.value(file_index as usize),
-                    (zdata_offset, fdata_offset, compressed_size, chunk_seq, checksum_group)
-                );
+                    log::debug!("[reader] reading file {} chunk {:?}",paths.value(file_index as usize),(zdata_offset, fdata_offset, compressed_size, chunk_seq, checksum_group));
 
                     // Try to get a chunk – if none are available, wait for one to be returned
                     let (mut chunk_data, chunk_index): (Chunk, u64) = loop {
@@ -200,7 +197,9 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
     // DECOMPRESSOR
     let mut decompressor_threads = Vec::with_capacity(config.max_core_in_compress as u8 as usize);
 
-    for _ in 0..config.max_core_in_compress {
+//    for _ in 0..config.max_core_in_compress {
+
+    for decompressor_nr in 0..1 {
         let rx = work_rx.clone();
         let tx = chunk_tx.clone();
         let done_tx = done_tx.clone(); // ✅ klona in
@@ -209,14 +208,16 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
         let handle = thread::spawn(move || unsafe {
 
             while let Ok((chunk_meta, chunk_nr)) = rx.recv() {
-                log::debug!("[Decompressor] got chunk_nr {}",chunk_nr);
+                log::debug!("[Decompressor {} ] got chunk_nr {}",decompressor_nr, chunk_nr);
                 let data = get_chunk_slice(
                     base_ptr.as_ptr(),
                     chunk_size,
                     chunk_nr as u32,
                     chunk_meta.compressed_size as usize,
                 );
-
+                let chunk_org_size=chunk_meta.uncompressed_size;
+                let chunk_seq = chunk_meta.chunk_seq;
+                let file_index = chunk_meta.file_index;
                 if(chunk_meta.compressed) {
                     match decompress_chunk_stream(&data) {
                         Ok(decompressed) => {
@@ -224,9 +225,10 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                             hasher.update(&decompressed);
                             tx.send((chunk_meta, decompressed)).unwrap();
                             done_tx.send(chunk_nr as u64).unwrap(); // ✅ viktigt
+                            log::debug!("Decompression successful chunkr {}  ",chunk_nr);
                         }
                         Err(e) => {
-                            eprintln!("Decompression failed: {}", e);
+                            eprintln!("Decompression failed: file_index {} chunk_nr {} chunk uncompressed size={} chunk compressed size={} chunk_seq {}  {}",file_index,chunk_nr,chunk_org_size,data.len(),chunk_seq, e);
                             done_tx.send(chunk_nr as u64).unwrap(); // ✅ viktigt
                         }
                     }
@@ -299,12 +301,15 @@ pub fn extract_file_checksums_from_metadata(schema: &SchemaRef) -> Result<Vec<[u
 
     Ok(checksums)
 }
+use std::ffi::CStr;
+use zstd_sys::*;
+use anyhow::{anyhow};
 
 pub fn decompress_chunk_stream(input: &[u8]) -> Result<Vec<u8>> {
     unsafe {
         let dctx = ZSTD_createDCtx();
         if dctx.is_null() {
-            return Err(anyhow::anyhow!("Failed to create decompression context"));
+            return Err(anyhow!("Failed to create decompression context"));
         }
 
         let mut dst_buf = vec![0u8; CONFIG.zstd_output_buffer_size];
@@ -316,22 +321,56 @@ pub fn decompress_chunk_stream(input: &[u8]) -> Result<Vec<u8>> {
             pos: 0,
         };
 
+        // Cast dst pointer explicitly to *mut c_void
         let mut output_buffer = ZSTD_outBuffer {
-            dst: dst_buf.as_mut_ptr() as *mut _,
+            dst: dst_buf.as_mut_ptr() as *mut c_void,  // First cast to *mut c_void
             size: dst_buf.len(),
             pos: 0,
         };
 
+        // Retry counter to avoid infinite loops when buffer keeps growing
+        let mut retries = 0;
+        const MAX_RETRIES: usize = 10;
+
         while input_buffer.pos < input_buffer.size {
             output_buffer.pos = 0;
-
             let remaining = ZSTD_decompressStream(dctx, &mut output_buffer, &mut input_buffer);
-            if ZSTD_isError(remaining) != 0 {
-                let err = ZSTD_getErrorName(remaining);
-                let err_str = std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned();
-                ZSTD_freeDCtx(dctx);
-                return Err(anyhow::anyhow!("ZSTD_decompressStream error: {}", err_str));
+
+            // Check if decompression is complete
+            if remaining == 0 {
+                output.extend_from_slice(&dst_buf[..output_buffer.pos]);
             }
+
+            // Check if there is more data left to decompress
+            else if remaining > 0 {
+                ZSTD_freeDCtx(dctx);
+                return Err(anyhow!("ZSTD_decompressStream error: Data left to decompress"));
+            }
+            else if remaining < 0 {
+                let err = ZSTD_getErrorName(remaining);
+                let err_str = CStr::from_ptr(err).to_string_lossy().into_owned();
+                // Check if the error is due to the output buffer being too small, this should never happend ...
+                if err_str.contains("buffer_too_small") {
+                    retries += 1;
+                    log::debug!("ZSTD wants larger output buffer , this should never happend !!!");
+                    // Limit retries to avoid infinite growth
+                    if retries > MAX_RETRIES {
+                        ZSTD_freeDCtx(dctx);
+                        return Err(anyhow!("Decompression failed after {} retries due to buffer size.", retries));
+                    }
+
+                    // Grow the output buffer and retry
+                    dst_buf.resize(dst_buf.len() * 2, 0);  // Example: Double the buffer size
+                    output_buffer.dst = dst_buf.as_mut_ptr() as *mut c_void;  // Re-cast to *mut c_void
+                    output_buffer.size = dst_buf.len();
+                    continue;  // Retry the decompression with the new buffer size
+                }
+
+
+                ZSTD_freeDCtx(dctx);
+                return Err(anyhow!("ZSTD_decompressStream error: {}", err_str));
+            }
+
 
             output.extend_from_slice(&dst_buf[..output_buffer.pos]);
         }
