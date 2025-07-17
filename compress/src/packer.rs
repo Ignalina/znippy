@@ -246,8 +246,6 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
                                 log::debug!("[compressor] Sending chunk uncompressed chunk nr {} of file {} to writer", chunk_nr, file_index);
                                 tx_compressed.send((output, chunk_meta)).unwrap();
-                                log::debug!("[compressor] Sending ACK on chunk_nr done  chunknr {} of file {} to reader", chunk_nr, file_index);
-                                tx_ret.send(chunk_nr);
                                 chunk_seq += 1;
                             } else {
                                 log::debug!("[compressor] start compressing chunk {} from file {} ({} bytes)", chunk_nr, file_index, length);
@@ -328,6 +326,9 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                     }
                                 }
                             }
+                            log::debug!("[compressor] Sending ACK on chunk_nr done  chunknr {} of file {} to reader", chunk_nr, file_index);
+                            tx_ret.send(chunk_nr);
+
                         }
                         Err(_) => {
                             // Channel is closed, gracefully exit the loop
@@ -335,6 +336,8 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                             break;
                         }
                     }
+
+
                 }
 
                 ZSTD_freeCCtx(cctx);
