@@ -38,4 +38,5 @@ pub struct CompressionReport {
     pub compressed_bytes: u64,
     pub uncompressed_bytes: u64,
     pub compression_ratio: f32, // 0.0–100.0
+    pub chunks: u64,
 }
