@@ -110,3 +110,19 @@ pub unsafe fn get_chunk_slice<'a>(
     let offset = chunk_index as usize * chunk_size;
     std::slice::from_raw_parts(base_ptr.add(offset), used)
 }
+
+pub fn split_into_microchunks<'a>(
+    full_chunk: &'a [u8],
+    micro_size: usize,
+) -> Vec<&'a [u8]> {
+    let mut microchunks = Vec::new();
+    let mut offset = 0;
+
+    while offset < full_chunk.len() {
+        let end = (offset + micro_size).min(full_chunk.len());
+        microchunks.push(&full_chunk[offset..end]);
+        offset = end;
+    }
+
+    microchunks
+}

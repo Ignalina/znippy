@@ -11,7 +11,7 @@ use zstd_sys::*;
 use blake3::Hasher; // Blake3 import
 use znippy_common::chunkrevolver::{ChunkRevolver, Chunk, SendPtr, get_chunk_slice};
 use znippy_common::common_config::CONFIG;
-use znippy_common::{attach_metadata, build_arrow_batch_from_files, CompressionReport, FileMeta};
+use znippy_common::{attach_metadata, build_arrow_batch_from_files, split_into_microchunks, CompressionReport, FileMeta};
 use znippy_common::meta::{ChunkMeta, WriterStats};
 use znippy_common::index::{build_arrow_metadata_for_checksums_and_config, should_skip_compression};
 use zstd_sys::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
@@ -248,33 +248,36 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                 tx_compressed.send((output, chunk_meta)).unwrap();
                                 chunk_seq += 1;
                             } else {
+                                let micro_chunks=split_into_microchunks(input,CONFIG.zstd_output_buffer_size);
+
                                 log::debug!("[compressor] start compressing chunk {} from file {} ({} bytes)", chunk_nr, file_index, length);
 
-                                let mut input = ZSTD_inBuffer {
-                                    src: input_ptr as *const _,
-                                    size: length as usize,
-                                    pos: 0,
-                                };
-
-                                let mut output = vec![0u8; CONFIG.zstd_output_buffer_size];
-
-                                let mut output_buffer = ZSTD_outBuffer {
-                                    dst: output.as_mut_ptr() as *mut _,
-                                    size: output.len(),
-                                    pos: 0,
-                                };
 
                                 // Loop until all input is consumed and the stream is fully flushed
-                                loop {
+                                let mut antal =0;
+                                for (micro_nr, micro) in micro_chunks.iter().enumerate()  {
+
+                                    let mut input = ZSTD_inBuffer {
+                                        src: micro.as_ptr() as *const _,
+                                        size: micro.len() as usize,
+                                        pos: 0,
+                                    };
+
+                                    let mut output = vec![0u8; CONFIG.zstd_output_buffer_size];
+
+                                    let mut output_buffer = ZSTD_outBuffer {
+                                        dst: output.as_mut_ptr() as *mut _,
+                                        size: output.len(),
+                                        pos: 0,
+                                    };
+
                                     ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only); // ← Här ska den vara
-                                    let input_start_pos = input.pos;
                                     let code = ZSTD_compressStream2(
                                         cctx,
                                         &mut output_buffer,
                                         &mut input,
                                         ZSTD_EndDirective::ZSTD_e_end,
                                     );
-                                    let uncompressed_size:u64 = (input.pos - input_start_pos) as u64;
 
                                     if ZSTD_isError(code) != 0 {
                                         let err_str = std::ffi::CStr::from_ptr(ZSTD_getErrorName(code));
@@ -294,8 +297,12 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                     // If there is compressed output, send it
                                     if output_buffer.pos > 0 {
                                         let compressed_chunk = Arc::from(output[..output_buffer.pos].to_vec().into_boxed_slice());
+                                        debug_assert!(
+                                            input.pos == input.size,
+                                            "ZSTD_compressStream2 did not consume entire input: input.pos = {}, input.size = {}",
+                                            input.pos, input.size
+                                        );
 
-                                        log::debug!("[compressor] Compressing micro for chunk nr {} from file {} ({} {} compressed bytes)", chunk_nr, file_index,uncompressed_size,output_buffer.pos);
 
                                         let chunk_meta = ChunkMeta {
                                             zdata_offset: 0,
@@ -305,18 +312,29 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                             checksum_group: compressor_group,
                                             compressed_size: output_buffer.pos as u64,
                                             compressed: true,
-                                            uncompressed_size
+                                            uncompressed_size: micro.len() as u64
                                         };
+
+                                        log::debug!(
+        "[compressor {} ] Compressing micro nr {} for chunk nr {} from file {} ({} → {} bytes)",
+                                            compressor_group,
+                                            antal,
+        chunk_nr,
+        file_index,
+        chunk_meta.uncompressed_size,
+        chunk_meta.compressed_size
+    );
+                                        antal=antal+1;
 
                                         tx_compressed.send((compressed_chunk, chunk_meta)).unwrap();
                                         chunk_seq += 1;
 
 
-                                        output_buffer.pos = 0;
-                                        output.clear();
-                                        output.resize(CONFIG.zstd_output_buffer_size, 0);
-                                        output_buffer.dst = output.as_mut_ptr() as *mut _;
-                                        output_buffer.size = output.len();
+//                                        output_buffer.pos = 0;
+//                                        output.clear();
+//                                        output.resize(CONFIG.zstd_output_buffer_size, 0);
+//                                        output_buffer.dst = output.as_mut_ptr() as *mut _;
+//                                        output_buffer.size = output.len();
                                     }
 
                                     // Break only when all input is consumed and ZSTD reports done
@@ -425,39 +443,6 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
         log::info!("[writer] Writer don compressing {} chunks , total written {} bytes)", writerstats.total_chunks,  writerstats.total_written_bytes);
 
         let batch= build_arrow_batch_from_files(&file_metadata);
-  /*
-        let mut maybe_writer: Option<FileWriter<File>> = match build_arrow_batch_from_files(&file_metadata) {
-            Ok(batch) => {
-                let index_path = output.with_extension("znippy");
-                match File::create(&index_path) {
-                    Ok(index_file) => {
-                        match FileWriter::try_new(index_file, &batch.schema()) {
-                            Ok(mut writer) => {
-                                if let Err(e) = writer.write(&batch) {
-                                    log::error!("[writer] Failed to write Arrow batch: {}", e);
-                                    None
-                                } else {
-                                    Some(writer)
-                                }
-                            }
-                            Err(e) => {
-                                log::error!("[writer] Failed to create FileWriter: {}", e);
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("[writer] Failed to create .znippy file: {}", e);
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!("[writer] Failed to build Arrow batch: {}", e);
-                None
-            }
-        };
-*/
         (writerstats,batch)
     });
 
@@ -472,7 +457,6 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
 
 
-//    let mut all_chunkmeta: Vec<Vec<ChunkMeta>> = Vec::with_capacity(CONFIG.max_core_in_compress as usize);
 
     let mut checksums: Vec<[u8;32]>  = Vec::with_capacity(CONFIG.max_core_in_compress as usize);
 
