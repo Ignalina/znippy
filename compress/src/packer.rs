@@ -1,7 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::Shutdown::Write as OtherWrite;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use arrow::array::Array;
@@ -18,6 +18,9 @@ use zstd_sys::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
 use zstd_sys::ZSTD_ResetDirective::ZSTD_reset_session_only;
 use arrow::ipc::writer::{FileWriter, IpcWriteOptions};
 use arrow::ipc::MetadataVersion;
+fn strip_prefix<'a>(base: &'a Path, full: &'a Path) -> PathBuf {
+    full.strip_prefix(base).unwrap_or(full).to_path_buf()
+}
 pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> anyhow::Result<CompressionReport> {
     log::debug!("Reading directory: {:?}", input_dir);
     let mut total_dirs = 0;
@@ -65,6 +68,8 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
     let base_ptr = SendPtr::new(revolver.base_ptr());
     let chunk_size = revolver.chunk_size();
 
+    let input_dir_cloned = input_dir.clone();
+
     // Reader Thread with inflight counter
     let all_files_for_reader = Arc::clone(&all_files);
     let all_files_for_writer = Arc::clone(&all_files);
@@ -108,7 +113,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                     let chunk_index:u64;
 
                     {
-                        // get a free chunk, if non is free , block wait for 1 to get free 
+                        // get a free chunk, if non is free , block wait for 1 to get free
 
                         match revolver.try_get_chunk() {
                             Some(c) => {
@@ -254,6 +259,14 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
 
                                 // Loop until all input is consumed and the stream is fully flushed
+                                let mut output = vec![0u8; CONFIG.zstd_output_buffer_size];
+
+                                let mut output_buffer = ZSTD_outBuffer {
+                                    dst: output.as_mut_ptr() as *mut _,
+                                    size: output.len(),
+                                    pos: 0,
+                                };
+
                                 let mut antal =0;
                                 for (micro_nr, micro) in micro_chunks.iter().enumerate()  {
 
@@ -263,14 +276,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                         pos: 0,
                                     };
 
-                                    let mut output = vec![0u8; CONFIG.zstd_output_buffer_size];
-
-                                    let mut output_buffer = ZSTD_outBuffer {
-                                        dst: output.as_mut_ptr() as *mut _,
-                                        size: output.len(),
-                                        pos: 0,
-                                    };
-
+                                    output_buffer.pos = 0;
                                     ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only); // ← Här ska den vara
                                     let code = ZSTD_compressStream2(
                                         cctx,
@@ -296,7 +302,9 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
                                     // If there is compressed output, send it
                                     if output_buffer.pos > 0 {
-                                        let compressed_chunk = Arc::from(output[..output_buffer.pos].to_vec().into_boxed_slice());
+//                                        let compressed_chunk = Arc::from(output[..output_buffer.pos].to_vec().into_boxed_slice());
+                                        let compressed_chunk: Arc<[u8]> = Arc::from(output[..output_buffer.pos].to_vec().into_boxed_slice());
+
                                         debug_assert!(
                                             input.pos == input.size,
                                             "ZSTD_compressStream2 did not consume entire input: input.pos = {}, input.size = {}",
@@ -315,33 +323,13 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                             uncompressed_size: micro.len() as u64
                                         };
 
-                                        log::debug!(
-        "[compressor {} ] Compressing micro nr {} for chunk nr {} from file {} ({} → {} bytes)",
-                                            compressor_group,
-                                            antal,
-        chunk_nr,
-        file_index,
-        chunk_meta.uncompressed_size,
-        chunk_meta.compressed_size
-    );
+                                        log::debug!("[compressor {} ] Compressing micro nr {} for chunk nr {} from file {} ({} → {} bytes) sending bytes={}",compressor_group,antal,chunk_nr,file_index,chunk_meta.uncompressed_size,chunk_meta.compressed_size,compressed_chunk.len());
                                         antal=antal+1;
 
                                         tx_compressed.send((compressed_chunk, chunk_meta)).unwrap();
                                         chunk_seq += 1;
-
-
-//                                        output_buffer.pos = 0;
-//                                        output.clear();
-//                                        output.resize(CONFIG.zstd_output_buffer_size, 0);
-//                                        output_buffer.dst = output.as_mut_ptr() as *mut _;
-//                                        output_buffer.size = output.len();
                                     }
 
-                                    // Break only when all input is consumed and ZSTD reports done
-                                    if input.pos == input.size && code == 0 {
-                                        log::debug!(" breaking micro chunks. remaining input bytes: {}", input.size - input.pos);
-                                        break;
-                                    }
                                 }
                             }
                             log::debug!("[compressor] Sending ACK on chunk_nr done  chunknr {} of file {} to reader", chunk_nr, file_index);
@@ -407,23 +395,28 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
             let idx = chunk_meta.file_index as usize;
 
             let idx = chunk_meta.file_index as usize;
+
+            debug_assert_eq!(
+                compressed_data.len() as u64,
+                chunk_meta.compressed_size,
+                "Mismatch between actual compressed data length ({}) and chunk_meta.compressed_size ({}) for file_index {}, chunk_seq {}",
+                compressed_data.len(),
+                chunk_meta.compressed_size,
+                chunk_meta.file_index,
+                chunk_meta.chunk_seq
+            );
+
             if idx >= file_metadata.len() {
                 log::error!("[writer] Invalid file_index {}: file_metadata.len() = {}", idx, file_metadata.len());
                 continue;
             }
 
             let file = &mut file_metadata[idx];
-
-
-
-            // If this is the first chunk for the file, fill in static info
-
-
             let path = &all_files_for_writer[idx];
 
             file.relative_path = path.to_string_lossy().to_string();
             file.compressed = chunk_meta.compressed;
-            file.uncompressed_size = chunk_meta.uncompressed_size;
+            file.uncompressed_size += chunk_meta.uncompressed_size;
             // Always push the chunk metadata
             chunk_meta.zdata_offset=zdata_offset;
             file.chunks.push(chunk_meta);
@@ -442,7 +435,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
         log::info!("[writer] Writer don compressing {} chunks , total written {} bytes)", writerstats.total_chunks,  writerstats.total_written_bytes);
 
-        let batch= build_arrow_batch_from_files(&file_metadata);
+        let batch = build_arrow_batch_from_files(&file_metadata,&input_dir_cloned);
         (writerstats,batch)
     });
 

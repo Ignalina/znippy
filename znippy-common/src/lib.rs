@@ -20,12 +20,6 @@ pub use decompress::decompress_archive;
 
 
 pub use index::{extract_config_from_arrow_metadata,attach_metadata,build_arrow_batch_from_files ,znippy_index_schema,is_probably_compressed, should_skip_compression, ZNIPPY_INDEX_SCHEMA,verify_archive_integrity,list_archive_contents,VerifyReport,read_znippy_index};
-#[derive(Debug, Clone)]
-pub struct StrategicConfig {
-    pub max_core_in_flight: usize,
-    pub max_core_in_compress: usize,
-    pub max_mem_allowed: u64,
-}
 
 #[derive(Debug)]
 pub struct CompressionReport {
