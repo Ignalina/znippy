@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::Shutdown::Write as OtherWrite;
@@ -269,67 +270,71 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
                                 let mut antal =0;
                                 for (micro_nr, micro) in micro_chunks.iter().enumerate()  {
-
                                     let mut input = ZSTD_inBuffer {
                                         src: micro.as_ptr() as *const _,
-                                        size: micro.len() as usize,
+                                        size: micro.len(),
                                         pos: 0,
                                     };
 
-                                    output_buffer.pos = 0;
-                                    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only); // ← Här ska den vara
-                                    let code = ZSTD_compressStream2(
-                                        cctx,
-                                        &mut output_buffer,
-                                        &mut input,
-                                        ZSTD_EndDirective::ZSTD_e_end,
-                                    );
+                                    output_buffer.pos = 0; // 🧼 Clear output before loop
+                                    ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only);
 
-                                    if ZSTD_isError(code) != 0 {
-                                        let err_str = std::ffi::CStr::from_ptr(ZSTD_getErrorName(code));
+                                    let mut total_written = 0;
 
-                                        // Hantera specifikt för output-buffert som är för liten
-                                        if err_str.to_string_lossy().contains("buffer_too_small") {
-                                            log::warn!("Output buffer too small, increasing buffer size.");
-                                            output.resize(output.len() * 2, 0); // Växla storlek på output-buffer
-                                            output_buffer.dst = output.as_mut_ptr() as *mut _; // Uppdatera pekaren
-                                            output_buffer.size = output.len(); // Uppdatera storleken på buffer
-                                            continue; // Starta om loopen med den nya bufferten
-                                        } else {
-                                            panic!("ZSTD error: {}", err_str.to_string_lossy()); // Om det är något annat fel, panik!
-                                        }
-                                    }
-
-                                    // If there is compressed output, send it
-                                    if output_buffer.pos > 0 {
-//                                        let compressed_chunk = Arc::from(output[..output_buffer.pos].to_vec().into_boxed_slice());
-                                        let compressed_chunk: Arc<[u8]> = Arc::from(output[..output_buffer.pos].to_vec().into_boxed_slice());
-
-                                        debug_assert!(
-                                            input.pos == input.size,
-                                            "ZSTD_compressStream2 did not consume entire input: input.pos = {}, input.size = {}",
-                                            input.pos, input.size
+                                    loop {
+                                        let code = ZSTD_compressStream2(
+                                            cctx,
+                                            &mut output_buffer,
+                                            &mut input,
+                                            ZSTD_EndDirective::ZSTD_e_end,
                                         );
 
+                                        if ZSTD_isError(code) != 0 {
+                                            let msg = std::ffi::CStr::from_ptr(ZSTD_getErrorName(code));
+                                            return Err(anyhow!(
+            "ZSTD_compressStream2 failed on file {} chunk {} micro {}: {}",
+            file_index, chunk_nr, micro_nr, msg.to_string_lossy()
+        ));
+                                        }
 
-                                        let chunk_meta = ChunkMeta {
-                                            zdata_offset: 0,
-                                            fdata_offset,
-                                            file_index,
-                                            chunk_seq,
-                                            checksum_group: compressor_group,
-                                            compressed_size: output_buffer.pos as u64,
-                                            compressed: true,
-                                            uncompressed_size: micro.len() as u64
-                                        };
+                                        if output_buffer.pos > 0 {
+                                            let bytes_written = output_buffer.pos;
 
-                                        log::debug!("[compressor {} ] Compressing micro nr {} for chunk nr {} from file {} ({} → {} bytes) sending bytes={}",compressor_group,antal,chunk_nr,file_index,chunk_meta.uncompressed_size,chunk_meta.compressed_size,compressed_chunk.len());
-                                        antal=antal+1;
+                                            let compressed_chunk: Arc<[u8]> =
+                                                Arc::from(output[..bytes_written].to_vec().into_boxed_slice());
 
-                                        tx_compressed.send((compressed_chunk, chunk_meta)).unwrap();
-                                        chunk_seq += 1;
+                                            let chunk_meta = ChunkMeta {
+                                                zdata_offset: 0, // to be filled by writer
+                                                fdata_offset,
+                                                file_index,
+                                                chunk_seq,
+                                                checksum_group: compressor_group,
+                                                compressed_size: bytes_written as u64,
+                                                compressed: true,
+                                                uncompressed_size: micro.len() as u64,
+                                            };
+
+                                            log::debug!(
+            "[compressor {}] Compressed micro {} of chunk {} from file {} ({} → {} bytes)",
+            compressor_group,
+            micro_nr,
+            chunk_nr,
+            file_index,
+            chunk_meta.uncompressed_size,
+            chunk_meta.compressed_size
+        );
+
+                                            tx_compressed.send((compressed_chunk, chunk_meta))?;
+                                            total_written += bytes_written;
+                                            chunk_seq += 1;
+                                        }
+
+                                        output_buffer.pos = 0; // 🔄 Reset after sending
+
+                                        if code == 0 {
+                                            break; // ✅ Compression fully flushed
+                                        }
                                     }
-
                                 }
                             }
                             log::debug!("[compressor] Sending ACK on chunk_nr done  chunknr {} of file {} to reader", chunk_nr, file_index);
@@ -360,7 +365,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
             }
             log::info!("📦 Compressor thread/group {} returning ",compressor_group);
 
-            ( compressor_group,*hasher.finalize().as_bytes())
+            Ok(( compressor_group,*hasher.finalize().as_bytes()))
         });
         compressor_threads.push(handle);
     }
@@ -455,9 +460,15 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
     let mut  i=0;
     for handle in compressor_threads {
-        let (compressor_group,checksum) = handle.join().unwrap();
+        let Ok((compressor_group, checksum)) = handle.join().unwrap() else {
+            return Err(anyhow!("Compressor thread returned error"));
+        };
         checksums.insert(compressor_group as usize,checksum);
     }
+
+
+
+
 
     log::info!("📦 Compressor threads returning blake3 checksums from {} compressor threads", checksums.len());
 
