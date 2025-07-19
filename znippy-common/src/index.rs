@@ -148,7 +148,7 @@ pub fn attach_metadata(
     // Construct a new RecordBatch with the same data but updated schema
     RecordBatch::try_new(Arc::new(new_schema), rb.columns().to_vec())
 }
-pub fn build_arrow_batch_from_files(files: &[FileMeta]) -> arrow::error::Result<RecordBatch> {
+pub fn build_arrow_batch_from_files(files: &[FileMeta],input_dir: &Path,) -> arrow::error::Result<RecordBatch> {
     let schema = ZNIPPY_INDEX_SCHEMA
         .as_ref()
         .clone();
@@ -180,7 +180,18 @@ pub fn build_arrow_batch_from_files(files: &[FileMeta]) -> arrow::error::Result<
 
     for file in files {
         // Append each file's path, compression status, and uncompressed size
-        relative_path_builder.append_value(&file.relative_path);
+
+
+
+        let full_path = Path::new(&file.relative_path);
+        let rel_path = match full_path.strip_prefix(input_dir) {
+            Ok(p) => p.to_string_lossy(),
+            Err(_) => file.relative_path.as_str().into(),
+        };
+
+        relative_path_builder.append_value(&rel_path);
+
+
         compressed_builder.append_value(file.compressed);
         uncompressed_size_builder.append_value(file.uncompressed_size);
 

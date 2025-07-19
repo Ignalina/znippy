@@ -9,7 +9,7 @@ impl StrategicConfig {
         self.file_split_block_size.try_into().unwrap()
     }
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)] //
 pub struct StrategicConfig {
     pub max_core_in_flight: usize,
     pub max_core_in_compress: usize,
