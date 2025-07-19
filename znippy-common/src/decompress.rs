@@ -233,7 +233,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                 let chunk_seq = chunk_meta.chunk_seq;
                 let file_index = chunk_meta.file_index;
                 if(chunk_meta.compressed) {
-                    match decompress_chunk_once(dctx,&data,&config_decompressor) {
+                    match decompress2_microchunk(&data) {
                         Ok(decompressed) => {
 
 
@@ -441,7 +441,51 @@ pub fn decompress_chunk_stream2(input: &[u8]) -> Result<Vec<u8>> {
         Ok(output)
     }
 }
-unsafe fn decompress_chunk_once(dctx: *mut ZSTD_DCtx, src: &[u8], config_decompressor: &StrategicConfig) -> Result<Vec<u8>> {
+pub unsafe fn decompress_chunk_once(
+    dctx: *mut ZSTD_DCtx,
+    src: &[u8],
+    config: &StrategicConfig,
+) -> Result<Vec<u8>> {
+    let mut dst = Vec::with_capacity(config.zstd_output_buffer_size);
+    let mut output_buf = vec![0u8; config.zstd_output_buffer_size];
+
+    let mut input = ZSTD_inBuffer {
+        src: src.as_ptr() as *const _,
+        size: src.len(),
+        pos: 0,
+    };
+
+    while input.pos < input.size {
+        let mut output = ZSTD_outBuffer {
+            dst: output_buf.as_mut_ptr() as *mut _,
+            size: output_buf.len(),
+            pos: 0,
+        };
+
+        let code = ZSTD_decompressStream(dctx, &mut output, &mut input);
+        if ZSTD_isError(code) != 0 {
+            let msg = std::ffi::CStr::from_ptr(ZSTD_getErrorName(code));
+            return Err(anyhow!("ZSTD_decompressStream error: {}", msg.to_string_lossy()));
+        }
+
+        if output.pos > 0 {
+            dst.extend_from_slice(&output_buf[..output.pos]);
+        }
+
+        // säkerhetsbrytare för toma svar
+        if input.pos == input.size && output.pos == 0 && code > 0 {
+            return Err(anyhow!("ZSTD_decompressStream flush error: no progress made"));
+        }
+
+        if code == 0 {
+            break; // ✅ flushed and complete
+        }
+    }
+
+    Ok(dst)
+}
+
+unsafe fn decompress_chunk_once2(dctx: *mut ZSTD_DCtx, src: &[u8], config_decompressor: &StrategicConfig) -> Result<Vec<u8>> {
     let output_capacity = config_decompressor.zstd_output_buffer_size; // t.ex. 10 MB
     let mut dst = vec![0u8; output_capacity];
 
@@ -471,3 +515,37 @@ unsafe fn decompress_chunk_once(dctx: *mut ZSTD_DCtx, src: &[u8], config_decompr
     dst.truncate(output.pos);
     Ok(dst)
 }
+
+
+pub fn decompress2_microchunk(input: &[u8]) -> Result<Vec<u8>> {
+    unsafe {
+        let size = ZSTD_getFrameContentSize(input.as_ptr() as *const _, input.len());
+
+        if size == ZSTD_CONTENTSIZE_ERROR as u64 {
+            return Err(anyhow!("Not a valid zstd frame"));
+        }
+        if size == ZSTD_CONTENTSIZE_UNKNOWN as u64 {
+            return Err(anyhow!("Unknown content size"));
+        }
+
+        let expected_size = size as usize;
+        let mut output = vec![0u8; expected_size];
+
+        let written = ZSTD_decompress(
+            output.as_mut_ptr() as *mut _,
+            output.len(),
+            input.as_ptr() as *const _,
+            input.len(),
+        );
+
+        if ZSTD_isError(written) != 0 {
+            let err = ZSTD_getErrorName(written);
+            let err_str = CStr::from_ptr(err).to_string_lossy();
+            return Err(anyhow!("ZSTD_decompress error: {}", err_str));
+        }
+
+        output.truncate(written);
+        Ok(output)
+    }
+}
+
