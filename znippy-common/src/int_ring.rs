@@ -1,10 +1,19 @@
 //! Reusable RingBuffer enum with fixed array backing and trait implementation
+//! Reusable RingBuffer enum with fixed array backing and trait implementation
+//!
+//! Memory usage is estimated assuming 10MB per chunk.
+//! Each thread gets its own RingBuffer. Total memory = SIZE × 10MB × NUM_THREADS (e.g. 32).
+//! The total RAM consumption per size tier (for 32 threads) is approximately:
+//
+//! MINI_SIZE:         4    × 10MB × 32 ≈   1.25 GB
+//! MEDIUM_SIZE:      32    × 10MB × 32 ≈  10.00 GB
+//! LARGE_SIZE:      128    × 10MB × 32 ≈  40.00 GB
+//! STORLEK_ENORM:  8192    × 10MB × 32 ≈ 2560.00 GB (~2.5 TB)
 
-pub const MINI_SIZE: usize = 64;         // ~1G * 0.75 / 10MB
-pub const MEDIUM_SIZE: usize = 512;      // ~8GB * 0.75 / 10MB
-pub const LARGE_SIZE: usize = 2048;      // ~32GB * 0.75 / 10MB
-pub const STORLEK_ENORM: usize = 256_000; // ~2.44 TB @ 10MB per chunk
-
+pub const MINI_SIZE: usize = 4;         // ~1.25 GB total at 10MB per chunk × 32 threads
+pub const MEDIUM_SIZE: usize = 32;      // ~10.00 GB total
+pub const LARGE_SIZE: usize = 128;      // ~40.00 GB total
+pub const STORLEK_ENORM: usize = 8192;  // ~2.5 TB total
 struct RingState {
     head: usize,
     tail: usize,

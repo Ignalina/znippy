@@ -58,18 +58,19 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
     let total_files:u64 = all_files.len() as u64;
 
-    let (tx_chunk, rx_chunk): (Sender<(u64,u64,u64, u64, bool)>, Receiver<_>) = bounded(CONFIG.max_core_in_flight);
+    let (tx_chunk, rx_chunk): (Sender<(u64,u64,u8,u64,u64, bool)>, Receiver<_>) = bounded(CONFIG.max_core_in_flight);
 
     let (tx_compressed, rx_compressed): (Sender<(Arc<[u8]>,ChunkMeta)>, Receiver<(Arc<[u8]>,ChunkMeta)>) = unbounded();
-    let (tx_return, rx_return): (Sender<u64>, Receiver<u64>) = unbounded();
+    let (tx_return, rx_return): (Sender<(u8,u64)>, Receiver<(u8,u64)>) = unbounded();
 
     let output_zdata_path = output.with_extension("zdata");
     log::debug!("Creating zdata file at: {:?}", output_zdata_path);
     let zdata_file = OpenOptions::new().create(true).write(true).truncate(true).open(&output_zdata_path)?;
     let mut writer = BufWriter::with_capacity((CONFIG.file_split_block_size / 2) as usize, zdata_file);
 
-    let revolver = ChunkRevolver::new(&CONFIG);
-    let base_ptr = SendPtr::new(revolver.base_ptr());
+    let mut revolver = ChunkRevolver::new(&CONFIG);
+    let base_ptrs = revolver.base_ptrs();
+
     let chunk_size = revolver.chunk_size();
 
     let input_dir_cloned = input_dir.clone();
@@ -80,7 +81,6 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
     let reader_thread = {
         let tx_chunk = tx_chunk.clone();
         let rx_done = rx_return.clone();
-        let mut revolver = revolver; // move into thread
         thread::spawn(move || {
             let mut inflight_chunks = 0usize;
             let mut uncompressed_files:u64 = 0;
@@ -111,60 +111,45 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                 let mut has_read_any_data = false;
                 let mut fdata_offset:u64=0;
                 loop {
+                    let maybe_chunk = revolver.try_get_chunk();
 
-
-                    let mut chunk;
-                    let chunk_index:u64;
-
-                    {
-                        // get a free chunk, if non is free , block wait for 1 to get free
-
-                        match revolver.try_get_chunk() {
-                            Some(c) => {
-                                chunk_index = c.index;
-                                chunk = c;
-                            }
-                            None => {
-                                // Blockera tills en chunk returneras
-                                let returned = rx_done.recv().expect("rx_done channel closed unexpectedly");
-//                                log::debug!("[reader] Blocking wait — returned chunk {} to pool", returned);
-                                revolver.return_chunk(returned);
-                                inflight_chunks = inflight_chunks.checked_sub(1).expect("inflight_chunks underflow");
-                                continue;
+                    match maybe_chunk {
+                        Some(mut chunk) => {
+                            match reader.read(&mut *chunk) {
+                                Ok(0) => {
+                                    if !has_read_any_data {
+                                        tx_chunk.send((file_index as u64, fdata_offset, chunk.ring_nr,chunk.index, 0, skip)).unwrap();
+                                        inflight_chunks += 1;
+                                    } else {
+                                        let ring_nr = chunk.ring_nr;
+                                        let index = chunk.index;
+                                        drop(chunk); // släpp lånet innan vi rör `revolver`
+                                        revolver.return_chunk(ring_nr, index);
+                                    }
+                                    break;
+                                }
+                                Ok(bytes_read) => {
+                                    has_read_any_data = true;
+                                    tx_chunk.send((file_index as u64, fdata_offset, chunk.ring_nr,chunk.index, bytes_read as u64, skip)).unwrap();
+                                    inflight_chunks += 1;
+                                    fdata_offset += bytes_read as u64;
+                                }
+                                Err(e) => {
+                                    log::warn!("[reader] Error reading file {}: {}", path.display(), e);
+                                    let ring_nr = chunk.ring_nr;
+                                    let index = chunk.index;
+                                    drop(chunk);
+                                    revolver.return_chunk(ring_nr, index);
+                                    break;
+                                }
                             }
                         }
-
-//                        chunk_index = chunk.index;
-                        match reader.read(&mut *chunk) {
-                            Ok(0) => {
-                                if !has_read_any_data {
-  //                                  log::debug!("[reader] Zero-length file {}", file_index);
-                                    // ⬇️ Skicka en chunk med 0 bytes för att markera tom fil
-                                    tx_chunk.send((file_index as u64,fdata_offset, chunk_index, 0, skip)).unwrap();
-                                    inflight_chunks += 1;
-                                } else {
-    //                                log::debug!("[reader] EOF after data for file {}", file_index);
-                                    // ⛔️ Inget att göra – datan är redan skickad
-                                    revolver.return_chunk(chunk_index); // Vi måste returnera chunken
-                                }
-                                break;
-                            }
-                            Ok(bytes_read) => {
-                                has_read_any_data = true;
-      //                          log::debug!("[reader] Read {} bytes from file {}", bytes_read, file_index);
-      //                          log::debug!("[reader] Sending chunk {} from file {} to compressor", chunk_index, file_index);
-                                tx_chunk.send((file_index as u64,fdata_offset, chunk_index, bytes_read as u64, skip)).unwrap();
-                                inflight_chunks += 1;
-                                fdata_offset+=bytes_read as u64;
-                            }
-                            Err(e) => {
-                                log::warn!("[reader] Error reading file {}: {}", path.display(), e);
-                                revolver.return_chunk(chunk_index); // Frigör chunken även vid fel
-                                break;
-                            }
-
-                        };
-
+                        None => {
+                            let (ring_nr, returned) = rx_done.recv().expect("rx_done channel closed unexpectedly");
+                            revolver.return_chunk(ring_nr, returned);
+                            inflight_chunks = inflight_chunks.checked_sub(1).expect("inflight_chunks underflow");
+                            continue;
+                        }
                     }
                 }
 
@@ -175,9 +160,9 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
             // Wait for all inflight chunks to return before finishing
             while inflight_chunks > 0 {
                 match rx_done.recv() {
-                    Ok(returned) => {
+                    Ok((ring_nr,returned)) => {
                         log::debug!("[reader] Returned chunk {} to pool during draining", returned);
-                        revolver.return_chunk(returned);
+                        revolver.return_chunk(ring_nr, returned);
                         inflight_chunks -= 1;
                     }
                     Err(_) => {
@@ -211,10 +196,13 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
         let rx_chunk = rx_chunk.clone();
         let tx_compressed = tx_compressed.clone();
         let tx_ret = tx_return.clone();
-        let base_ptr = SendPtr::new(base_ptr.as_ptr()); // create new SendPtr for each thread
+        let base_ptr: SendPtr = base_ptrs[compressor_group as usize];
+
         let chunk_size = chunk_size;
 
         let handle = thread::spawn(move || {
+            let raw_ptr = base_ptr.as_ptr();
+
             let mut local_chunkmeta: Vec<ChunkMeta> = Vec::new();
             let mut hasher = Hasher::new(); // Blake3 hash initialization
             let mut chunk_seq:u32=0;
@@ -228,9 +216,9 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
                 loop {
                     match rx_chunk.recv() {
-                        Ok((file_index, fdata_offset, chunk_nr, length, skip)) => {
+                        Ok((file_index, fdata_offset, ring_nr,chunk_nr, length, skip)) => {
                             log::debug!("[compressor] Processing chunk {} from file {}: {} bytes", chunk_nr, file_index, length);
-                            let input = get_chunk_slice(base_ptr.as_ptr(), chunk_size, chunk_nr as u32, length as usize);
+                            let input = get_chunk_slice(raw_ptr, chunk_size, chunk_nr as u32, length as usize);
                             let input_ptr = input.as_ptr();
                             let chunk_meta;
                             let output: Arc<[u8]>;
@@ -294,7 +282,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                 }
                             }
                       //      log::debug!("[compressor] Sending ACK on chunk_nr done  chunknr {} of file {} to reader", chunk_nr, file_index);
-                            tx_ret.send(chunk_nr);
+                            tx_ret.send((ring_nr, chunk_nr));
 
                         }
                         Err(_) => {
