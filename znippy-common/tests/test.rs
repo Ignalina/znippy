@@ -1,9 +1,8 @@
 use znippy_common::chunkrevolver::ChunkRevolver;
 use znippy_common::common_config::CONFIG;
 use std::collections::HashSet;
-
-
-
+use znippy_common::RingBuffer;
+use znippy_common::ChunkQueue;
 #[test]
 fn test_try_get_chunk_exhaustion() {
     let mut revolver = ChunkRevolver::new(&CONFIG);
@@ -114,4 +113,42 @@ fn test_ring_buffer_one_slot_safety() {
         "Expected to get max - 1 chunks due to 1-slot safety, got {}",
         used
     );
+}
+
+#[test]
+fn test_return_chunks_out_of_order() {
+
+    let mut ring = RingBuffer::new(64);    let capacity = ring.capacity();
+
+    let mut taken = vec![];
+
+    // Ta ut alla chunkar
+    for _ in 0..capacity {
+        let val = ring.pop();
+        assert!(val.is_some());
+        taken.push(val.unwrap());
+    }
+
+    // Nu bör det vara tomt
+    assert!(ring.pop().is_none());
+
+    // Returnera chunkar i omvänd ordning
+    for &val in taken.iter().rev() {
+        ring.push(val).unwrap();
+    }
+
+    // Plocka ut igen – bör få exakt samma antal
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..capacity {
+        let val = ring.pop();
+        assert!(val.is_some());
+        let v = val.unwrap();
+        assert!(
+            seen.insert(v),
+            "Duplicate chunk detected: {v} – chunk reused too early!"
+        );
+    }
+
+    // Ska vara tomt igen
+    assert!(ring.pop().is_none());
 }

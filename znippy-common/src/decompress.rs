@@ -40,17 +40,17 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
     let batch_cloned_for_writer = Arc::clone(&batch);
 
 
-    let revolver = ChunkRevolver::new(&config);
-    let base_ptr = SendPtr::new(revolver.base_ptr());
+    let mut revolver = ChunkRevolver::new(&config);
+    let base_ptrs = revolver.base_ptrs();
     let chunk_size = revolver.chunk_size();
 
 
 
-    let (work_tx, work_rx): (Sender<(ChunkMeta,u32)>, Receiver<(ChunkMeta,u32 )>) = bounded(config.max_core_in_flight);
+    let (work_tx, work_rx): (Sender<(ChunkMeta,u8,u32)>, Receiver<(ChunkMeta,u8,u32 )>) = bounded(config.max_core_in_flight);
 
     let (chunk_tx, chunk_rx): (Sender<(ChunkMeta, Vec<u8>)>, Receiver<_>) = bounded(config.max_core_in_flight);
 
-    let (done_tx, done_rx): (Sender<u64>, Receiver<u64>) = unbounded();
+    let (done_tx, done_rx): (Sender<(u8,u64)>, Receiver<(u8,u64)>) = unbounded();
 
 
     let out_dir = Arc::new(out_dir.to_path_buf());
@@ -69,7 +69,6 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
         let mut inflight_chunks = 0usize;
 
         let mut zdata_file = File::open(&zdata_path).expect("Failed to open .zdata file");
-        let mut revolver = revolver; // move into thread
 
         let Some(batch) = batches.get(0) else {
             eprintln!("❌ No batch found in index");
@@ -126,17 +125,16 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                     log::debug!("[reader] reading file {} chunk {:?}",paths.value(file_index as usize),(zdata_offset, fdata_offset, compressed_size, chunk_seq, checksum_group));
 
                     // Try to get a chunk – if none are available, wait for one to be returned
-                    let (mut chunk_data, chunk_index): (Chunk, u64) = loop {
+                    let mut chunk_data: Chunk = loop {
                         match revolver.try_get_chunk() {
                             Some(c) => {
-                                let idx = c.index;
-                                break (c, idx);
+                                break c
                             }
                             None => {
                                 // Block until a chunk is returned
-                                let returned = done_rx.recv().expect("rx_done channel closed unexpectedly");
-                                log::debug!("[reader] Blocking wait — returned chunk {} to pool", returned);
-                                revolver.return_chunk(returned);
+                                let (thread_nr,returned) = done_rx.recv().expect("rx_done channel closed unexpectedly");
+                                log::debug!("[reader] Blocking wait — returned chunk {} from thread nr {} to pool", returned,thread_nr);
+                                revolver.return_chunk(thread_nr ,returned);
                                 inflight_chunks = inflight_chunks.checked_sub(1).expect("inflight_chunks underflow");
                             }
                         }
@@ -170,7 +168,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                     };
 
                     // Send chunk to the decompressor
-                    tx.send((meta, chunk_index as u32)).unwrap();
+                    tx.send((meta, chunk_data.ring_nr,chunk_data.index as u32)).unwrap();
                     inflight_chunks += 1;
                 }
             } else {
@@ -184,9 +182,9 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
         // Wait for all inflight chunks to return before finishing
         while inflight_chunks > 0 {
             match done_rx.recv() {
-                Ok(returned) => {
+                Ok((thread_nr,returned)) => {
                     log::debug!("[reader] Returned chunk {} to pool during draining", returned);
-                    revolver.return_chunk(returned);
+                    revolver.return_chunk(thread_nr,returned);
                     inflight_chunks -= 1;
                 }
                 Err(_) => {
@@ -201,27 +199,25 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
     // DECOMPRESSOR
     let mut decompressor_threads = Vec::with_capacity(config.max_core_in_compress as u8 as usize);
 
-    for decompressor_nr in 0..config.max_core_in_compress {
-
- //   for decompressor_nr in 0..1 {
+    for decompressor_nr in 0..config.max_core_in_compress as u8 {
+        let base_ptr: SendPtr = base_ptrs[decompressor_nr as usize];
         let rx = work_rx.clone();
         let tx = chunk_tx.clone();
         let done_tx = done_tx.clone(); // ✅ klona in
         let config_decompressor = config.clone();
-        let base_ptr = SendPtr::new(base_ptr.as_ptr()); // create new SendPtr for each thread
-
         let handle = thread::spawn(move || unsafe {
+            let raw_ptr = base_ptr.as_ptr();
             let dctx = ZSTD_createDCtx();
             if dctx.is_null() {
                 return Err(anyhow!("Failed to create decompression context"));
             }
 
 
-            while let Ok((chunk_meta, chunk_nr)) = rx.recv() {
+            while let Ok((chunk_meta,ring_nr, chunk_nr)) = rx.recv() {
                 log::debug!("[Decompressor {} ] got chunk_nr {}",decompressor_nr, chunk_nr);
 
                 let data = get_chunk_slice(
-                    base_ptr.as_ptr(),
+                    raw_ptr,
                     chunk_size,
                     chunk_nr as u32,
                     chunk_meta.compressed_size as usize,
@@ -242,18 +238,18 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                             let mut hasher = Hasher::new();
                             hasher.update(&decompressed);
                             tx.send((chunk_meta, decompressed)).unwrap();
-                            done_tx.send(chunk_nr as u64).unwrap(); // ✅ viktigt
+                            done_tx.send((decompressor_nr as u8,chunk_nr as u64)).unwrap(); // ✅ viktigt
                             log::debug!("Decompression successful chunkr {}  ",chunk_nr);
                         }
                         Err(e) => {
                             eprintln!("Decompression failed: file_index {} chunk_nr {} chunk uncompressed size={} chunk compressed size={} chunk_seq {}  {}",file_index,chunk_nr,chunk_org_size,data.len(),chunk_seq, e);
-                            done_tx.send(chunk_nr as u64).unwrap(); // ✅ viktigt
+                            done_tx.send((decompressor_nr as u8,chunk_nr as u64)).unwrap(); // ✅ viktigt
                         }
                     }
                 } else {
                     log::debug!("Saving non compressed chunk with len: {}",data.len());
                     tx.send((chunk_meta, data.to_vec())).unwrap();
-                    done_tx.send(chunk_nr as u64).unwrap(); // ✅ viktigt
+                    done_tx.send((decompressor_nr as u8, chunk_nr as u64)).unwrap(); // ✅ viktigt
 
                 }
 
