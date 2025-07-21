@@ -33,7 +33,8 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
     let (schema, batches) = read_znippy_index(index_path)?;
     let file_checksums = extract_file_checksums_from_metadata(&schema);
-    let config = extract_config_from_arrow_metadata(schema.metadata())?;
+    let config =&CONFIG;
+        //extract_config_from_arrow_metadata(schema.metadata())?;
     log::debug!("read config from meta {:?}\n and checksums {:?}", config,file_checksums);
 
     let batch = Arc::new(batches[0].clone()); // ✅ clone är shallow – delar data internt

@@ -1,4 +1,4 @@
-use crate::common_config::{StrategicConfig, CONFIG};
+pub use crate::common_config::{StrategicConfig, CONFIG};
 use crate::int_ring::RingBuffer;
 use crate::ChunkQueue;
 use std::ops::{Deref, DerefMut};
@@ -49,7 +49,7 @@ impl ChunkRevolver {
     pub fn new(config: &StrategicConfig) -> Self {
         let chunk_size = config.file_split_block_size_usize() as u64;
         let num_chunks = config.max_chunks as usize;
-        let thread_count = config.max_core_in_compress as usize;
+        let thread_count = config.max_core_in_flight as usize;
 
         let safe_thread_count = thread_count.min(num_chunks);
         let chunks_per_thread = num_chunks / safe_thread_count;

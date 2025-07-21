@@ -375,13 +375,16 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                 log::error!("[writer] Write error: {}", e);
                 continue;
             }
-
-            unsafe {
-                if let Err(e) = test_decompress_chunk(&compressed_data) {
-                    log::error!("Test decompression failed in WRITER THREAD: {}", e);
+/*
+            if file.compressed {
+                unsafe {
+                    if let Err(e) = test_decompress_chunk(&compressed_data) {
+                        log::error!("Test decompression failed in WRITER THREAD for  {} error {}",file.relative_path,e);
+                    }
                 }
             }
-
+            
+ */
             zdata_offset += compressed_data.len() as u64;
             writerstats.total_chunks += 1;
             writerstats.total_written_bytes += compressed_data.len() as u64; // Update the total output bytes
