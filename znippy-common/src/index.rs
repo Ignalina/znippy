@@ -72,6 +72,7 @@ pub fn extract_config_from_arrow_metadata(
     metadata: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<StrategicConfig> {
     Ok(StrategicConfig {
+        max_core_allowed: 0,
         max_core_in_flight: metadata.get("max_core_in_flight")
             .ok_or_else(|| anyhow::anyhow!("Missing 'max_core_in_flight' in metadata"))?
             .parse()?,
