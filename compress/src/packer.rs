@@ -272,19 +272,6 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                         compressed: true,
                                         uncompressed_size: micro.len() as u64,
                                     };
-/*
-                                    if let Err(e) = test_decompress_chunk(&compressed_chunk[..]) {
-                                        log::error!(
-        "❌ Test decompression failed right after compression!        seq={}, file_index={}, z_offset={}, len={} => {:?}",
-        chunk_meta.chunk_seq,
-        chunk_meta.file_index,
-        chunk_meta.zdata_offset,
-        chunk_meta.compressed_size,
-        e
-    );
-                                        panic!("not GOOOD EROROROORRO: {}", e);
-                                    }
-*/
                                     log::debug!("[compressor {}] did File_index {} chunk nr {} size {} micro nr {} chunk size {} out {} ",compressor_group,file_index, chunk_nr,length,micro_nr,micro.len(),chunk_meta.compressed_size);
 
                                     tx_compressed.send((compressed_chunk, chunk_meta))?;
