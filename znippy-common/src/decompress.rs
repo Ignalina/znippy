@@ -47,11 +47,23 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
 
 
-    let (work_tx, work_rx): (Sender<(ChunkMeta,u8,u32)>, Receiver<(ChunkMeta,u8,u32 )>) = bounded(config.max_core_in_flight);
+//    let (work_tx, work_rx): (Sender<(ChunkMeta,u8,u32)>, Receiver<(ChunkMeta,u8,u32 )>) = bounded(config.max_core_in_flight);
 
-    let (chunk_tx, chunk_rx): (Sender<(ChunkMeta, Vec<u8>)>, Receiver<_>) = bounded(config.max_core_in_flight);
+
+
+    // work: skickas från reader → decompressors
+    let (work_tx_array, work_rx_array): (
+        Vec<Sender<(ChunkMeta, u8, u32)>>,
+        Vec<Receiver<(ChunkMeta, u8, u32)>>
+    ) = (0..CONFIG.max_core_in_flight)
+        .map(|_| bounded(CONFIG.max_chunks as usize))
+        .unzip();
+
 
     let (done_tx, done_rx): (Sender<(u8,u64)>, Receiver<(u8,u64)>) = unbounded();
+
+    // chunk: skickar decompressor til writer
+    let (chunk_tx, chunk_rx): (Sender<(ChunkMeta, Vec<u8>)>, Receiver<_>) = bounded(config.max_core_in_flight);
 
 
     let out_dir = Arc::new(out_dir.to_path_buf());
@@ -64,10 +76,10 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
 
     // READER
-    let tx = work_tx.clone();
     let done_rx = done_rx.clone();
     let mut reader_thread = thread::spawn(move || {
         let mut inflight_chunks = 0usize;
+        let work_tx_array = work_tx_array.clone();
 
         let mut zdata_file = File::open(&zdata_path).expect("Failed to open .zdata file");
 
@@ -169,7 +181,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                     };
 
                     // Send chunk to the decompressor
-                    tx.send((meta, chunk_data.ring_nr,chunk_data.index as u32)).unwrap();
+                    work_tx_array[chunk_data.ring_nr as usize] .send((meta, chunk_data.ring_nr,chunk_data.index as u32)).unwrap();
                     inflight_chunks += 1;
                 }
             } else {
@@ -199,14 +211,17 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
     // DECOMPRESSOR
     let mut decompressor_threads = Vec::with_capacity(config.max_core_in_compress as u8 as usize);
+    let rx_array = work_rx_array.clone();
 
     for decompressor_nr in 0..config.max_core_in_compress as u8 {
         let base_ptr: SendPtr = base_ptrs[decompressor_nr as usize];
-        let rx = work_rx.clone();
+        let rx = rx_array[decompressor_nr as usize].clone();
+
         let tx = chunk_tx.clone();
         let done_tx = done_tx.clone(); // ✅ klona in
         let config_decompressor = config.clone();
         let handle = thread::spawn(move || unsafe {
+            //let rx = rx_array[decompressor_nr as usize];
             let raw_ptr = base_ptr.as_ptr();
             let dctx = ZSTD_createDCtx();
             if dctx.is_null() {
