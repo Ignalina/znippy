@@ -58,7 +58,14 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
     let total_files:u64 = all_files.len() as u64;
 
-    let (tx_chunk, rx_chunk): (Sender<(u64,u64,u8,u64,u64, bool)>, Receiver<_>) = bounded(CONFIG.max_core_in_flight);
+
+    let (tx_chunk_array, rx_chunk_array): (
+        Vec<Sender<(u64, u64, u8, u64, u64, bool)>>,
+        Vec<Receiver<(u64, u64, u8, u64, u64, bool)>>
+    ) = (0..CONFIG.max_core_in_flight)
+        .map(|_| bounded(CONFIG.max_chunks as usize))
+        .unzip();
+
 
     let (tx_compressed, rx_compressed): (Sender<(Arc<[u8]>,ChunkMeta)>, Receiver<(Arc<[u8]>,ChunkMeta)>) = unbounded();
     let (tx_return, rx_return): (Sender<(u8,u64)>, Receiver<(u8,u64)>) = unbounded();
@@ -79,7 +86,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
     let all_files_for_reader = Arc::clone(&all_files);
     let all_files_for_writer = Arc::clone(&all_files);
     let reader_thread = {
-        let tx_chunk = tx_chunk.clone();
+        let tx_chunk_array = tx_chunk_array.clone();
         let rx_done = rx_return.clone();
         thread::spawn(move || {
             let mut inflight_chunks = 0usize;
@@ -115,10 +122,12 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
                     match maybe_chunk {
                         Some(mut chunk) => {
+
+                            let ring_nr=chunk.ring_nr as usize;
                             match reader.read(&mut *chunk) {
                                 Ok(0) => {
                                     if !has_read_any_data {
-                                        tx_chunk.send((file_index as u64, fdata_offset, chunk.ring_nr,chunk.index, 0, skip)).unwrap();
+                                        tx_chunk_array[ring_nr].send((file_index as u64, fdata_offset, chunk.ring_nr,chunk.index, 0, skip)).unwrap();
                                         inflight_chunks += 1;
                                     } else {
                                         let ring_nr = chunk.ring_nr;
@@ -130,7 +139,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                 }
                                 Ok(bytes_read) => {
                                     has_read_any_data = true;
-                                    tx_chunk.send((file_index as u64, fdata_offset, chunk.ring_nr,chunk.index, bytes_read as u64, skip)).unwrap();
+                                    tx_chunk_array[ring_nr].send((file_index as u64, fdata_offset, chunk.ring_nr,chunk.index, bytes_read as u64, skip)).unwrap();
                                     inflight_chunks += 1;
                                     fdata_offset += bytes_read as u64;
                                 }
@@ -173,7 +182,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
             }
 
             // Drop the sender side of the channel `tx_chunk` to signal that no more data will be sent
-            drop(tx_chunk); // This ensures that tx_chunk is no longer available and allows the receiver to detect closure
+            tx_chunk_array.into_iter().for_each(drop);
             log::debug!("[reader] tx_chunk dropped after finishing all chunk sends");
 
             // Drop other resources after processing is complete
@@ -193,7 +202,8 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
     let mut compressor_threads = Vec::with_capacity(CONFIG.max_core_in_flight as u8 as usize);
     for compressor_group in 0..CONFIG.max_core_in_flight as u8 {
-        let rx_chunk = rx_chunk.clone();
+        let rx_chunk = rx_chunk_array[compressor_group as usize].clone();
+
         let tx_compressed = tx_compressed.clone();
         let tx_ret = tx_return.clone();
         let base_ptr: SendPtr = base_ptrs[compressor_group as usize];
@@ -262,7 +272,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                         compressed: true,
                                         uncompressed_size: micro.len() as u64,
                                     };
-
+/*
                                     if let Err(e) = test_decompress_chunk(&compressed_chunk[..]) {
                                         log::error!(
         "❌ Test decompression failed right after compression!        seq={}, file_index={}, z_offset={}, len={} => {:?}",
@@ -274,7 +284,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
     );
                                         panic!("not GOOOD EROROROORRO: {}", e);
                                     }
-
+*/
                                     log::debug!("[compressor {}] did File_index {} chunk nr {} size {} micro nr {} chunk size {} out {} ",compressor_group,file_index, chunk_nr,length,micro_nr,micro.len(),chunk_meta.compressed_size);
 
                                     tx_compressed.send((compressed_chunk, chunk_meta))?;
@@ -383,7 +393,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                     }
                 }
             }
-            
+
  */
             zdata_offset += compressed_data.len() as u64;
             writerstats.total_chunks += 1;
@@ -403,7 +413,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
     log::debug!("[reader] reader_thread joined");
 
     // Drop the sender-side channels after the reader and compressor threads finish
-    drop(tx_chunk); // Ensure no more chunks are sent
+    tx_chunk_array.into_iter().for_each(drop);
     log::debug!("[reader] tx_chunk dropped after reader thread finished");
 
 
