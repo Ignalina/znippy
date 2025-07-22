@@ -234,7 +234,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                             let output: Arc<[u8]>;
 
                             // Hash the uncompressed data before compressing
-//                            hasher.update(&input);
+                            hasher.update(&input);
 
                             if skip {
                                 log::debug!("[compressor] Skipping compression for chunk {} of file {}", chunk_nr, file_index);
