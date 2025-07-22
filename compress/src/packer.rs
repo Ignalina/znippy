@@ -164,7 +164,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
             }
             // Reader thread cleanup
-            log::debug!("[reader] Reader thread done about to drain writer returning chunks ");
+            log::debug!("[reader] Thread done about to drain compressor returning chunks ");
 
             // Wait for all inflight chunks to return before finishing
             while inflight_chunks > 0 {
@@ -180,6 +180,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                     }
                 }
             }
+            log::debug!("[reader] Drain done ");
 
             // Drop the sender side of the channel `tx_chunk` to signal that no more data will be sent
             tx_chunk_array.into_iter().for_each(drop);
