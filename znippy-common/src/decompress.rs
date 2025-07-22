@@ -184,15 +184,17 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                     inflight_chunks += 1;
                 }
             } else {
-                eprintln!("❌ The chunks array is not a StructArray.");
+                log::debug!("❌ The chunks array is not a StructArray.");
             }
         }
 
         // Reader thread cleanup
-        log::debug!("[reader] Reader thread done about to drain writer returning chunks ");
+        log::debug!("[reader] Thread done about to drain compressor returning chunks ");
 
         // Wait for all inflight chunks to return before finishing
         while inflight_chunks > 0 {
+            log::debug!("[reader] draining inflight_chunks amount = {}", inflight_chunks);
+
             match done_rx.recv() {
                 Ok((thread_nr, returned)) => {
                     log::debug!("[reader] Returned chunk {} to pool during draining", returned);
@@ -205,6 +207,8 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                 }
             }
         }
+
+        log::debug!("[reader] Drain done ");
         work_tx_array.into_iter().for_each(drop);
         log::debug!("[reader] tx_work dropped after finishing all chunk sends");
         drop(done_rx);
@@ -221,7 +225,6 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
         let rx = rx_array[decompressor_nr as usize].clone();
         let tx = chunk_tx.clone();
         let done_tx = done_tx.clone(); // ✅ klona in
-        let config_decompressor = config.clone();
         let handle = thread::spawn(move || unsafe {
             let raw_ptr = base_ptr.as_ptr();
             let dctx = ZSTD_createDCtx();
