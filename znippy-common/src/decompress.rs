@@ -222,8 +222,10 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 };
 
 // DECOMPRESSOR
-    let mut decompressor_threads = Vec::with_capacity(config.max_core_in_compress as u8 as usize);
+    let mut decompressor_threads: Vec<JoinHandle<Result<()>>> =
+        Vec::with_capacity(config.max_core_in_flight as usize);
     let rx_array = work_rx_array.clone();
+
 
     for decompressor_nr in 0..config.max_core_in_flight as u8 {
         let base_ptr: SendPtr = base_ptrs[decompressor_nr as usize];
@@ -232,10 +234,6 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
         let done_tx = tx_return.clone(); // ✅ klona in
         let handle = thread::spawn(move || unsafe {
             let raw_ptr = base_ptr.as_ptr();
-            let dctx = ZSTD_createDCtx();
-            if dctx.is_null() {
-                return Err(anyhow!("Failed to create decompression context"));
-            }
 
 
             loop {
@@ -357,11 +355,14 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
                     std::fs::create_dir_all(parent).unwrap();
                 }
 
+
                 let f = OpenOptions::new()
                     .create(true)
                     .write(true)
+                    .truncate(true)
                     .open(&full_path)
                     .unwrap();
+
 
                 current_open += 1;
                 if current_open > peak_open {
@@ -440,6 +441,7 @@ pub fn extract_file_checksums_from_metadata(schema: &SchemaRef) -> Result<Vec<[u
 }
 use zstd_sys::*;
 use std::slice;
+use std::thread::JoinHandle;
 use log::debug;
 use crate::common_config::StrategicConfig;
 use crate::meta::{ReaderStats, WriterStats};
