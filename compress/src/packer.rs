@@ -261,8 +261,26 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                 for (micro_nr, micro) in micro_chunks.iter().enumerate()  {
 
                                     let compressed_vec = compress2_microchunk(cctx, micro)?;
-                                    let compressed_chunk: Arc<[u8]> = Arc::from(compressed_vec.into_boxed_slice());
 
+                                    // ✅ Test-dekomprimera före Arc
+                                    if let Ok(test) = decompress2_microchunk(&compressed_vec) {
+                                        if test.len() != micro.len() {
+                                            log::error!(
+            "❌ [compressor {}] Test direct decompression size mismatch: got {}, expected {}",
+            compressor_group,
+            test.len(),
+            micro.len()
+        );
+                                        }
+                                    } else {
+                                        log::error!(
+        "❌ [compressor {}] Test direct decompression failed (corrupt output)",
+        compressor_group
+    );
+                                    }
+
+                                    // ✅ Inget mer truncate behövs, redan rätt längd
+                                    let compressed_chunk: Arc<[u8]> = Arc::from(compressed_vec.into_boxed_slice());
                                     let chunk_meta = ChunkMeta {
                                         zdata_offset: 0, // to be set by writer
                                         fdata_offset,
@@ -366,23 +384,57 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
             file.uncompressed_size += uncompressed_size;
             // Always push the chunk metadata
             chunk_meta.zdata_offset=zdata_offset;
-            file.chunks.push(chunk_meta);
 
 
             if let Err(e) = writer.write_all(&compressed_data) {
                 log::error!("[writer] Write error: {}", e);
                 continue;
             }
-/*
-            if file.compressed {
+
+
+
+            let chunk_seq = chunk_meta.chunk_seq;
+            let file_index = chunk_meta.file_index;
+            let expected_size = chunk_meta.uncompressed_size;
+
+            file.chunks.push(chunk_meta); // move happens here
+
+            if file.compressed && compressed_data.len() > 0 {
                 unsafe {
-                    if let Err(e) = test_decompress_chunk(&compressed_data) {
-                        log::error!("Test decompression failed in WRITER THREAD for  {} error {}",file.relative_path,e);
+                    match test_decompress_chunk(&compressed_data) {
+                        Ok(actual_size) => {
+                            if actual_size as u64 != expected_size {
+                                log::error!(
+                        "❌ [writer] Test decompress mismatch: got {} bytes, expected {} (file_index {}, chunk_seq {})",
+                        actual_size,
+                        expected_size,
+                        file_index,
+                        chunk_seq
+                    );
+                            }
+                        }
+                        Err(e) => {
+                            log::error!(
+                    "❌ [writer] Test decompression failed for file_index {} chunk_seq {}: {}",
+                    file_index,
+                    chunk_seq,
+                    e
+                );
+                        }
                     }
                 }
             }
 
- */
+            /*
+                        if file.compressed {
+                            unsafe {
+                                if let Err(e) = test_decompress_chunk(&compressed_data) {
+                                    log::error!("Test decompression failed in WRITER THREAD for  {} error {}",file.relative_path,e);
+                                }
+                            }
+                        }
+
+             */
             zdata_offset += compressed_data.len() as u64;
             writerstats.total_chunks += 1;
             writerstats.total_written_bytes += compressed_data.len() as u64; // Update the total output bytes
@@ -523,6 +575,7 @@ pub fn compress_microchunk(
 use std::slice;
 use zstd_sys::*;
 use std::ptr;
+use znippy_common::decompress::decompress2_microchunk;
 
 unsafe fn test_decompress_chunk(data: &[u8]) -> Result<usize> {
     let ctx = unsafe { ZSTD_createDCtx() };
