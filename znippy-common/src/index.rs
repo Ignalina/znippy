@@ -270,6 +270,7 @@ pub struct VerifyReport {
     pub total_bytes: u64,
     pub verified_bytes: u64,
     pub corrupt_bytes: u64,
+    pub chunks: u64,
 }
 
 pub fn list_archive_contents(path: &Path) -> Result<()> {

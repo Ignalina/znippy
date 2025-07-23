@@ -7,8 +7,6 @@ pub use int_ring::{RingBuffer, ChunkQueue};
 
 pub mod chunkrevolver;
 pub use chunkrevolver::{ChunkRevolver,get_chunk_slice,split_into_microchunks};
-pub mod chunkpool;
-pub use chunkpool::ChunkPool;
 
 pub mod meta;
 pub use meta::{ChunkMeta,FileMeta};

@@ -65,7 +65,6 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
 
     let out_dir = Arc::new(out_dir.to_path_buf());
-    let report = VerifyReport::default();
 
     let chunk_rx_cloned = chunk_rx.clone();
     let out_dir_cloned = Arc::clone(&out_dir);
@@ -77,17 +76,17 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
          let work_tx_array = work_tx_array.clone();
 
-    thread::spawn(move || {
+    thread::spawn(move || -> ReaderStats  {
         let mut inflight_chunks = 0usize;
 
         let mut zdata_file = File::open(&zdata_path).expect("Failed to open .zdata file");
 
         let Some(batch) = batches.get(0) else {
             eprintln!("❌ No batch found in index");
-            return;
+            return ReaderStats { total_files: 0, skipped_files: 0 };
         };
 
-        let file_count = batch.num_rows(); // Get file_count here
+        let total_files = batch.num_rows(); // Get file_count here
 
         // Fetch columns only once for later use
         let paths = batch
@@ -109,7 +108,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
         let chunk_offsets = chunks_array.value_offsets(); // Get chunk offsets once before the loop
 
         // Iterate over files, using Arrow's ListArray to access chunks directly
-        for file_index in 0..file_count as u64 {
+        for file_index in 0..total_files as u64 {
 
             // Ensure we access the correct chunk array for the current file
             let chunks_array_for_file = chunks_array.value(file_index as usize); // This gives us the StructArray for the current file
@@ -213,6 +212,12 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
         log::debug!("[reader] tx_work dropped after finishing all chunk sends");
         drop(done_rx);
         drop(revolver);
+
+        ReaderStats {
+            total_files,
+            skipped_files: 0 as usize,
+        }
+
     })
 };
 
@@ -312,7 +317,9 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
 
     // [WRITER]
-    let writer_thread=thread::spawn(move || {
+    let writer_thread=thread::spawn(move || -> WriterStats  {
+        let mut total_chunks = 0u64;
+        let mut total_written_bytes = 0u64;
         while let Ok((chunk_meta, data)) = chunk_rx_cloned.recv() {
 
 
@@ -328,7 +335,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
             let full_path = out_dir_cloned.join(rel_path); // → PathBuf
 
-            println!("[Writer] got file_index {} index file name  {} transposed to fullpath={:?}", chunk_meta.file_index, rel_path,full_path);
+            log::debug!("[Writer] got file_index {} index file name  {} transposed to fullpath={:?}", chunk_meta.file_index, rel_path,full_path);
 
             if let Some(parent) = full_path.parent() {
                 std::fs::create_dir_all(parent).unwrap();
@@ -342,10 +349,16 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
             f.seek(SeekFrom::Start(chunk_meta.fdata_offset)).unwrap();
             f.write_all(&data).unwrap();
 
+            total_chunks += 1;
+            total_written_bytes += data.len() as u64;
+        }
+
+        WriterStats {
+            total_chunks,
+            total_written_bytes,
         }
     });
-
-    reader_thread.join().expect("reader_thread panicked");
+    let reader_stats = reader_thread.join().expect("reader_thread panicked");
     log::debug!("[reader] reader_thread joined");
     work_tx_array.into_iter().for_each(drop);
     log::debug!("[reader] tx_chunk dropped after reader thread finished");
@@ -357,8 +370,17 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
          handle.join();
     }
     drop(chunk_tx);
-    writer_thread.join();
+    let writer_stats=writer_thread.join().expect("writher_thread panicked");
 
+    let report = VerifyReport {
+        total_files: reader_stats.total_files,
+        verified_files: 0,
+        corrupt_files: 0,
+        total_bytes: writer_stats.total_written_bytes,
+        verified_bytes: 0,
+        corrupt_bytes: 0,
+        chunks: writer_stats.total_chunks
+    };
 
     Ok(report)
 }
@@ -389,7 +411,9 @@ pub fn extract_file_checksums_from_metadata(schema: &SchemaRef) -> Result<Vec<[u
 }
 use zstd_sys::*;
 use std::slice;
+use log::debug;
 use crate::common_config::StrategicConfig;
+use crate::meta::{ReaderStats, WriterStats};
 
 /// Decompress a complete microchunk into the provided `dst` buffer.
 /// Assumes `src` contains a *complete* ZSTD stream (as produced with `ZSTD_e_end`)

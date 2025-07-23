@@ -78,10 +78,12 @@ fn main() -> Result<()> {
             println!("\n✅ Dekomprimering och verifiering klar:");
             println!("📁 Totala filer:       {}", report.total_files);
             println!("🔐 Verifierade filer:  {}", report.verified_files);
+            println!("📥  chunks:    {}", report.chunks);
             println!("❌ Korrupta filer:     {}", report.corrupt_files);
             println!("📥 Totala bytes:       {}", report.total_bytes);
             println!("📤 Verifierade bytes:  {}", report.verified_bytes);
             println!("⚠️  Korrupta bytes:    {}", report.corrupt_bytes);
+
         }
 
         Commands::List { input } => {

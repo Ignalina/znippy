@@ -22,6 +22,12 @@ pub struct WriterStats {
     pub total_written_bytes:u64
 }
 
+#[derive(Debug)]
+pub struct ReaderStats {
+    pub total_files: usize,
+    pub skipped_files: usize,
+}
+
 
 #[derive(Debug)]
 pub struct FileMeta {
