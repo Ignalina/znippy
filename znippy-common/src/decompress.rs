@@ -58,7 +58,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
         .unzip();
 
 
-    let (done_tx, done_rx): (Sender<(u8, u64)>, Receiver<(u8, u64)>) = unbounded();
+    let (tx_return, rx_return): (Sender<(u8, u64)>, Receiver<(u8, u64)>) = unbounded();
 
     // chunk: skickar decompressor til writer
     let (chunk_tx, chunk_rx): (Sender<(ChunkMeta, Vec<u8>)>, Receiver<_>) = bounded(config.max_core_in_flight);
@@ -67,14 +67,14 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
     let out_dir = Arc::new(out_dir.to_path_buf());
     let report = VerifyReport::default();
 
-    let rx = chunk_rx.clone();
+    let chunk_rx_cloned = chunk_rx.clone();
     let out_dir_cloned = Arc::clone(&out_dir);
-    let done_tx_cloned = done_tx.clone();
 
 
     // READER
-    let done_rx = done_rx.clone();
      let reader_thread = {
+         let done_rx = rx_return.clone();
+
          let work_tx_array = work_tx_array.clone();
 
     thread::spawn(move || {
@@ -220,11 +220,11 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
     let mut decompressor_threads = Vec::with_capacity(config.max_core_in_compress as u8 as usize);
     let rx_array = work_rx_array.clone();
 
-    for decompressor_nr in 0..config.max_core_in_compress as u8 {
+    for decompressor_nr in 0..config.max_core_in_flight as u8 {
         let base_ptr: SendPtr = base_ptrs[decompressor_nr as usize];
         let rx = rx_array[decompressor_nr as usize].clone();
         let tx = chunk_tx.clone();
-        let done_tx = done_tx.clone(); // ✅ klona in
+        let done_tx = tx_return.clone(); // ✅ klona in
         let handle = thread::spawn(move || unsafe {
             let raw_ptr = base_ptr.as_ptr();
             let dctx = ZSTD_createDCtx();
@@ -233,47 +233,73 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
             }
 
 
-            while let Ok((chunk_meta,ring_nr, chunk_nr)) = rx.recv() {
-                log::debug!("[Decompressor {} ] got chunk_nr {}",decompressor_nr, chunk_nr);
+            loop {
+                match rx.recv() {
+                    Ok((chunk_meta, ring_nr, chunk_nr)) => {
+                        log::debug!("[Decompressor {}] got chunk_nr {}", decompressor_nr, chunk_nr);
 
-                let data = get_chunk_slice(
-                    raw_ptr,
-                    chunk_size,
-                    chunk_nr as u32,
-                    chunk_meta.compressed_size as usize,
-                );
+                        let data = get_chunk_slice(
+                            raw_ptr,
+                            chunk_size,
+                            chunk_nr,
+                            chunk_meta.compressed_size as usize,
+                        );
 
+                        let chunk_org_size = chunk_meta.uncompressed_size;
+                        let chunk_seq = chunk_meta.chunk_seq;
+                        let file_index = chunk_meta.file_index;
 
+                        // skydd mot panik
+                        let decompress_result = std::panic::catch_unwind(|| {
+                            if chunk_meta.compressed {
+                                decompress2_microchunk(&data)
+                            } else {
+                                Ok(data.to_vec())
+                            }
+                        });
 
-                let chunk_org_size=chunk_meta.uncompressed_size;
-                let chunk_seq = chunk_meta.chunk_seq;
-                let file_index = chunk_meta.file_index;
-                if(chunk_meta.compressed) {
-                    match decompress2_microchunk(&data) {
-                        Ok(decompressed) => {
-
-
-
-
-                            let mut hasher = Hasher::new();
-                            hasher.update(&decompressed);
-                            tx.send((chunk_meta, decompressed)).unwrap();
-                            done_tx.send((decompressor_nr as u8,chunk_nr as u64)).unwrap(); // ✅ viktigt
-                            log::debug!("Decompression successful chunkr {}  ",chunk_nr);
+                        match decompress_result {
+                            Ok(Ok(decompressed)) => {
+                                log::debug!(
+                        "Decompression successful chunk_nr {} ({} bytes)",
+                        chunk_nr, decompressed.len()
+                    );
+                                if let Err(e) = tx.send((chunk_meta, decompressed)) {
+                                    log::error!("[Decompressor {}] tx.send failed: {}", decompressor_nr, e);
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                log::error!(
+                        "Decompression failed: file_index {} chunk_nr {} uncompressed={} compressed={} chunk_seq={} error={}",
+                        file_index, chunk_nr, chunk_org_size, data.len(), chunk_seq, e
+                    );
+                            }
+                            Err(_) => {
+                                log::error!(
+                        "PANIC: decompress2_microchunk panicked! file_index {} chunk_nr {} chunk_seq={}",
+                        file_index, chunk_nr, chunk_seq
+                    );
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("Decompression failed: file_index {} chunk_nr {} chunk uncompressed size={} chunk compressed size={} chunk_seq {}  {}",file_index,chunk_nr,chunk_org_size,data.len(),chunk_seq, e);
-                            done_tx.send((decompressor_nr as u8,chunk_nr as u64)).unwrap(); // ✅ viktigt
+
+                        // ✅ Alltid returnera chunk – oavsett vad som gick fel
+                        if let Err(e) = done_tx.send((decompressor_nr, chunk_nr as u64)) {
+                            log::warn!(
+                    "[Decompressor {}] done_tx failed (chunk_nr {}): {}",
+                    decompressor_nr, chunk_nr, e
+                );
                         }
                     }
-                } else {
-                    log::debug!("Saving non compressed chunk with len: {}",data.len());
-                    tx.send((chunk_meta, data.to_vec())).unwrap();
-                    done_tx.send((decompressor_nr as u8, chunk_nr as u64)).unwrap(); // ✅ viktigt
-
+                    Err(_) => {
+                        log::debug!(
+                "[Decompressor {}] rx channel closed, exiting thread",
+                decompressor_nr
+            );
+                        break;
+                    }
                 }
-
             }
+
             drop(tx);
             drop(done_tx);
             drop(rx);
@@ -287,7 +313,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
 
     // [WRITER]
     let writer_thread=thread::spawn(move || {
-        while let Ok((chunk_meta, data)) = rx.recv() {
+        while let Ok((chunk_meta, data)) = chunk_rx_cloned.recv() {
 
 
 
@@ -324,7 +350,7 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
     work_tx_array.into_iter().for_each(drop);
     log::debug!("[reader] tx_chunk dropped after reader thread finished");
 
-    drop(done_tx);
+    drop(tx_return);
 
 
     for handle in  decompressor_threads  {
