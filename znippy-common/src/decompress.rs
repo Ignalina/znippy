@@ -320,6 +320,11 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
     let writer_thread=thread::spawn(move || -> WriterStats  {
         let mut total_chunks = 0u64;
         let mut total_written_bytes = 0u64;
+
+        let mut open_files: HashMap<u64, File> = HashMap::new();
+        let mut current_open = 0usize;
+        let mut peak_open = 0usize;
+
         while let Ok((chunk_meta, data)) = chunk_rx_cloned.recv() {
 
 
@@ -340,19 +345,43 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
             if let Some(parent) = full_path.parent() {
                 std::fs::create_dir_all(parent).unwrap();
             }
-            let mut f = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .open(&full_path)
-                .unwrap();
 
-            f.seek(SeekFrom::Start(chunk_meta.fdata_offset)).unwrap();
-            f.write_all(&data).unwrap();
+
+
+
+            let file = open_files.entry(chunk_meta.file_index).or_insert_with(|| {
+                let rel_path = col.value(chunk_meta.file_index as usize);
+                let full_path = out_dir_cloned.join(rel_path);
+
+                if let Some(parent) = full_path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+
+                let f = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .open(&full_path)
+                    .unwrap();
+
+                current_open += 1;
+                if current_open > peak_open {
+                    peak_open = current_open;
+                }
+
+                f
+            });
+
+            file.seek(SeekFrom::Start(chunk_meta.fdata_offset)).unwrap();
+            file.write_all(&data).unwrap();
 
             total_chunks += 1;
             total_written_bytes += data.len() as u64;
         }
 
+        for (_, file) in open_files {
+            drop(file);
+            current_open -= 1;
+        }
         WriterStats {
             total_chunks,
             total_written_bytes,
