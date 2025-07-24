@@ -14,6 +14,8 @@ pub use meta::{ChunkMeta,FileMeta};
 use serde::{Serialize, Deserialize};
 
 pub mod decompress;
+mod skip;
+
 pub use decompress::decompress_archive;
 
 
