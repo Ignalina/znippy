@@ -155,6 +155,9 @@ pub fn build_arrow_batch_from_files(files: &[FileMeta],input_dir: &Path,) -> arr
         .clone();
 
 
+
+
+
     let mut relative_path_builder = StringBuilder::new();
     let mut compressed_builder = BooleanBuilder::new();
     let mut uncompressed_size_builder = UInt64Builder::new();
@@ -185,10 +188,10 @@ pub fn build_arrow_batch_from_files(files: &[FileMeta],input_dir: &Path,) -> arr
 
 
         let full_path = Path::new(&file.relative_path);
-        let rel_path = match full_path.strip_prefix(input_dir) {
-            Ok(p) => p.to_string_lossy(),
-            Err(_) => file.relative_path.as_str().into(),
-        };
+        let rel_path = full_path
+            .strip_prefix(input_dir)
+            .expect("❌ build_arrow_batch_from_files: file path is not under input_dir")
+            .to_string_lossy();
 
         relative_path_builder.append_value(&rel_path);
 

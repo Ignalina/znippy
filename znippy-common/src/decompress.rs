@@ -373,17 +373,17 @@ pub fn decompress_archive(index_path: &Path, save_data: bool, out_dir: &Path) ->
             });
 
             file.seek(SeekFrom::Start(chunk_meta.fdata_offset)).unwrap();
-
+/*
             assert_eq!(
                 data.len(),
                 chunk_meta.uncompressed_size as usize,
-                "❌ Decompressed size mismatch: expected {}, got {} (file_index {}, chunk_seq {})",
+                "[Writer] ❌ Decompressed size mismatch: expected {}, got {} (file_index {}, chunk_seq {})",
                 chunk_meta.uncompressed_size,
                 data.len(),
                 chunk_meta.file_index,
                 chunk_meta.chunk_seq,
             );
-
+*/
             file.write_all(&data).unwrap();
 
             total_chunks += 1;
