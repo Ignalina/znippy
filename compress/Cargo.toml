@@ -1,6 +1,6 @@
 [package]
 name = "compress"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -8,13 +8,8 @@ walkdir = "2.5.0"
 blake3 = "1.8.2"
 anyhow = "1.0.98"
 zstd-sys = { path = "../zstd-sys-patched", version = "2.0.15" }
-bincode = { version = "2.0.1"  ,features = ["serde"] }
 crossbeam-channel = "0.5.15"
-sysinfo = { version = "0.35.2", features = ["multithread"] }
 arrow = "55.2.0"
 znippy-common = { path = "../znippy-common" }
-rayon = "1.10.0"
-num_cpus = "1.17.0"
-parking_lot = "0.12.4"
 log = "0.4.27"
 
