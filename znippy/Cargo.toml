@@ -3,12 +3,12 @@ name = "znippy"
 version = "0.2.0"
 edition = "2021"
 authors = ["Rickard Lundin <rickard@x14.se>"]
-description = "Znippy compression CLI (alias crate for znippy-cli)"
+description = "Znippy compresses files using Arrow IPC. Readable by DuckDB and Polars. May Allfather Odin watch over every bit."
 license = "MIT"
 repository = "https://github.com/Ignalina/znippy"
 readme = "../README.md"
 categories = ["command-line-utilities", "compression"]
-keywords = ["znippy", "zstd", "arrow", "blake3", "cli"]
+keywords = ["znippy", "zstd", "arrow", "blake3", "cli","arrow","duckdb","polars"]
 
 [dependencies]
 znippy-cli = "0.2.1"
