@@ -2,6 +2,14 @@
 name = "znippy-common"
 version = "0.2.0"
 edition = "2021"
+authors = ["Rickard Lundin <rickard@x14.se>"]
+description = "Core logic and data structures for Znippy, a parallel chunked compression system."
+license = "MIT"
+repository = "https://github.com/Ignalina/znippy"
+readme = "../README.md"
+categories = ["compression", "filesystem", "data-structures"]
+keywords = ["compression", "zstd", "parallel", "arrow", "blake3"]
+
 
 [dependencies]
 zstd-sys-rs = "1.5.10"

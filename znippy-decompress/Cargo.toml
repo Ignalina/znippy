@@ -4,6 +4,16 @@
 name = "znippy-decompress"
 version = "0.2.0"
 edition = "2021"
+authors = ["Rickard Lundin <rickard@x14>"]
+description = "decompress logic for Znippy, a parallel chunked compression system."
+license = "MIT"
+repository = "https://github.com/Ignalina/znippy"
+readme = "../README.md"
+categories = ["compression", "filesystem", "data-structures"]    
+keywords = ["compression", "zstd", "parallel", "arrow", "blake3"]
+
+
+
 
 [dependencies]
 zstd-sys-rs = { version="1.5.10"}
