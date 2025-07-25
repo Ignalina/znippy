@@ -2,7 +2,7 @@
 
 [package]
 name = "znippy-cli"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["Rickard Lundin <rickard@x14>"]
 description = "CLI for Znippy, a parallel chunked compression system."
