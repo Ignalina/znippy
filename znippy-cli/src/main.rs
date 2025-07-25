@@ -4,8 +4,8 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use anyhow::Result;
 
-use compress::compress_dir;
-use decompress::decompress_archive;
+use znippy_compress::compress_dir;
+use znippy_decompress::decompress_archive;
 use znippy_common::{verify_archive_integrity, list_archive_contents, VerifyReport};
 
 #[derive(Parser)]
