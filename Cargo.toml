@@ -4,11 +4,7 @@ members = [
     "compress",
     "decompress",
     "znippy-cli", "znippy-common",
-    "zstd-sys-patched"
 ]
 resolver = "2"
-
-[patch.crates-io]
-zstd-sys = { path = "zstd-sys-patched" }
 
 

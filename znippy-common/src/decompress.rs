@@ -1,10 +1,10 @@
 use std::ffi::CStr;
-use zstd_sys::*;
+use zstd_sys_rs::*;
 use anyhow::{anyhow};
 
 use std::ffi::c_void;
 use std::ptr;
-use zstd_sys::*;
+use zstd_sys_rs::*;
 
 use std::{
     collections::HashMap,
@@ -450,7 +450,7 @@ pub fn extract_file_checksums_from_metadata(schema: &SchemaRef) -> Result<Vec<[u
 
     Ok(checksums)
 }
-use zstd_sys::*;
+use zstd_sys_rs::*;
 use std::slice;
 use std::thread::JoinHandle;
 use log::debug;
