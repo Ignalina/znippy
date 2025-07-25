@@ -52,7 +52,7 @@ enum Commands {
     },
 }
 
-fn main() -> Result<()> {
+pub fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 

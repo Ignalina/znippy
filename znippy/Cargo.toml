@@ -1,0 +1,14 @@
+[package]
+name = "znippy"
+version = "0.2.0"
+edition = "2021"
+authors = ["Rickard Lundin <rickard@x14.se>"]
+description = "Znippy compression CLI (alias crate for znippy-cli)"
+license = "MIT"
+repository = "https://github.com/Ignalina/znippy"
+readme = "../README.md"
+categories = ["command-line-utilities", "compression"]
+keywords = ["znippy", "zstd", "arrow", "blake3", "cli"]
+
+[dependencies]
+znippy-cli = "0.2.1"
