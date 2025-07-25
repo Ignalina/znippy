@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 clap = { version = "4.5.41", features = ["derive"] }
 anyhow = "1.0.98"
-compress = { path = "../compress" }
-decompress = { path = "../decompress" }
-znippy-common = { path = "../znippy-common" }
+znippy-compress = "0.2.0"
+znippy-decompress = "0.2.0"
+znippy-common = "0.2."
 env_logger = "0.11.8"

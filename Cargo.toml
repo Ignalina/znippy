@@ -1,8 +1,8 @@
 # Root Cargo.toml
 [workspace]
 members = [
-    "compress",
-    "decompress",
+    "znippy-compress",
+    "znippy-decompress",
     "znippy-cli", "znippy-common",
 ]
 resolver = "2"

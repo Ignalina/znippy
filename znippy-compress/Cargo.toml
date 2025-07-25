@@ -1,5 +1,5 @@
 [package]
-name = "compress"
+name = "znippy-compress"
 version = "0.2.0"
 edition = "2021"
 
@@ -10,6 +10,6 @@ blake3 = "1.8.2"
 anyhow = "1.0.98"
 crossbeam-channel = "0.5.15"
 arrow = "55.2.0"
-znippy-common = { path = "../znippy-common" }
+znippy-common = "0.2.0"
 log = "0.4.27"
 
