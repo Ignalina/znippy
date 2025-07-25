@@ -1,7 +1,7 @@
 # decompress/Cargo.toml
 
 [package]
-name = "decompress"
+name = "znippy-decompress"
 version = "0.2.0"
 edition = "2021"
 
@@ -12,7 +12,7 @@ bincode = { version = "2.0.1"  ,features = ["serde"] }
 blake3 = "1.8.2"
 rayon = "1.10.0"
 walkdir = "2.5.0"
-znippy-common = { path = "../znippy-common" }
+znippy-common = "0.2.0"
 log = "0.4.27"
 parking_lot = "0.12.4"
 sysinfo = { version = "0.36.1", features = ["multithread"] }
