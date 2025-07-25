@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use zstd_sys::*;
+use zstd_sys_rs::*;
 use crate::packer::ZSTD_EndDirective::ZSTD_e_end;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -12,15 +12,15 @@ use std::thread;
 use arrow::array::Array;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use walkdir::WalkDir;
-use zstd_sys::*;
+use zstd_sys_rs::*;
 use blake3::Hasher; // Blake3 import
 use znippy_common::chunkrevolver::{ChunkRevolver, Chunk, SendPtr, get_chunk_slice};
 use znippy_common::common_config::CONFIG;
 use znippy_common::{attach_metadata, build_arrow_batch_from_files, split_into_microchunks, CompressionReport, FileMeta};
 use znippy_common::meta::{ChunkMeta, WriterStats};
 use znippy_common::index::{build_arrow_metadata_for_checksums_and_config, should_skip_compression};
-use zstd_sys::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
-use zstd_sys::ZSTD_ResetDirective::ZSTD_reset_session_only;
+use zstd_sys_rs::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
+use zstd_sys_rs::ZSTD_ResetDirective::ZSTD_reset_session_only;
 use arrow::ipc::writer::{FileWriter, IpcWriteOptions};
 use arrow::ipc::MetadataVersion;
 fn strip_prefix<'a>(base: &'a Path, full: &'a Path) -> PathBuf {
@@ -498,7 +498,7 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
 
 use std::ffi::CStr;
-use zstd_sys::*;
+use zstd_sys_rs::*;
 
 pub fn compress_microchunk(
     cctx: *mut ZSTD_CCtx,
@@ -545,7 +545,7 @@ pub fn compress_microchunk(
 }
 
 use std::slice;
-use zstd_sys::*;
+use zstd_sys_rs::*;
 use std::ptr;
 use znippy_common::decompress::decompress2_microchunk;
 
