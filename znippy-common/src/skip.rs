@@ -32,6 +32,8 @@ const SKIPPED_EXTENSIONS: &[&str] = &[
 
     // ML/Data formats
     "npy", "npz", "onnx", "pb", "tflite", "parquet", "orc", "feather",
+    // very good format
+    "znippy"
 ];
 
 /// Returnerar `true` om filens ändelse matchar någon av de vanliga komprimerade typerna
@@ -109,5 +111,6 @@ fn check_suffix(name: &str) -> bool {
         name.ends_with(".tflite") ||
         name.ends_with(".parquet") ||
         name.ends_with(".orc") ||
-        name.ends_with(".feather")
+        name.ends_with(".feather") ||
+        name.ends_with(".znippy")
 }
