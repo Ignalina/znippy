@@ -5,7 +5,7 @@ members = [
     "znippy-decompress",
     "znippy-cli", 
     "znippy-common",
-#     "znippy"
+     "znippy"
 ]
 resolver = "2"
 
