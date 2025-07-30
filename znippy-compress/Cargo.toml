@@ -20,6 +20,6 @@ blake3 = "1.8.2"
 anyhow = "1.0.98"
 crossbeam-channel = "0.5.15"
 arrow = "55.2.0"
-znippy-common = "0.2.3"
+znippy-common = "0.2.4"
 log = "0.4.27"
 
