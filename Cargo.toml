@@ -1,7 +1,7 @@
 # Root Cargo.toml
 [workspace]
 members = [
-#    "znippy-compress",
+    "znippy-compress",
 #    "znippy-decompress",
 #    "znippy-cli", 
     "znippy-common",
