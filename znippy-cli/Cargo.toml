@@ -2,7 +2,7 @@
 
 [package]
 name = "znippy-cli"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 authors = ["Rickard Lundin <rickard@x14>"]
 description = "CLI for Znippy, a parallel chunked compression system."
@@ -12,14 +12,10 @@ readme = "../README.md"
 categories = ["compression", "filesystem", "data-structures"]    
 keywords = ["compression", "zstd", "parallel", "arrow", "blake3"]
 
-
-
-
-
 [dependencies]
 clap = { version = "4.5.41", features = ["derive"] }
 anyhow = "1.0.98"
-znippy-compress = "0.2.0"
-znippy-decompress = "0.2.0"
-znippy-common = "0.2.0"
+znippy-compress = "0.2.4"
+znippy-decompress = "0.2.4"
+znippy-common = "0.2.3"
 env_logger = "0.11.8"

@@ -1,6 +1,6 @@
 [package]
 name = "znippy"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 authors = ["Rickard Lundin <rickard@x14.se>"]
 description = "Znippy compresses files using Arrow IPC. Readable by DuckDB,Polars,Datafusion. May Allfather Odin watch over every bit."
@@ -11,4 +11,4 @@ categories = ["command-line-utilities", "compression"]
 keywords = ["zstd", "arrow", "blake3", "cli","polars"]
 
 [dependencies]
-znippy-cli = "0.2.2"
+znippy-cli = "0.2.4"
