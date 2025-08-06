@@ -1,7 +1,7 @@
 
 ![znippy](https://github.com/user-attachments/assets/7db1c1c1-d577-4f87-bfe1-11af6e8c58a0)
 
-# Znippy
+# Znippy (Betha preview !!!!)
 Znippy archive format based on Zstandard and Apache Arrow . Built for speed, streaming, and random access, it was originally created for Artisan—the airgap-driven artifact toolbox—and now stands as a fast, interchangeable backend.  
 
 |                 | ⚡ Znippy                                                    | 🐢 tar + zstd                      |
