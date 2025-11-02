@@ -1,80 +1,100 @@
-use std::collections::HashMap;
-use zstd_sys_rs::*;
 use crate::packer::ZSTD_EndDirective::ZSTD_e_end;
 use anyhow::Result;
 use anyhow::anyhow;
+use arrow::array::Array;
+use arrow::ipc::MetadataVersion;
+use arrow::ipc::writer::{FileWriter, IpcWriteOptions};
+use blake3::Hasher; // Blake3 import
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::Shutdown::Write as OtherWrite;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use arrow::array::Array;
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use walkdir::WalkDir;
-use zstd_sys_rs::*;
-use blake3::Hasher; // Blake3 import
-use znippy_common::chunkrevolver::{ChunkRevolver, Chunk, SendPtr, get_chunk_slice};
+use znippy_common::chunkrevolver::{Chunk, ChunkRevolver, SendPtr, get_chunk_slice};
 use znippy_common::common_config::CONFIG;
-use znippy_common::{attach_metadata, build_arrow_batch_from_files, split_into_microchunks, CompressionReport, FileMeta};
+use znippy_common::index::{
+    build_arrow_metadata_for_checksums_and_config, should_skip_compression,
+};
 use znippy_common::meta::{ChunkMeta, WriterStats};
-use znippy_common::index::{build_arrow_metadata_for_checksums_and_config, should_skip_compression};
-use zstd_sys_rs::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
+use znippy_common::{
+    CompressionReport, FileMeta, attach_metadata, build_arrow_batch_from_files,
+    split_into_microchunks,
+};
 use zstd_sys_rs::ZSTD_ResetDirective::ZSTD_reset_session_only;
-use arrow::ipc::writer::{FileWriter, IpcWriteOptions};
-use arrow::ipc::MetadataVersion;
+use zstd_sys_rs::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
+use zstd_sys_rs::*;
+use zstd_sys_rs::*;
 fn strip_prefix<'a>(base: &'a Path, full: &'a Path) -> PathBuf {
     full.strip_prefix(base).unwrap_or(full).to_path_buf()
 }
-pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> anyhow::Result<CompressionReport> {
+pub fn compress_dir(
+    input_dir: &PathBuf,
+    output: &PathBuf,
+    no_skip: bool,
+) -> anyhow::Result<CompressionReport> {
     log::debug!("Reading directory: {:?}", input_dir);
     let mut total_dirs = 0;
-    let mut filesTOSkip=0;
-    let mut filesTOCompress=0;
-
+    let mut filesTOSkip = 0;
+    let mut filesTOCompress = 0;
 
     let all_files: Arc<Vec<PathBuf>> = Arc::new(
-
-    WalkDir::new(input_dir)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter_map(|e| {
-            if e.file_type().is_dir() {
-                total_dirs += 1;
-                None
-            } else if e.file_type().is_file() {
-                let skip = !no_skip && should_skip_compression(e.path());
-                if(skip) {
-                    filesTOSkip=filesTOSkip+1;
+        WalkDir::new(input_dir)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|e| {
+                if e.file_type().is_dir() {
+                    total_dirs += 1;
+                    None
+                } else if e.file_type().is_file() {
+                    let skip = !no_skip && should_skip_compression(e.path());
+                    if (skip) {
+                        filesTOSkip = filesTOSkip + 1;
+                    } else {
+                        filesTOCompress = filesTOCompress + 1;
+                    }
+                    Some(e.into_path())
                 } else {
-                    filesTOCompress=filesTOCompress+1;
+                    None
                 }
-                Some(e.into_path())
-            } else {
-                None
-            }
-        })
-        .collect());
-    log::debug!("Found {} files include in {} directories. to compressed {} will skip {}", all_files.len(), total_dirs,filesTOCompress,filesTOSkip);
+            })
+            .collect(),
+    );
+    log::debug!(
+        "Found {} files include in {} directories. to compressed {} will skip {}",
+        all_files.len(),
+        total_dirs,
+        filesTOCompress,
+        filesTOSkip
+    );
 
-    let total_files:u64 = all_files.len() as u64;
-
+    let total_files: u64 = all_files.len() as u64;
 
     let (tx_chunk_array, rx_chunk_array): (
         Vec<Sender<(u64, u64, u8, u64, u64, bool)>>,
-        Vec<Receiver<(u64, u64, u8, u64, u64, bool)>>
+        Vec<Receiver<(u64, u64, u8, u64, u64, bool)>>,
     ) = (0..CONFIG.max_core_in_flight)
         .map(|_| bounded(CONFIG.max_chunks as usize))
         .unzip();
 
-
-    let (tx_compressed, rx_compressed): (Sender<(Arc<[u8]>,ChunkMeta)>, Receiver<(Arc<[u8]>,ChunkMeta)>) = unbounded();
-    let (tx_return, rx_return): (Sender<(u8,u64)>, Receiver<(u8,u64)>) = unbounded();
+    let (tx_compressed, rx_compressed): (
+        Sender<(Arc<[u8]>, ChunkMeta)>,
+        Receiver<(Arc<[u8]>, ChunkMeta)>,
+    ) = unbounded();
+    let (tx_return, rx_return): (Sender<(u8, u64)>, Receiver<(u8, u64)>) = unbounded();
 
     let output_zdata_path = output.with_extension("zdata");
     log::debug!("Creating zdata file at: {:?}", output_zdata_path);
-    let zdata_file = OpenOptions::new().create(true).write(true).truncate(true).open(&output_zdata_path)?;
-    let mut writer = BufWriter::with_capacity((CONFIG.file_split_block_size / 2) as usize, zdata_file);
+    let zdata_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&output_zdata_path)?;
+    let mut writer =
+        BufWriter::with_capacity((CONFIG.file_split_block_size / 2) as usize, zdata_file);
 
     let mut revolver = ChunkRevolver::new(&CONFIG);
     let base_ptrs = revolver.base_ptrs();
@@ -91,19 +111,17 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
         let rx_done = rx_return.clone();
         thread::spawn(move || {
             let mut inflight_chunks = 0usize;
-            let mut uncompressed_files:u64 = 0;
-            let mut uncompressed_bytes:u64 = 0;
-            let mut compressed_files:u64=0;
-            let mut compressed_bytes:u64=0;
-
-
+            let mut uncompressed_files: u64 = 0;
+            let mut uncompressed_bytes: u64 = 0;
+            let mut compressed_files: u64 = 0;
+            let mut compressed_bytes: u64 = 0;
 
             for (file_index, path) in all_files_for_reader.iter().enumerate() {
-//                log::debug!("[reader] Handling file index {}: {:?}", file_index, path);
+                //                log::debug!("[reader] Handling file index {}: {:?}", file_index, path);
 
                 let skip = !no_skip && should_skip_compression(path);
                 if skip {
-//                    log::debug!("[reader] Skipping compression for file {}", path.display());
+                    //                    log::debug!("[reader] Skipping compression for file {}", path.display());
                     uncompressed_files += 1; // Increment uncompressed files count
                     uncompressed_bytes += path.metadata().unwrap().len(); // Add to uncompressed bytes
                 } else {
@@ -119,20 +137,25 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                 };
                 let mut reader = BufReader::new(file);
                 let mut has_read_any_data = false;
-                let mut fdata_offset:u64=0;
+                let mut fdata_offset: u64 = 0;
                 loop {
                     let maybe_chunk = revolver.try_get_chunk();
                     match maybe_chunk {
                         Some(mut chunk) => {
-
-                            let ring_nr=chunk.ring_nr as usize;
+                            let ring_nr = chunk.ring_nr as usize;
                             match reader.read(&mut *chunk) {
                                 Ok(0) => {
                                     if !has_read_any_data {
-
-
-
-                                        tx_chunk_array[ring_nr].send((file_index as u64, fdata_offset, chunk.ring_nr,chunk.index, 0, skip)).unwrap();
+                                        tx_chunk_array[ring_nr]
+                                            .send((
+                                                file_index as u64,
+                                                fdata_offset,
+                                                chunk.ring_nr,
+                                                chunk.index,
+                                                0,
+                                                skip,
+                                            ))
+                                            .unwrap();
                                         inflight_chunks += 1;
                                     } else {
                                         let ring_nr = chunk.ring_nr;
@@ -143,16 +166,26 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                     break;
                                 }
                                 Ok(bytes_read) => {
-
-
-
                                     has_read_any_data = true;
-                                    tx_chunk_array[ring_nr].send((file_index as u64, fdata_offset, chunk.ring_nr,chunk.index, bytes_read as u64, skip)).unwrap();
+                                    tx_chunk_array[ring_nr]
+                                        .send((
+                                            file_index as u64,
+                                            fdata_offset,
+                                            chunk.ring_nr,
+                                            chunk.index,
+                                            bytes_read as u64,
+                                            skip,
+                                        ))
+                                        .unwrap();
                                     inflight_chunks += 1;
                                     fdata_offset += bytes_read as u64;
                                 }
                                 Err(e) => {
-                                    log::warn!("[reader] Error reading file {}: {}", path.display(), e);
+                                    log::warn!(
+                                        "[reader] Error reading file {}: {}",
+                                        path.display(),
+                                        e
+                                    );
                                     let ring_nr = chunk.ring_nr;
                                     let index = chunk.index;
                                     drop(chunk);
@@ -162,14 +195,16 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                             }
                         }
                         None => {
-                            let (ring_nr, returned) = rx_done.recv().expect("rx_done channel closed unexpectedly");
+                            let (ring_nr, returned) =
+                                rx_done.recv().expect("rx_done channel closed unexpectedly");
                             revolver.return_chunk(ring_nr, returned);
-                            inflight_chunks = inflight_chunks.checked_sub(1).expect("inflight_chunks underflow");
+                            inflight_chunks = inflight_chunks
+                                .checked_sub(1)
+                                .expect("inflight_chunks underflow");
                             continue;
                         }
                     }
                 }
-
             }
             // Reader thread cleanup
             log::debug!("[reader] Thread done about to drain compressor returning chunks ");
@@ -177,8 +212,11 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
             // Wait for all inflight chunks to return before finishing
             while inflight_chunks > 0 {
                 match rx_done.recv() {
-                    Ok((ring_nr,returned)) => {
-                        log::debug!("[reader] Returned chunk {} to pool during draining", returned);
+                    Ok((ring_nr, returned)) => {
+                        log::debug!(
+                            "[reader] Returned chunk {} to pool during draining",
+                            returned
+                        );
                         revolver.return_chunk(ring_nr, returned);
                         inflight_chunks -= 1;
                     }
@@ -195,19 +233,24 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
             log::debug!("[reader] tx_chunk dropped after finishing all chunk sends");
 
             // Drop other resources after processing is complete
-            drop(rx_done);  // Drop rx_done after we're done draining inflight chunks
+            drop(rx_done); // Drop rx_done after we're done draining inflight chunks
             log::debug!("[reader] rx_done dropped after processing all chunks");
 
-            drop(revolver);    // Drop revolver if needed (Rust will also drop it when the thread finishes)
+            drop(revolver); // Drop revolver if needed (Rust will also drop it when the thread finishes)
 
             // Return the statistics to the main thread
-            (uncompressed_files, uncompressed_bytes,compressed_files,compressed_bytes)})
+            (
+                uncompressed_files,
+                uncompressed_bytes,
+                compressed_files,
+                compressed_bytes,
+            )
+        })
     };
 
     // Compressor Threads pool
     // chunk_nr is index in the shared chunk array
     // chunk_index is a sequence within the file.
-
 
     let mut compressor_threads = Vec::with_capacity(CONFIG.max_core_in_flight as u8 as usize);
     for compressor_group in 0..CONFIG.max_core_in_flight as u8 {
@@ -224,20 +267,34 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
             let mut local_chunkmeta: Vec<ChunkMeta> = Vec::new();
             let mut hasher = Hasher::new(); // Blake3 hash initialization
-            let mut chunk_seq:u32=0;
+            let mut chunk_seq: u32 = 0;
             unsafe {
                 let cctx = ZSTD_createCCtx();
                 assert!(!cctx.is_null(), "ZSTD_createCCtx failed");
 
                 ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, CONFIG.compression_level);
                 ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, CONFIG.max_core_in_compress as i32);
-                log::info!("[compressor] Compressor thread started with level {} and {} workers", CONFIG.compression_level, CONFIG.max_core_in_compress);
+                log::info!(
+                    "[compressor] Compressor thread started with level {} and {} workers",
+                    CONFIG.compression_level,
+                    CONFIG.max_core_in_compress
+                );
 
                 loop {
                     match rx_chunk.recv() {
-                        Ok((file_index, mut fdata_offset, ring_nr,chunk_nr, length, skip)) => {
-                            log::debug!("[compressor] Processing chunk {} from file {}: {} bytes", chunk_nr, file_index, length);
-                            let input = get_chunk_slice(raw_ptr, chunk_size, chunk_nr as u32, length as usize);
+                        Ok((file_index, mut fdata_offset, ring_nr, chunk_nr, length, skip)) => {
+                            log::debug!(
+                                "[compressor] Processing chunk {} from file {}: {} bytes",
+                                chunk_nr,
+                                file_index,
+                                length
+                            );
+                            let input = get_chunk_slice(
+                                raw_ptr,
+                                chunk_size,
+                                chunk_nr as u32,
+                                length as usize,
+                            );
                             let chunk_meta;
                             let output: Arc<[u8]>;
 
@@ -245,7 +302,11 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                             hasher.update(&input);
 
                             if skip {
-                                log::debug!("[compressor] Skipping compression for chunk {} of file {}", chunk_nr, file_index);
+                                log::debug!(
+                                    "[compressor] Skipping compression for chunk {} of file {}",
+                                    chunk_nr,
+                                    file_index
+                                );
                                 output = Arc::from(input);
 
                                 chunk_meta = ChunkMeta {
@@ -259,19 +320,19 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                     uncompressed_size: input.len() as u64,
                                 };
 
-                            //    log::debug!("[compressor] Sending chunk uncompressed chunk nr {} of file {} to writer", chunk_nr, file_index);
+                                //    log::debug!("[compressor] Sending chunk uncompressed chunk nr {} of file {} to writer", chunk_nr, file_index);
                                 tx_compressed.send((output, chunk_meta)).unwrap();
                                 chunk_seq += 1;
-                                fdata_offset +=input.len() as u64;
+                                fdata_offset += input.len() as u64;
                             } else {
-                                let micro_chunks=split_into_microchunks(input,CONFIG.zstd_output_buffer_size);
+                                let micro_chunks =
+                                    split_into_microchunks(input, CONFIG.zstd_output_buffer_size);
 
-                                for (micro_nr, micro) in micro_chunks.iter().enumerate()  {
-
+                                for (micro_nr, micro) in micro_chunks.iter().enumerate() {
                                     let compressed_vec = compress2_microchunk(cctx, micro)?;
 
-
-                                    let compressed_chunk: Arc<[u8]> = Arc::from(compressed_vec.into_boxed_slice());
+                                    let compressed_chunk: Arc<[u8]> =
+                                        Arc::from(compressed_vec.into_boxed_slice());
                                     let chunk_meta = ChunkMeta {
                                         zdata_offset: 0, // to be set by writer
                                         fdata_offset,
@@ -282,16 +343,25 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                                         compressed: true,
                                         uncompressed_size: micro.len() as u64,
                                     };
-                                    fdata_offset+=micro.len() as u64;
-                                    log::debug!("[compressor {}] did File_index {} chunk nr {} size {} micro nr {} chunk size {} out {} zdata_offset = {}",compressor_group,file_index, chunk_nr,length,micro_nr,micro.len(),chunk_meta.compressed_size,chunk_meta.zdata_offset);
+                                    fdata_offset += micro.len() as u64;
+                                    log::debug!(
+                                        "[compressor {}] did File_index {} chunk nr {} size {} micro nr {} chunk size {} out {} zdata_offset = {}",
+                                        compressor_group,
+                                        file_index,
+                                        chunk_nr,
+                                        length,
+                                        micro_nr,
+                                        micro.len(),
+                                        chunk_meta.compressed_size,
+                                        chunk_meta.zdata_offset
+                                    );
 
                                     tx_compressed.send((compressed_chunk, chunk_meta))?;
                                     chunk_seq += 1;
                                 }
                             }
-                      //      log::debug!("[compressor] Sending ACK on chunk_nr done  chunknr {} of file {} to reader", chunk_nr, file_index);
+                            //      log::debug!("[compressor] Sending ACK on chunk_nr done  chunknr {} of file {} to reader", chunk_nr, file_index);
                             tx_ret.send((ring_nr, chunk_nr));
-
                         }
                         Err(_) => {
                             // Channel is closed, gracefully exit the loop
@@ -299,8 +369,6 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                             break;
                         }
                     }
-
-
                 }
 
                 ZSTD_freeCCtx(cctx);
@@ -313,11 +381,10 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                 drop(rx_chunk);
 
                 log::debug!("[compressor] Compressor thread finished processing.");
-
             }
-            log::info!("📦 Compressor thread/group {} returning ",compressor_group);
+            log::info!("📦 Compressor thread/group {} returning ", compressor_group);
 
-            Ok(( compressor_group,*hasher.finalize().as_bytes()))
+            Ok((compressor_group, *hasher.finalize().as_bytes()))
         });
         compressor_threads.push(handle);
     }
@@ -325,8 +392,6 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
     // Writer thread
     let output = output.clone(); // klona innan writer_thread
     let writer_thread = thread::spawn(move || {
-
-
         let mut file_metadata: Vec<FileMeta> = Vec::with_capacity(all_files_for_writer.len());
 
         file_metadata = all_files_for_writer
@@ -339,20 +404,22 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
             })
             .collect();
 
-        let mut writerstats=WriterStats {
+        let mut writerstats = WriterStats {
             total_chunks: 0,
             total_written_bytes: 0,
         };
-        let mut zdata_offset:u64=0;
+        let mut zdata_offset: u64 = 0;
 
-        let mut zero_fdata_per_file: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
-        while let Ok((compressed_data,mut chunk_meta)) = rx_compressed.recv() {
-//            log::debug!("[writer] Received compressed block from file with index {}:  length {} start write at offset {}", chunk_meta.file_index, compressed_data.len(),zdata_offset);
-
+        let mut zero_fdata_per_file: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::new();
+        while let Ok((compressed_data, mut chunk_meta)) = rx_compressed.recv() {
+            //            log::debug!("[writer] Received compressed block from file with index {}:  length {} start write at offset {}", chunk_meta.file_index, compressed_data.len(),zdata_offset);
 
             // Inuti loopen, direkt efter while-raden:
             if chunk_meta.fdata_offset == 0 {
-                let count = zero_fdata_per_file.entry(chunk_meta.file_index).or_default();
+                let count = zero_fdata_per_file
+                    .entry(chunk_meta.file_index)
+                    .or_default();
                 *count += 1;
                 if *count > 1 {
                     panic!(
@@ -361,7 +428,6 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
                     );
                 }
             }
-
 
             let idx = chunk_meta.file_index as usize;
 
@@ -376,27 +442,28 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
             );
 
             if idx >= file_metadata.len() {
-                log::error!("[writer] Invalid file_index {}: file_metadata.len() = {}", idx, file_metadata.len());
+                log::error!(
+                    "[writer] Invalid file_index {}: file_metadata.len() = {}",
+                    idx,
+                    file_metadata.len()
+                );
                 continue;
             }
 
             let file = &mut file_metadata[idx];
             let path = &all_files_for_writer[idx];
-            let uncompressed_size=chunk_meta.uncompressed_size;
+            let uncompressed_size = chunk_meta.uncompressed_size;
 
             file.relative_path = path.to_string_lossy().to_string();
             file.compressed = chunk_meta.compressed;
             file.uncompressed_size += uncompressed_size;
             // Always push the chunk metadata
-            chunk_meta.zdata_offset=zdata_offset;
-
+            chunk_meta.zdata_offset = zdata_offset;
 
             if let Err(e) = writer.write_all(&compressed_data) {
                 log::error!("[writer] Write error: {}", e);
                 continue;
             }
-
-
 
             let chunk_seq = chunk_meta.chunk_seq;
             let file_index = chunk_meta.file_index;
@@ -404,49 +471,46 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
             file.chunks.push(chunk_meta); // move happens here
 
-
-
-
             zdata_offset += compressed_data.len() as u64;
             writerstats.total_chunks += 1;
             writerstats.total_written_bytes += compressed_data.len() as u64; // Update the total output bytes
-
         }
 
-        log::info!("[writer] Done {} chunks , total written {} bytes)", writerstats.total_chunks,  writerstats.total_written_bytes);
+        log::info!(
+            "[writer] Done {} chunks , total written {} bytes)",
+            writerstats.total_chunks,
+            writerstats.total_written_bytes
+        );
 
-        let batch = build_arrow_batch_from_files(&file_metadata,&input_dir_cloned);
-        (writerstats,batch)
+        let batch = build_arrow_batch_from_files(&file_metadata, &input_dir_cloned);
+        (writerstats, batch)
     });
 
-
     // Wait for reader thread to finish
-    let (uncompressed_files, uncompressed_bytes,compressed_files,compressed_bytes) = reader_thread.join().unwrap();
+    let (uncompressed_files, uncompressed_bytes, compressed_files, compressed_bytes) =
+        reader_thread.join().unwrap();
     log::debug!("[reader] reader_thread joined");
 
     // Drop the sender-side channels after the reader and compressor threads finish
     tx_chunk_array.into_iter().for_each(drop);
     log::debug!("[reader] tx_chunk dropped after reader thread finished");
 
+    let mut checksums: Vec<[u8; 32]> = Vec::with_capacity(CONFIG.max_core_in_compress as usize);
 
-
-
-    let mut checksums: Vec<[u8;32]>  = Vec::with_capacity(CONFIG.max_core_in_compress as usize);
-
-    let mut  i=0;
+    let mut i = 0;
     for handle in compressor_threads {
-        let Ok((compressor_group, checksum)): Result<(u8, [u8; 32]), anyhow::Error> = handle.join().unwrap() else {
+        let Ok((compressor_group, checksum)): Result<(u8, [u8; 32]), anyhow::Error> =
+            handle.join().unwrap()
+        else {
             return Err(anyhow!("Compressor thread returned error"));
         };
-        checksums.insert(compressor_group as usize,checksum);
+        checksums.insert(compressor_group as usize, checksum);
     }
 
-
-
-
-
-    log::info!("📦 Compressor threads returning blake3 checksums from {} compressor threads", checksums.len());
-
+    log::info!(
+        "📦 Compressor threads returning blake3 checksums from {} compressor threads",
+        checksums.len()
+    );
 
     // After compressor threads are done, drop tx_compressed
     drop(tx_compressed);
@@ -475,19 +539,20 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
     log::info!("[main] Arrow index written and finished.");
 
-
     let report = CompressionReport {
         total_files,
-        compressed_files ,
+        compressed_files,
         uncompressed_files,
         chunks: writerstats.total_chunks,
         total_dirs,
-        total_bytes_in : compressed_bytes+uncompressed_bytes,
+        total_bytes_in: compressed_bytes + uncompressed_bytes,
         total_bytes_out: writerstats.total_written_bytes,
         compressed_bytes,
         uncompressed_bytes,
         compression_ratio: if uncompressed_bytes > 0 {
-            (compressed_bytes as f32 / (writerstats.total_written_bytes-uncompressed_bytes)  as f32) * 100.0
+            (compressed_bytes as f32
+                / (writerstats.total_written_bytes - uncompressed_bytes) as f32)
+                * 100.0
         } else {
             0.0
         },
@@ -495,7 +560,6 @@ pub fn compress_dir(input_dir: &PathBuf, output: &PathBuf, no_skip: bool) -> any
 
     Ok(report)
 }
-
 
 use std::ffi::CStr;
 use zstd_sys_rs::*;
@@ -521,7 +585,12 @@ pub fn compress_microchunk(
         };
 
         let code = unsafe {
-            ZSTD_compressStream2(cctx, &mut out_buf, &mut in_buf, ZSTD_EndDirective::ZSTD_e_end)
+            ZSTD_compressStream2(
+                cctx,
+                &mut out_buf,
+                &mut in_buf,
+                ZSTD_EndDirective::ZSTD_e_end,
+            )
         };
 
         if unsafe { ZSTD_isError(code) } != 0 {
@@ -544,10 +613,10 @@ pub fn compress_microchunk(
     Ok(full_output)
 }
 
-use std::slice;
-use zstd_sys_rs::*;
 use std::ptr;
+use std::slice;
 use znippy_common::decompress::decompress2_microchunk;
+use zstd_sys_rs::*;
 
 unsafe fn test_decompress_chunk(data: &[u8]) -> Result<usize> {
     let ctx = unsafe { ZSTD_createDCtx() };
@@ -581,13 +650,9 @@ unsafe fn test_decompress_chunk(data: &[u8]) -> Result<usize> {
     Ok(output.pos)
 }
 
-
 /// Compresses a microchunk using `ZSTD_compress2` (non-streaming API).
 /// Returns a standalone frame that is self-decompressible.
-pub fn compress2_microchunk(
-    cctx: *mut ZSTD_CCtx,
-    input: &[u8],
-) -> Result<Vec<u8>> {
+pub fn compress2_microchunk(cctx: *mut ZSTD_CCtx, input: &[u8]) -> Result<Vec<u8>> {
     unsafe {
         let bound = ZSTD_compressBound(input.len());
         let mut output = vec![0u8; bound];
@@ -602,10 +667,7 @@ pub fn compress2_microchunk(
 
         if ZSTD_isError(compressed_size) != 0 {
             let msg = CStr::from_ptr(ZSTD_getErrorName(compressed_size));
-            return Err(anyhow!(
-                "ZSTD_compress2 failed: {}",
-                msg.to_string_lossy()
-            ));
+            return Err(anyhow!("ZSTD_compress2 failed: {}", msg.to_string_lossy()));
         }
 
         output.truncate(compressed_size);

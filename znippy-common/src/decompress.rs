@@ -10,28 +10,30 @@ use zstd_sys_rs::*;
 use anyhow::{Context, Result};
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::RecordBatch;
-use arrow_array::{Array, BinaryArray, BooleanArray, Datum, GenericListArray, ListArray, StringArray, StructArray, UInt32Array, UInt64Array, UInt8Array};
-use std::any::{type_name, Any};
+use arrow_array::{
+    Array, BinaryArray, BooleanArray, Datum, GenericListArray, ListArray, StringArray, StructArray,
+    UInt8Array, UInt32Array, UInt64Array,
+};
+use std::any::{Any, type_name};
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write,sink},
+    io::{Read, Seek, SeekFrom, Write, sink},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
 };
 
 use crate::{
-    common_config::CONFIG, extract_config_from_arrow_metadata, index::read_znippy_index,
-    index::VerifyReport, ChunkMeta, ChunkRevolver,
+    ChunkMeta, ChunkRevolver, common_config::CONFIG, extract_config_from_arrow_metadata,
+    index::VerifyReport, index::read_znippy_index,
 };
 use blake3::Hasher;
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use hex::FromHex;
 
-use crate::chunkrevolver::{get_chunk_slice, Chunk, SendPtr};
+use crate::chunkrevolver::{Chunk, SendPtr, get_chunk_slice};
 use arrow_array::ArrayRef;
-
 
 pub fn decompress_archive(
     index_path: &Path,
@@ -196,7 +198,11 @@ pub fn decompress_archive(
                                     let (thread_nr, returned) = done_rx
                                         .recv()
                                         .expect("rx_done channel closed unexpectedly");
-                                    log::debug!("[reader] Blocking wait — returned chunk {} from thread nr {} to pool", returned,thread_nr);
+                                    log::debug!(
+                                        "[reader] Blocking wait — returned chunk {} from thread nr {} to pool",
+                                        returned,
+                                        thread_nr
+                                    );
                                     revolver.return_chunk(thread_nr, returned);
                                     inflight_chunks = inflight_chunks
                                         .checked_sub(1)
@@ -343,15 +349,22 @@ pub fn decompress_archive(
                             }
                             Ok(Err(e)) => {
                                 log::error!(
-                        "Decompression failed: file_index {} chunk_nr {} uncompressed={} compressed={} chunk_seq={} error={}",
-                        file_index, chunk_nr, chunk_org_size, data.len(), chunk_seq, e
-                    );
+                                    "Decompression failed: file_index {} chunk_nr {} uncompressed={} compressed={} chunk_seq={} error={}",
+                                    file_index,
+                                    chunk_nr,
+                                    chunk_org_size,
+                                    data.len(),
+                                    chunk_seq,
+                                    e
+                                );
                             }
                             Err(_) => {
                                 log::error!(
-                        "PANIC: decompress2_microchunk panicked! file_index {} chunk_nr {} chunk_seq={}",
-                        file_index, chunk_nr, chunk_seq
-                    );
+                                    "PANIC: decompress2_microchunk panicked! file_index {} chunk_nr {} chunk_seq={}",
+                                    file_index,
+                                    chunk_nr,
+                                    chunk_seq
+                                );
                             }
                         }
 
@@ -391,7 +404,6 @@ pub fn decompress_archive(
     // [WRITER]
 
     let writer_thread = thread::spawn(move || -> WriterStats {
-
         let mut total_chunks = 0u64;
         let chunks_array = batch_cloned_for_writer
             .column_by_name("chunks")
@@ -412,7 +424,6 @@ pub fn decompress_archive(
         let mut current_open = 0usize;
         let mut peak_open = 0usize;
         let mut created_dirs: HashSet<PathBuf> = HashSet::new();
-
         while let Ok((chunk_meta, data)) = chunk_rx_cloned.recv() {
             let col = batch_cloned_for_writer
                 .column_by_name("relative_path")
@@ -454,6 +465,21 @@ pub fn decompress_archive(
 
             total_chunks += 1;
             total_written_bytes += data.len() as u64;
+
+
+            // increment chunks_written AFTER writing
+            let written = chunks_written.entry(chunk_meta.file_index as usize).or_default();
+            *written += 1;
+
+            // close immediately if last chunk
+            if let Some(&chunk_goal) = expected_chunks.get(&(chunk_meta.file_index as usize)) {
+                if *written == chunk_goal {
+                    if let Some(file) = open_files.remove(&(chunk_meta.file_index as usize)) {
+                        drop(file);
+                        current_open -= 1;
+                    }
+                }
+            }
         }
 
         for (_, file) in open_files {
@@ -518,10 +544,10 @@ pub fn extract_file_checksums_from_metadata(schema: &SchemaRef) -> Result<Vec<[u
 }
 use crate::common_config::StrategicConfig;
 use crate::meta::{ReaderStats, WriterStats};
+use arrow_array::types::Int32Type;
 use log::debug;
 use std::slice;
 use std::thread::JoinHandle;
-use arrow_array::types::Int32Type;
 use zstd_sys_rs::*;
 
 /// Decompress a complete microchunk into the provided `dst` buffer.
@@ -615,7 +641,9 @@ pub fn decompress_chunk_stream2(input: &[u8]) -> Result<Vec<u8>> {
 
             if input_buffer.pos == input_buffer.size && output_buffer.pos == 0 {
                 ZSTD_freeDCtx(dctx);
-                return Err(anyhow!("ZSTD_decompressStream flush error: Operation made no progress over multiple calls, due to input being empty"));
+                return Err(anyhow!(
+                    "ZSTD_decompressStream flush error: Operation made no progress over multiple calls, due to input being empty"
+                ));
             }
 
             if output_buffer.pos > 0 {
@@ -753,13 +781,9 @@ pub fn decompress2_microchunk(input: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+use std::collections::HashSet;
 
-use std::collections::{HashSet};
-
-
-
-
-use std::io::{ Result as IoResult};
+use std::io::Result as IoResult;
 
 pub trait WriteSeek: Write + Seek + Send {}
 impl<T: Write + Seek + Send> WriteSeek for T {}
@@ -787,6 +811,7 @@ impl Seek for DevNullSeek {
 
 unsafe impl Send for DevNullSeek {}
 
+
 #[allow(clippy::too_many_arguments)]
 fn get_output_writer(
     open_files: &mut HashMap<usize, File>,
@@ -801,8 +826,9 @@ fn get_output_writer(
     save_data: bool,
 ) -> Box<dyn WriteSeek> {
     let chunk_goal = chunks_array.value_length(file_index);
-    expected_chunks.entry(file_index).or_insert(chunk_goal as usize);
-    chunks_written.entry(file_index).or_insert(0);
+    expected_chunks
+        .entry(file_index)
+        .or_insert(chunk_goal as usize);
 
     if let Some(parent) = full_path.parent() {
         if created_dirs.insert(parent.to_path_buf()) {
@@ -811,7 +837,6 @@ fn get_output_writer(
     }
 
     // Öppna fil eller "open dev null" - räkna alltid upp current_open och peak_open
-    if save_data {
         if !open_files.contains_key(&file_index) {
             let file = OpenOptions::new()
                 .create(true)
@@ -819,37 +844,33 @@ fn get_output_writer(
                 .truncate(true)
                 .open(full_path)
                 .expect("Failed to open file for writing");
-
-            *current_open += 1;
-            *peak_open = (*peak_open).max(*current_open);
             open_files.insert(file_index, file);
         }
-    } else {
-        // För dev/null fallback räknar vi också upp current_open
-        *current_open += 1;
-        *peak_open = (*peak_open).max(*current_open);
-    }
 
+   *current_open += 1;
+   *peak_open = (*peak_open).max(*current_open);
+
+
+    let file = open_files.get_mut(&file_index).unwrap();
+    Box::new(file.try_clone().expect("Failed to clone file"))
+
+}
+
+fn maybe_close_file(
+    open_files: &mut HashMap<usize, File>,
+    file_index: usize,
+    chunks_written: &mut HashMap<usize, usize>,
+    chunks_array: &ListArray,
+    current_open: &mut usize,
+) {
+    let chunk_goal = chunks_array.value_length(file_index) as usize;
     let written = chunks_written.entry(file_index).or_default();
     *written += 1;
 
-    if *written == chunk_goal as usize {
-        // Stäng fil eller minska current_open oavsett save_data
-        if save_data {
-            if let Some(file) = open_files.remove(&file_index) {
-                drop(file);
-                *current_open -= 1;
-            }
-        } else {
+    if *written == chunk_goal {
+        if let Some(file) = open_files.remove(&file_index) {
+            drop(file);
             *current_open -= 1;
         }
     }
-
-    if save_data {
-        if let Some(file) = open_files.get_mut(&file_index) {
-            return Box::new(file.try_clone().expect("Failed to clone file"));
-        }
-    }
-
-    Box::new(DevNullSeek {})
 }

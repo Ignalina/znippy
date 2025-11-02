@@ -1,12 +1,12 @@
 // znippy-cli/src/main.rs
 
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use anyhow::Result;
 
+use znippy_common::{VerifyReport, list_archive_contents, verify_archive_integrity};
 use znippy_compress::compress_dir;
 use znippy_decompress::decompress_archive;
-use znippy_common::{verify_archive_integrity, list_archive_contents, VerifyReport};
 
 #[derive(Parser)]
 #[command(name = "znippy")]
@@ -57,24 +57,37 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Compress { input, output, no_skip } => {
-            let report = compress_dir(&input, &output,no_skip)?;
+        Commands::Compress {
+            input,
+            output,
+            no_skip,
+        } => {
+            let report = compress_dir(&input, &output, no_skip)?;
             println!("\n✅ Komprimering klar:");
             println!("📁 Totalt antal filer:         {}", report.total_files);
             println!("📁 Totalt antal chunks:         {}", report.chunks);
 
             println!("📂 Totalt antal kataloger:     {}", report.total_dirs);
             println!("📦 Filer komprimerade:         {}", report.compressed_files);
-            println!("📄 Filer ej komprimerade:      {}", report.uncompressed_files);
+            println!(
+                "📄 Filer ej komprimerade:      {}",
+                report.uncompressed_files
+            );
             println!("📥 Totalt inlästa bytes:       {}", report.total_bytes_in);
             println!("📤 Totalt skrivna bytes:       {}", report.total_bytes_out);
             println!("📉 Bytes som komprimerades:    {}", report.compressed_bytes);
-            println!("📃 Bytes ej komprimerade:      {}", report.uncompressed_bytes);
-            println!("📊 Komprimeringsgrad:          {:.2}%", report.compression_ratio);
+            println!(
+                "📃 Bytes ej komprimerade:      {}",
+                report.uncompressed_bytes
+            );
+            println!(
+                "📊 Komprimeringsgrad:          {:.2}%",
+                report.compression_ratio
+            );
         }
 
         Commands::Decompress { input, output } => {
-            let report: VerifyReport = decompress_archive(&input,  &output)?;
+            let report: VerifyReport = decompress_archive(&input, &output)?;
             println!("\n✅ Dekomprimering och verifiering klar:");
             println!("📁 Totala filer:       {}", report.total_files);
             println!("🔐 Verifierade filer:  {}", report.verified_files);
@@ -83,7 +96,6 @@ pub fn run() -> Result<()> {
             println!("📥 Totala bytes:       {}", report.total_bytes);
             println!("📤 Verifierade bytes:  {}", report.verified_bytes);
             println!("⚠️  Korrupta bytes:    {}", report.corrupt_bytes);
-
         }
 
         Commands::List { input } => {
