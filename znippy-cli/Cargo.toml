@@ -15,12 +15,12 @@ keywords = ["compression", "zstd", "parallel", "arrow", "blake3"]
 [dependencies]
 clap = { version = "4.5.51", features = ["derive"] }
 anyhow = { version = "1.0.100" }
-znippy-compress = { path = "../znippy-compress" }
-#znippy-compress = { version = "*" }
-znippy-decompress = { path ="../znippy-decompress" }
-#znippy-decompress = { version = "*" }
+#znippy-compress = { path = "../znippy-compress" }
+znippy-compress = { version = "0.2.5" }
+"znippy-decompress = { path ="../znippy-decompress" }
+znippy-decompress = { version = "0.2.5" }
 
-znippy-common = { path ="../znippy-common" }
-#znippy-common = { version = "*" }
+#znippy-common = { path ="../znippy-common" }
+znippy-common = { version = "0.2.5" }
 
 env_logger = { version = "0.11.8" }

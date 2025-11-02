@@ -11,6 +11,6 @@ categories = ["command-line-utilities", "compression"]
 keywords = ["zstd", "arrow", "blake3", "cli","polars"]
 
 [dependencies]
-znippy-cli = { path ="../znippy-cli" }
+#znippy-cli = { path ="../znippy-cli" }
 
-#znippy-cli = "*"
+znippy-cli = "0.2.5"
