@@ -17,7 +17,7 @@ clap = { version = "4.5.51", features = ["derive"] }
 anyhow = { version = "1.0.100" }
 #znippy-compress = { path = "../znippy-compress" }
 znippy-compress = { version = "0.2.5" }
-"znippy-decompress = { path ="../znippy-decompress" }
+#"znippy-decompress = { path ="../znippy-decompress" }
 znippy-decompress = { version = "0.2.5" }
 
 #znippy-common = { path ="../znippy-common" }
