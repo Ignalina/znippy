@@ -20,7 +20,7 @@ blake3 = "1.8.2"
 anyhow = "1.0.100"
 crossbeam-channel = "0.5.15"
 arrow = "57.0.0"
-#znippy-common = { version = "*" }
-znippy-common = { path = "../znippy-common" }
+znippy-common = { version = "0.2.5" }
+#znippy-common = { path = "../znippy-common" }
 log = "0.4.28"
 

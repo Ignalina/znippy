@@ -17,5 +17,5 @@ keywords = ["compression", "zstd", "parallel", "arrow", "blake3"]
 
 [dependencies]
 anyhow = "1.0.100"
-znippy-common = { path = "../znippy-common" }
-#znippy-common = { version = "*" }
+#znippy-common = { path = "../znippy-common" }
+znippy-common = { version = "0.2.5" }
