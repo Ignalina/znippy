@@ -1,7 +1,7 @@
 [package]
 name = "znippy-compress"
-version = "0.2.4"
-edition = "2021"
+version = "0.2.5"
+edition = "2024"
 authors = ["Rickard Lundin <rickard@x14>"]
 description = "Compression logic for Znippy, a parallel chunked compression system."
 license = "MIT"
@@ -17,9 +17,10 @@ keywords = ["compression", "zstd", "parallel", "arrow", "blake3"]
 zstd-sys-rs = "1.5.10"
 walkdir = "2.5.0"
 blake3 = "1.8.2"
-anyhow = "1.0.98"
+anyhow = "1.0.100"
 crossbeam-channel = "0.5.15"
-arrow = "55.2.0"
-znippy-common = "0.2.4"
-log = "0.4.27"
+arrow = "57.0.0"
+#znippy-common = { version = "*" }
+znippy-common = { path = "../znippy-common" }
+log = "0.4.28"
 

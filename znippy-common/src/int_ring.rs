@@ -10,10 +10,10 @@
 //! LARGE_SIZE:      128    × 10MB × 32 ≈  40.00 GB
 //! STORLEK_ENORM:  8192    × 10MB × 32 ≈ 2560.00 GB (~2.5 TB)
 
-pub const MINI_SIZE: usize = 4;         // ~1.25GB total at 10MB per chunk × 32 threads
-pub const MEDIUM_SIZE: usize = 32;      // ~10.00GB total
-pub const LARGE_SIZE: usize = 128;      // ~40.00GB total
-pub const STORLEK_ENORM: usize = 8192;  // ~2.5TB total
+pub const MINI_SIZE: usize = 4; // ~1.25GB total at 10MB per chunk × 32 threads
+pub const MEDIUM_SIZE: usize = 32; // ~10.00GB total
+pub const LARGE_SIZE: usize = 128; // ~40.00GB total
+pub const STORLEK_ENORM: usize = 8192; // ~2.5TB total
 struct RingState {
     head: usize,
     tail: usize,
@@ -37,9 +37,6 @@ impl<const N: usize> RingInner<N> {
             },
         }
     }
-
-
-
 
     fn pop(&mut self) -> Option<u64> {
         if self.state.len == 0 {

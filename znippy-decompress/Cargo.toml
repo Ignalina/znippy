@@ -2,8 +2,8 @@
 
 [package]
 name = "znippy-decompress"
-version = "0.2.4"
-edition = "2021"
+version = "0.2.5"
+edition = "2024"
 authors = ["Rickard Lundin <rickard@x14>"]
 description = "decompress logic for Znippy, a parallel chunked compression system."
 license = "MIT"
@@ -16,15 +16,6 @@ keywords = ["compression", "zstd", "parallel", "arrow", "blake3"]
 
 
 [dependencies]
-zstd-sys-rs = { version="1.5.10"}
-anyhow = "1.0.98"
-bincode = { version = "2.0.1"  ,features = ["serde"] }
-blake3 = "1.8.2"
-rayon = "1.10.0"
-walkdir = "2.5.0"
-znippy-common = "0.2.3"
-log = "0.4.27"
-parking_lot = "0.12.4"
-sysinfo = { version = "0.36.1", features = ["multithread"] }
-arrow = "55.2.0"
-crossbeam-channel = "0.5.15"
+anyhow = "1.0.100"
+znippy-common = { path = "../znippy-common" }
+#znippy-common = { version = "*" }

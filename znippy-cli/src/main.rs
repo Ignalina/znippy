@@ -1,3 +1,3 @@
 fn main() {
-    znippy_cli::run().unwrap(); 
+    znippy_cli::run().unwrap();
 }

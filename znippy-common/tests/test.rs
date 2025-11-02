@@ -1,11 +1,11 @@
-use znippy_common::chunkrevolver::{ChunkRevolver, CONFIG};
+use znippy_common::chunkrevolver::{CONFIG, ChunkRevolver};
 
 #[test]
 fn test_chunk_revolver_basic_usage() {
     // Setup: skapa en lokal config
     let mut config = CONFIG.clone();
     config.max_core_in_flight = 4; // antal ringar
-    config.max_chunks = 16;        // totalt antal chunkar
+    config.max_chunks = 16; // totalt antal chunkar
     config.file_split_block_size = 1024 * 1024; // 1 MB
 
     let mut revolver = ChunkRevolver::new(&config);
@@ -15,17 +15,11 @@ fn test_chunk_revolver_basic_usage() {
 
     // 1. Hämta alla chunkar
     for _ in 0..config.max_chunks {
-        let chunk = revolver
-            .try_get_chunk()
-            .expect("Expected available chunk");
+        let chunk = revolver.try_get_chunk().expect("Expected available chunk");
 
         // Kontrollera unikhet
         let key = (chunk.ring_nr, chunk.index);
-        assert!(
-            seen.insert(key),
-            "Duplicate chunk detected: {:?}",
-            key
-        );
+        assert!(seen.insert(key), "Duplicate chunk detected: {:?}", key);
 
         // Spara så vi kan returnera dem sen
         all_chunks.push((chunk.ring_nr, chunk.index));
@@ -51,11 +45,7 @@ fn test_chunk_revolver_basic_usage() {
             .expect("Expected chunk after return");
 
         let key = (chunk.ring_nr, chunk.index);
-        assert!(
-            second_seen.insert(key),
-            "Duplicate on reuse: {:?}",
-            key
-        );
+        assert!(second_seen.insert(key), "Duplicate on reuse: {:?}", key);
     }
 }
 
@@ -80,7 +70,10 @@ fn test_chunk_revolver_two_passes() {
     }
 
     let total = all_chunks.len();
-    assert_eq!(total, config.max_chunks as usize, "Första varvet borde hämta alla chunkar");
+    assert_eq!(
+        total, config.max_chunks as usize,
+        "Första varvet borde hämta alla chunkar"
+    );
 
     // Återlämna i exakt samma ordning
     for (ring, index) in &all_chunks {
@@ -94,19 +87,26 @@ fn test_chunk_revolver_two_passes() {
         second_pass.push((chunk.ring_nr, chunk.index));
     }
 
-    assert_eq!(second_pass.len(), total, "Andra varvet borde ge lika många chunkar");
+    assert_eq!(
+        second_pass.len(),
+        total,
+        "Andra varvet borde ge lika många chunkar"
+    );
 
     // Kontrollera att chunkarna faktiskt är desamma (eller minst att alla återanvänds)
     let set1: std::collections::HashSet<_> = all_chunks.iter().cloned().collect();
     let set2: std::collections::HashSet<_> = second_pass.iter().cloned().collect();
 
-    assert_eq!(set1, set2, "Chunkarna som återanvänds ska vara identiska mellan varven");
+    assert_eq!(
+        set1, set2,
+        "Chunkarna som återanvänds ska vara identiska mellan varven"
+    );
 }
 #[test]
 fn test_no_duplicate_without_return() {
+    use std::collections::HashSet;
     use znippy_common::chunkrevolver::ChunkRevolver;
     use znippy_common::common_config::StrategicConfig;
-    use std::collections::HashSet;
 
     let mut config = CONFIG.clone();
     config.max_chunks = 64;
@@ -130,8 +130,7 @@ fn test_no_duplicate_without_return() {
     }
 
     assert_eq!(
-        count,
-        config.max_chunks as usize,
+        count, config.max_chunks as usize,
         "Should get exactly max_chunks before exhaustion"
     );
 
@@ -144,9 +143,9 @@ fn test_no_duplicate_without_return() {
 #[test]
 #[should_panic(expected = "Chunk already seen")]
 fn test_duplicate_chunk_without_return_is_detected() {
+    use std::collections::HashSet;
     use znippy_common::chunkrevolver::ChunkRevolver;
     use znippy_common::common_config::StrategicConfig;
-    use std::collections::HashSet;
 
     let mut config = CONFIG.clone();
     config.max_chunks = 8;
@@ -186,9 +185,9 @@ fn test_duplicate_chunk_without_return_is_detected() {
 
 #[test]
 fn test_chunk_does_not_overlap_without_return() {
+    use std::collections::HashSet;
     use znippy_common::chunkrevolver::ChunkRevolver;
     use znippy_common::common_config::StrategicConfig;
-    use std::collections::HashSet;
 
     let mut config = CONFIG.clone();
     config.max_chunks = 8;
@@ -249,8 +248,7 @@ fn test_no_duplicate_chunks_without_return() {
     }
 
     assert_eq!(
-        count,
-        config.max_chunks,
+        count, config.max_chunks,
         "Expected to get exactly {} unique chunks",
         config.max_chunks
     );

@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Metadata för en enskild chunk i arkivet (.zdata)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,15 +11,12 @@ pub struct ChunkMeta {
     pub compressed: bool,
     pub uncompressed_size: u64,
     pub compressed_size: u64,
-
 }
-
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriterStats {
     pub total_chunks: u64,
-    pub total_written_bytes:u64
+    pub total_written_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -28,7 +25,6 @@ pub struct ReaderStats {
     pub skipped_files: usize,
 }
 
-
 #[derive(Debug)]
 pub struct FileMeta {
     pub relative_path: String,
@@ -36,5 +32,3 @@ pub struct FileMeta {
     pub uncompressed_size: u64,
     pub chunks: Vec<ChunkMeta>,
 }
-
-

@@ -1,25 +1,28 @@
 extern crate core;
 
-pub mod index;
 pub mod common_config;
+pub mod index;
 mod int_ring;
-pub use int_ring::{RingBuffer, ChunkQueue};
+pub use int_ring::{ChunkQueue, RingBuffer};
 
 pub mod chunkrevolver;
-pub use chunkrevolver::{ChunkRevolver,get_chunk_slice,split_into_microchunks};
+pub use chunkrevolver::{ChunkRevolver, get_chunk_slice, split_into_microchunks};
 
 pub mod meta;
-pub use meta::{ChunkMeta,FileMeta};
+pub use meta::{ChunkMeta, FileMeta};
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 pub mod decompress;
 mod skip;
 
 pub use decompress::decompress_archive;
 
-
-pub use index::{extract_config_from_arrow_metadata,attach_metadata,build_arrow_batch_from_files ,znippy_index_schema,is_probably_compressed, should_skip_compression, ZNIPPY_INDEX_SCHEMA,verify_archive_integrity,list_archive_contents,VerifyReport,read_znippy_index};
+pub use index::{
+    VerifyReport, ZNIPPY_INDEX_SCHEMA, attach_metadata, build_arrow_batch_from_files,
+    extract_config_from_arrow_metadata, is_probably_compressed, list_archive_contents,
+    read_znippy_index, should_skip_compression, verify_archive_integrity, znippy_index_schema,
+};
 
 #[derive(Debug)]
 pub struct CompressionReport {

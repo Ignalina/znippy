@@ -1,6 +1,6 @@
-pub use crate::common_config::{StrategicConfig, CONFIG};
-use crate::int_ring::RingBuffer;
 use crate::ChunkQueue;
+pub use crate::common_config::{CONFIG, StrategicConfig};
+use crate::int_ring::RingBuffer;
 use std::ops::{Deref, DerefMut};
 
 #[derive(Copy, Clone)]
@@ -68,12 +68,12 @@ impl ChunkRevolver {
             let block = vec![0u8; block_size].into_boxed_slice();
             memory_blocks.push(block);
         }
-        let next_ring=0;
+        let next_ring = 0;
         Self {
             chunk_size,
             rings,
             memory_blocks,
-            next_ring
+            next_ring,
         }
     }
 
@@ -85,7 +85,8 @@ impl ChunkRevolver {
 
             if let Some(index) = self.rings[ring_nr].pop() {
                 let offset = index as usize * self.chunk_size as usize;
-                let data = &mut self.memory_blocks[ring_nr][offset..offset + self.chunk_size as usize];
+                let data =
+                    &mut self.memory_blocks[ring_nr][offset..offset + self.chunk_size as usize];
                 self.next_ring = (ring_nr + 1) % total_rings;
 
                 return Some(Chunk {
@@ -98,7 +99,6 @@ impl ChunkRevolver {
 
         None
     }
-
 
     pub fn return_chunk(&mut self, thread_nr: u8, index: u64) {
         self.rings[thread_nr as usize]
@@ -126,10 +126,7 @@ pub unsafe fn get_chunk_slice<'a>(
     std::slice::from_raw_parts(base_ptr.add(offset), used)
 }
 
-pub fn split_into_microchunks<'a>(
-    full_chunk: &'a [u8],
-    micro_size: usize,
-) -> Vec<&'a [u8]> {
+pub fn split_into_microchunks<'a>(full_chunk: &'a [u8], micro_size: usize) -> Vec<&'a [u8]> {
     let mut microchunks = Vec::new();
     let mut offset = 0;
     while offset < full_chunk.len() {
