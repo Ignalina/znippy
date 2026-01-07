@@ -1,6 +1,9 @@
 
 ![znippy](https://github.com/user-attachments/assets/7db1c1c1-d577-4f87-bfe1-11af6e8c58a0)
 
+
+
+
 # Znippy (Betha preview !!!!)
 Znippy archive format based on Zstandard and Apache Arrow . Built for speed, streaming, and random access,.  
 
@@ -56,7 +59,4 @@ flowchart LR
 
 
 ## 🧩 Fan art
-ok
-
 ![znippy](https://github.com/user-attachments/assets/b068d559-4339-4f9f-9623-7c6b5efe2771)
-
