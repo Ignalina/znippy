@@ -1,10 +1,12 @@
 use SeekFrom::Start;
 use anyhow::anyhow;
 use std::ffi::CStr;
+#[cfg(feature = "zstd")]
 use zstd_sys_rs::*;
 
 use std::ffi::c_void;
 use std::ptr;
+#[cfg(feature = "zstd")]
 use zstd_sys_rs::*;
 
 use anyhow::{Context, Result};
@@ -643,10 +645,12 @@ use arrow_array::types::Int32Type;
 use log::debug;
 use std::slice;
 use std::thread::JoinHandle;
+#[cfg(feature = "zstd")]
 use zstd_sys_rs::*;
 
 /// Decompress a complete microchunk into the provided `dst` buffer.
 /// Assumes `src` contains a *complete* ZSTD stream (as produced with `ZSTD_e_end`)
+#[cfg(feature = "zstd")]
 pub fn decompress_chunk_stream(
     dctx: *mut ZSTD_DCtx,
     dst: &mut [u8],
@@ -689,6 +693,7 @@ pub fn decompress_chunk_stream(
     }
 }
 
+#[cfg(feature = "zstd")]
 pub fn decompress_chunk_stream2(input: &[u8]) -> Result<Vec<u8>> {
     unsafe {
         let dctx = ZSTD_createDCtx();
@@ -756,6 +761,7 @@ pub fn decompress_chunk_stream2(input: &[u8]) -> Result<Vec<u8>> {
         Ok(output)
     }
 }
+#[cfg(feature = "zstd")]
 pub unsafe fn decompress_chunk_once(
     dctx: *mut ZSTD_DCtx,
     src: &[u8],
@@ -805,6 +811,7 @@ pub unsafe fn decompress_chunk_once(
     Ok(dst)
 }
 
+#[cfg(feature = "zstd")]
 unsafe fn decompress_chunk_once2(
     dctx: *mut ZSTD_DCtx,
     src: &[u8],
@@ -845,35 +852,7 @@ unsafe fn decompress_chunk_once2(
 }
 
 pub fn decompress2_microchunk(input: &[u8]) -> Result<Vec<u8>> {
-    unsafe {
-        let size = ZSTD_getFrameContentSize(input.as_ptr() as *const _, input.len());
-
-        if size == ZSTD_CONTENTSIZE_ERROR as u64 {
-            return Err(anyhow!("Not a valid zstd frame"));
-        }
-        if size == ZSTD_CONTENTSIZE_UNKNOWN as u64 {
-            return Err(anyhow!("Unknown content size"));
-        }
-
-        let expected_size = size as usize;
-        let mut output = vec![0u8; expected_size];
-
-        let written = ZSTD_decompress(
-            output.as_mut_ptr() as *mut _,
-            output.len(),
-            input.as_ptr() as *const _,
-            input.len(),
-        );
-
-        if ZSTD_isError(written) != 0 {
-            let err = ZSTD_getErrorName(written);
-            let err_str = CStr::from_ptr(err).to_string_lossy();
-            return Err(anyhow!("ZSTD_decompress error: {}", err_str));
-        }
-
-        output.truncate(written);
-        Ok(output)
-    }
+    crate::codec::decompress_frame(input)
 }
 
 use std::collections::HashSet;

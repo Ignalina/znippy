@@ -1,4 +1,3 @@
-use crate::packer::ZSTD_EndDirective::ZSTD_e_end;
 use anyhow::Result;
 use anyhow::anyhow;
 use arrow::array::Array;
@@ -24,9 +23,9 @@ use znippy_common::{
     CompressionReport, FileMeta, attach_metadata, build_arrow_batch_from_files,
     split_into_microchunks,
 };
-use zstd_sys_rs::ZSTD_ResetDirective::ZSTD_reset_session_only;
+#[cfg(feature = "zstd")]
 use zstd_sys_rs::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
-use zstd_sys_rs::*;
+#[cfg(feature = "zstd")]
 use zstd_sys_rs::*;
 fn strip_prefix<'a>(base: &'a Path, full: &'a Path) -> PathBuf {
     full.strip_prefix(base).unwrap_or(full).to_path_buf()
@@ -268,18 +267,16 @@ pub fn compress_dir(
             let mut local_chunkmeta: Vec<ChunkMeta> = Vec::new();
             let mut hasher = Hasher::new(); // Blake3 hash initialization
             let mut chunk_seq: u32 = 0;
+
+            let mut cctx = znippy_common::codec::CompressCtx::new(CONFIG.compression_level)
+                .expect("Failed to create compression context");
+
+            log::info!(
+                "[compressor] Compressor thread started with level {}",
+                CONFIG.compression_level,
+            );
+
             unsafe {
-                let cctx = ZSTD_createCCtx();
-                assert!(!cctx.is_null(), "ZSTD_createCCtx failed");
-
-                ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, CONFIG.compression_level);
-                ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, CONFIG.max_core_in_compress as i32);
-                log::info!(
-                    "[compressor] Compressor thread started with level {} and {} workers",
-                    CONFIG.compression_level,
-                    CONFIG.max_core_in_compress
-                );
-
                 loop {
                     match rx_chunk.recv() {
                         Ok((file_index, mut fdata_offset, ring_nr, chunk_nr, length, skip)) => {
@@ -320,7 +317,6 @@ pub fn compress_dir(
                                     uncompressed_size: input.len() as u64,
                                 };
 
-                                //    log::debug!("[compressor] Sending chunk uncompressed chunk nr {} of file {} to writer", chunk_nr, file_index);
                                 tx_compressed.send((output, chunk_meta)).unwrap();
                                 chunk_seq += 1;
                                 fdata_offset += input.len() as u64;
@@ -329,7 +325,7 @@ pub fn compress_dir(
                                     split_into_microchunks(input, CONFIG.zstd_output_buffer_size);
 
                                 for (micro_nr, micro) in micro_chunks.iter().enumerate() {
-                                    let compressed_vec = compress2_microchunk(cctx, micro)?;
+                                    let compressed_vec = cctx.compress(micro)?;
 
                                     let compressed_chunk: Arc<[u8]> =
                                         Arc::from(compressed_vec.into_boxed_slice());
@@ -360,7 +356,6 @@ pub fn compress_dir(
                                     chunk_seq += 1;
                                 }
                             }
-                            //      log::debug!("[compressor] Sending ACK on chunk_nr done  chunknr {} of file {} to reader", chunk_nr, file_index);
                             tx_ret.send((ring_nr, chunk_nr));
                         }
                         Err(_) => {
@@ -370,8 +365,6 @@ pub fn compress_dir(
                         }
                     }
                 }
-
-                ZSTD_freeCCtx(cctx);
 
                 // Drop sender-side channels after the receiver finishes
                 drop(tx_compressed);
@@ -565,9 +558,12 @@ pub fn compress_dir(
     Ok(report)
 }
 
+#[cfg(feature = "zstd")]
 use std::ffi::CStr;
+#[cfg(feature = "zstd")]
 use zstd_sys_rs::*;
 
+#[cfg(feature = "zstd")]
 pub fn compress_microchunk(
     cctx: *mut ZSTD_CCtx,
     input: &[u8],
@@ -619,9 +615,12 @@ pub fn compress_microchunk(
 
 use std::ptr;
 use std::slice;
+#[cfg(feature = "zstd")]
 use znippy_common::decompress::decompress2_microchunk;
+#[cfg(feature = "zstd")]
 use zstd_sys_rs::*;
 
+#[cfg(feature = "zstd")]
 unsafe fn test_decompress_chunk(data: &[u8]) -> Result<usize> {
     let ctx = unsafe { ZSTD_createDCtx() };
     if ctx.is_null() {
@@ -656,6 +655,7 @@ unsafe fn test_decompress_chunk(data: &[u8]) -> Result<usize> {
 
 /// Compresses a microchunk using `ZSTD_compress2` (non-streaming API).
 /// Returns a standalone frame that is self-decompressible.
+#[cfg(feature = "zstd")]
 pub fn compress2_microchunk(cctx: *mut ZSTD_CCtx, input: &[u8]) -> Result<Vec<u8>> {
     unsafe {
         let bound = ZSTD_compressBound(input.len());

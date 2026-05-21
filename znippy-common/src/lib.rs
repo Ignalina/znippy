@@ -1,5 +1,6 @@
 extern crate core;
 
+pub mod codec;
 pub mod common_config;
 pub mod index;
 mod int_ring;
