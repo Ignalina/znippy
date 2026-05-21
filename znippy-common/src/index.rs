@@ -490,11 +490,25 @@ pub fn read_znippy_index(path: &Path) -> Result<(Arc<Schema>, Vec<RecordBatch>)>
     let file = File::open(path)?;
     let reader = FileReader::try_new(BufReader::new(file), None)?;
     let schema = reader.schema();
-    let batches = reader.collect::<Result<Vec<_>, _>>()?;
+    let custom_metadata = reader.custom_metadata().clone();
+    let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>()?;
     eprintln!(
         "Batch schema fields: {:?}",
         schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
     );
+
+    // Merge footer custom_metadata into schema metadata for backward compatibility
+    if !custom_metadata.is_empty() {
+        let mut merged = schema.metadata().clone();
+        for (k, v) in custom_metadata {
+            merged.entry(k).or_insert(v);
+        }
+        let merged_schema = Arc::new(Schema::new_with_metadata(
+            schema.fields().to_vec(),
+            merged,
+        ));
+        return Ok((merged_schema, batches));
+    }
 
     Ok((schema, batches))
 }

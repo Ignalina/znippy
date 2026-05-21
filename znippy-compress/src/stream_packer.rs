@@ -15,7 +15,7 @@ use znippy_common::index::{
 };
 use znippy_common::meta::{ChunkMeta, WriterStats};
 use znippy_common::{
-    CompressionReport, attach_metadata,
+    CompressionReport,
     split_into_microchunks,
 };
 
@@ -370,10 +370,22 @@ fn run_compression_pipeline(
         compressor_threads.push(handle);
     }
 
-    // Writer thread (identical to compress_dir)
-    // Writer thread — collect chunk rows inline (v2: no .zdata file)
-    let writer_thread = thread::spawn(move || {
+    // Writer thread — streams batches to Arrow IPC file incrementally
+    let output_for_writer = output.clone();
+    let writer_thread = thread::spawn(move || -> (WriterStats, FileWriter<std::io::BufWriter<File>>) {
+        use znippy_common::index::ZNIPPY_INDEX_SCHEMA;
+
+        const BATCH_FLUSH_BYTES: u64 = 64 * 1024 * 1024; // flush every 64MB of zdata
+
+        let output_path = output_for_writer.with_extension("znippy");
+        let file = File::create(&output_path).expect("Failed to create output file");
+        let buf_writer = std::io::BufWriter::new(file);
+        let schema = ZNIPPY_INDEX_SCHEMA.as_ref().clone();
+        let mut arrow_writer = FileWriter::try_new(buf_writer, &schema)
+            .expect("Failed to create Arrow writer");
+
         let mut chunk_rows: Vec<(ChunkMeta, Vec<u8>)> = Vec::new();
+        let mut buffered_bytes: u64 = 0;
         let mut writerstats = WriterStats {
             total_chunks: 0,
             total_written_bytes: 0,
@@ -385,8 +397,56 @@ fn run_compression_pipeline(
 
         while let Ok((compressed_data, chunk_meta)) = rx_compressed.recv() {
             writerstats.total_chunks += 1;
-            writerstats.total_written_bytes += compressed_data.len() as u64;
+            let data_len = compressed_data.len() as u64;
+            writerstats.total_written_bytes += data_len;
+            buffered_bytes += data_len;
             chunk_rows.push((chunk_meta, compressed_data.to_vec()));
+
+            if buffered_bytes >= BATCH_FLUSH_BYTES {
+                let rows: Vec<ChunkRow> = chunk_rows
+                    .drain(..)
+                    .map(|(meta, data)| {
+                        let rel_path = relative_paths_for_writer[meta.file_index as usize].clone();
+                        ChunkRow {
+                            relative_path: rel_path,
+                            chunk_seq: meta.chunk_seq,
+                            fdata_offset: meta.fdata_offset,
+                            checksum_group: meta.checksum_group,
+                            compressed: meta.compressed,
+                            uncompressed_size: meta.uncompressed_size,
+                            repo: None,
+                            zdata: data,
+                        }
+                    })
+                    .collect();
+                let batch = build_arrow_batch_from_chunks(&rows)
+                    .expect("Failed to build batch");
+                arrow_writer.write(&batch).expect("Failed to write batch");
+                buffered_bytes = 0;
+            }
+        }
+
+        // Flush remaining chunks
+        if !chunk_rows.is_empty() {
+            let rows: Vec<ChunkRow> = chunk_rows
+                .into_iter()
+                .map(|(meta, data)| {
+                    let rel_path = relative_paths_for_writer[meta.file_index as usize].clone();
+                    ChunkRow {
+                        relative_path: rel_path,
+                        chunk_seq: meta.chunk_seq,
+                        fdata_offset: meta.fdata_offset,
+                        checksum_group: meta.checksum_group,
+                        compressed: meta.compressed,
+                        uncompressed_size: meta.uncompressed_size,
+                        repo: None,
+                        zdata: data,
+                    }
+                })
+                .collect();
+            let batch = build_arrow_batch_from_chunks(&rows)
+                .expect("Failed to build batch");
+            arrow_writer.write(&batch).expect("Failed to write batch");
         }
 
         log::info!(
@@ -395,25 +455,7 @@ fn run_compression_pipeline(
             writerstats.total_written_bytes
         );
 
-        let rows: Vec<ChunkRow> = chunk_rows
-            .into_iter()
-            .map(|(meta, data)| {
-                let rel_path = relative_paths_for_writer[meta.file_index as usize].clone();
-                ChunkRow {
-                    relative_path: rel_path,
-                    chunk_seq: meta.chunk_seq,
-                    fdata_offset: meta.fdata_offset,
-                    checksum_group: meta.checksum_group,
-                    compressed: meta.compressed,
-                    uncompressed_size: meta.uncompressed_size,
-                    repo: None,
-                    zdata: data,
-                }
-            })
-            .collect();
-
-        let batch = build_arrow_batch_from_chunks(&rows);
-        (writerstats, batch)
+        (writerstats, arrow_writer)
     });
 
     // Wait for reader
@@ -435,19 +477,16 @@ fn run_compression_pipeline(
 
     drop(tx_compressed);
 
-    let (writerstats, batch) = writer_thread.join().unwrap();
+    let (writerstats, mut arrow_writer) = writer_thread.join().unwrap();
 
-    // Build and write single-file Arrow archive
+    // Write checksums and config as custom metadata in the IPC footer
     let metadata = build_arrow_metadata_for_checksums_and_config(&checksums, &CONFIG);
-    let final_batch = attach_metadata(batch?, metadata)?;
-
-    let output_path = output.with_extension("znippy");
-    let index_file = File::create(&output_path)?;
-    let mut arrow_writer = FileWriter::try_new(index_file, &final_batch.schema())?;
-    arrow_writer.write(&final_batch)?;
+    for (key, value) in &metadata {
+        arrow_writer.write_metadata(key, value);
+    }
     arrow_writer.finish()?;
 
-    log::info!("[stream] Single-file archive written to {:?}", output_path);
+    log::info!("[stream] Single-file archive written");
 
     let report = CompressionReport {
         total_files,
