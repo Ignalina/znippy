@@ -10,7 +10,9 @@ default = []
 [dependencies]
 znippy-compress = { path = "../znippy-compress" }
 znippy-common = { path = "../znippy-common" }
+znippy-plugin-maven = { path = "../znippy-plugin-maven", features = ["resolve"] }
 anyhow = "1.0.100"
 tempfile = "3"
 env_logger = "0.11.8"
 walkdir = "2.5.0"
+miniz_oxide = "0.8"

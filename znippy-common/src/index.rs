@@ -56,14 +56,28 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
 /// Type ID 0 = holger_nexus_v1, Type ID 1 = photoalbum_v1
 pub fn extension_union_fields() -> UnionFields {
     UnionFields::new(
-        vec![0, 1],
+        vec![0, 1, 2, 3],
         vec![
+            Field::new(
+                "generic",
+                DataType::Null,
+                true,
+            ),
             Field::new(
                 "holger_nexus_v1",
                 DataType::Struct(Fields::from(vec![
                     Field::new("group", DataType::Utf8, false),
                     Field::new("artifact_type", DataType::Utf8, false),
                     Field::new("version", DataType::Utf8, true),
+                ])),
+                true,
+            ),
+            Field::new(
+                "cargo_registry_v1",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("crate_name", DataType::Utf8, false),
+                    Field::new("version", DataType::Utf8, false),
+                    Field::new("features", DataType::Utf8, true),
                 ])),
                 true,
             ),
@@ -340,19 +354,25 @@ fn new_null_utf8_array(len: usize) -> StringArray {
     builder.finish()
 }
 
-/// Create a null DenseUnion array (extension column, all nulls)
+/// Create a null DenseUnion array (extension column, all nulls = generic type_id 0)
 fn new_null_union_array(len: usize) -> arrow::array::UnionArray {
     use arrow::buffer::ScalarBuffer;
-    let type_ids: Vec<i8> = vec![0; len];
-    // Each row points to its own offset in the null child
+    let type_ids: Vec<i8> = vec![0; len]; // 0 = generic
     let offsets: Vec<i32> = (0..len as i32).collect();
     let fields = extension_union_fields();
 
-    // Child arrays with `len` null entries so offsets are valid
+    // Child arrays — generic is Null type, others are empty structs
+    let generic_child = arrow::array::NullArray::new(len);
+
     let holger_fields = Fields::from(vec![
         Field::new("group", DataType::Utf8, false),
         Field::new("artifact_type", DataType::Utf8, false),
         Field::new("version", DataType::Utf8, true),
+    ]);
+    let cargo_fields = Fields::from(vec![
+        Field::new("crate_name", DataType::Utf8, false),
+        Field::new("version", DataType::Utf8, false),
+        Field::new("features", DataType::Utf8, true),
     ]);
     let photo_fields = Fields::from(vec![
         Field::new("album", DataType::Utf8, false),
@@ -360,12 +380,11 @@ fn new_null_union_array(len: usize) -> arrow::array::UnionArray {
         Field::new("thumbnail", DataType::Binary, true),
     ]);
 
-    let holger_child = StructArray::new_null(holger_fields, len);
-    let photo_child = StructArray::new_null(photo_fields, 0);
-
     let children: Vec<ArrayRef> = vec![
-        Arc::new(holger_child),
-        Arc::new(photo_child),
+        Arc::new(generic_child),
+        Arc::new(StructArray::new_null(holger_fields, 0)),
+        Arc::new(StructArray::new_null(cargo_fields, 0)),
+        Arc::new(StructArray::new_null(photo_fields, 0)),
     ];
 
     arrow::array::UnionArray::try_new(
@@ -400,11 +419,12 @@ pub fn build_holger_nexus_union(entries: &[Option<HolgerNexusExt>]) -> arrow::ar
     let mut type_ids: Vec<i8> = Vec::with_capacity(len);
     let mut offsets: Vec<i32> = Vec::with_capacity(len);
     let mut holger_count: i32 = 0;
+    let mut generic_count: i32 = 0;
 
     for entry in entries {
         match entry {
             Some(ext) => {
-                type_ids.push(0); // holger_nexus_v1 = type_id 0
+                type_ids.push(1); // holger_nexus_v1 = type_id 1
                 offsets.push(holger_count);
                 holger_count += 1;
                 group_builder.append_value(&ext.group);
@@ -415,12 +435,15 @@ pub fn build_holger_nexus_union(entries: &[Option<HolgerNexusExt>]) -> arrow::ar
                 }
             }
             None => {
-                // No extension — point at offset 0 of holger variant (will be masked by null)
+                // No extension — generic type_id 0
                 type_ids.push(0);
-                offsets.push(0);
+                offsets.push(generic_count);
+                generic_count += 1;
             }
         }
     }
+
+    let generic_child = arrow::array::NullArray::new(generic_count as usize);
 
     let holger_struct = StructArray::from(vec![
         (
@@ -437,16 +460,22 @@ pub fn build_holger_nexus_union(entries: &[Option<HolgerNexusExt>]) -> arrow::ar
         ),
     ]);
 
+    let cargo_fields = Fields::from(vec![
+        Field::new("crate_name", DataType::Utf8, false),
+        Field::new("version", DataType::Utf8, false),
+        Field::new("features", DataType::Utf8, true),
+    ]);
     let photo_fields = Fields::from(vec![
         Field::new("album", DataType::Utf8, false),
         Field::new("sort_order", DataType::UInt32, false),
         Field::new("thumbnail", DataType::Binary, true),
     ]);
-    let photo_child = StructArray::new_null(photo_fields, 0);
 
     let children: Vec<ArrayRef> = vec![
+        Arc::new(generic_child),
         Arc::new(holger_struct),
-        Arc::new(photo_child),
+        Arc::new(StructArray::new_null(cargo_fields, 0)),
+        Arc::new(StructArray::new_null(photo_fields, 0)),
     ];
 
     arrow::array::UnionArray::try_new(
