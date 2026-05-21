@@ -403,6 +403,9 @@ pub fn decompress_archive(
 
     // [WRITER]
 
+    let expected_checksums = file_checksums.unwrap_or_default();
+    let num_groups = expected_checksums.len();
+
     let writer_thread = thread::spawn(move || -> WriterStats {
         let mut total_chunks = 0u64;
         let chunks_array = batch_cloned_for_writer
@@ -418,6 +421,9 @@ pub fn decompress_archive(
 
         let mut total_written_bytes = 0u64;
 
+        // Checksum verification: collect (chunk_seq, data) per group, hash in order at end
+        let mut group_chunks: Vec<Vec<(u32, Vec<u8>)>> = vec![Vec::new(); num_groups];
+
         let mut open_files: HashMap<usize, File> = HashMap::new();
         let mut chunks_written: HashMap<usize, usize> = HashMap::new();
         let mut expected_chunks: HashMap<usize, usize> = HashMap::new();
@@ -425,58 +431,64 @@ pub fn decompress_archive(
         let mut peak_open = 0usize;
         let mut created_dirs: HashSet<PathBuf> = HashSet::new();
         while let Ok((chunk_meta, data)) = chunk_rx_cloned.recv() {
-            let col = batch_cloned_for_writer
-                .column_by_name("relative_path")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-
-            let rel_path = col.value(chunk_meta.file_index.try_into().unwrap()); // &str
-
-            let full_path = out_dir_cloned.join(rel_path); // → PathBuf
-
-            log::debug!(
-                "[Writer] got file_index {} index file name  {} transposed to fullpath={:?}",
-                chunk_meta.file_index,
-                rel_path,
-                full_path
-            );
-
-            if let Some(parent) = full_path.parent() {
-                std::fs::create_dir_all(parent).unwrap();
+            // Collect data for checksum verification
+            let grp = chunk_meta.checksum_group as usize;
+            if grp < num_groups {
+                group_chunks[grp].push((chunk_meta.chunk_seq, data.clone()));
             }
-
-            let mut writer = get_output_writer(
-                &mut open_files,
-                chunk_meta.file_index as usize,
-                &full_path,
-                &mut current_open,
-                &mut peak_open,
-                &mut expected_chunks,
-                &mut chunks_written,
-                &mut created_dirs,
-                &chunks_array,
-                save_data,
-            );
-
-            writer.seek(Start(chunk_meta.fdata_offset)).unwrap();
-            writer.write_all(&data).unwrap();
 
             total_chunks += 1;
             total_written_bytes += data.len() as u64;
 
+            if save_data {
+                let col = batch_cloned_for_writer
+                    .column_by_name("relative_path")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
 
-            // increment chunks_written AFTER writing
-            let written = chunks_written.entry(chunk_meta.file_index as usize).or_default();
-            *written += 1;
+                let rel_path = col.value(chunk_meta.file_index.try_into().unwrap());
+                let full_path = out_dir_cloned.join(rel_path);
 
-            // close immediately if last chunk
-            if let Some(&chunk_goal) = expected_chunks.get(&(chunk_meta.file_index as usize)) {
-                if *written == chunk_goal {
-                    if let Some(file) = open_files.remove(&(chunk_meta.file_index as usize)) {
-                        drop(file);
-                        current_open -= 1;
+                log::debug!(
+                    "[Writer] got file_index {} index file name  {} transposed to fullpath={:?}",
+                    chunk_meta.file_index,
+                    rel_path,
+                    full_path
+                );
+
+                if let Some(parent) = full_path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+
+                let mut writer = get_output_writer(
+                    &mut open_files,
+                    chunk_meta.file_index as usize,
+                    &full_path,
+                    &mut current_open,
+                    &mut peak_open,
+                    &mut expected_chunks,
+                    &mut chunks_written,
+                    &mut created_dirs,
+                    &chunks_array,
+                    save_data,
+                );
+
+                writer.seek(Start(chunk_meta.fdata_offset)).unwrap();
+                writer.write_all(&data).unwrap();
+
+                // increment chunks_written AFTER writing
+                let written = chunks_written.entry(chunk_meta.file_index as usize).or_default();
+                *written += 1;
+
+                // close immediately if last chunk
+                if let Some(&chunk_goal) = expected_chunks.get(&(chunk_meta.file_index as usize)) {
+                    if *written == chunk_goal {
+                        if let Some(file) = open_files.remove(&(chunk_meta.file_index as usize)) {
+                            drop(file);
+                            current_open -= 1;
+                        }
                     }
                 }
             }
@@ -486,9 +498,49 @@ pub fn decompress_archive(
             drop(file);
             current_open -= 1;
         }
+
+        // Verify checksums: sort each group by chunk_seq, hash in order, compare
+        let mut verified_files = 0usize;
+        let mut corrupt_files = 0usize;
+        let mut verified_bytes = 0u64;
+        let mut corrupt_bytes = 0u64;
+
+        for (grp_idx, mut chunks) in group_chunks.into_iter().enumerate() {
+            chunks.sort_by_key(|(seq, _)| *seq);
+            let mut hasher = Hasher::new();
+            let mut grp_bytes = 0u64;
+            for (_, data) in &chunks {
+                hasher.update(data);
+                grp_bytes += data.len() as u64;
+            }
+            let computed = *hasher.finalize().as_bytes();
+            if computed == expected_checksums[grp_idx] {
+                verified_bytes += grp_bytes;
+                log::debug!("[verify] checksum_group {} OK", grp_idx);
+            } else {
+                corrupt_bytes += grp_bytes;
+                corrupt_files += 1;
+                log::error!(
+                    "[verify] checksum_group {} MISMATCH: expected {}, got {}",
+                    grp_idx,
+                    hex::encode(expected_checksums[grp_idx]),
+                    hex::encode(computed)
+                );
+            }
+        }
+
+        // If all groups verified, count total files as verified
+        if corrupt_files == 0 && num_groups > 0 {
+            verified_files = batch_cloned_for_writer.num_rows();
+        }
+
         WriterStats {
             total_chunks,
             total_written_bytes,
+            verified_files,
+            corrupt_files,
+            verified_bytes,
+            corrupt_bytes,
         }
     });
     let reader_stats = reader_thread.join().expect("reader_thread panicked");
@@ -506,11 +558,11 @@ pub fn decompress_archive(
 
     let report = VerifyReport {
         total_files: reader_stats.total_files,
-        verified_files: 0,
-        corrupt_files: 0,
+        verified_files: writer_stats.verified_files,
+        corrupt_files: writer_stats.corrupt_files,
         total_bytes: writer_stats.total_written_bytes,
-        verified_bytes: 0,
-        corrupt_bytes: 0,
+        verified_bytes: writer_stats.verified_bytes,
+        corrupt_bytes: writer_stats.corrupt_bytes,
         chunks: writer_stats.total_chunks,
     };
 
@@ -523,12 +575,12 @@ pub fn extract_file_checksums_from_metadata(schema: &SchemaRef) -> Result<Vec<[u
 
     let mut sorted_keys: Vec<_> = metadata
         .keys()
-        .filter(|k| k.starts_with("checksum_"))
+        .filter(|k| k.starts_with("checksum_group_"))
         .collect();
 
     // Sort by numerical suffix to preserve order
     sorted_keys.sort_by_key(|k| {
-        k.trim_start_matches("checksum_")
+        k.trim_start_matches("checksum_group_")
             .parse::<usize>()
             .unwrap_or(usize::MAX)
     });

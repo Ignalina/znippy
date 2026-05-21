@@ -384,6 +384,10 @@ fn run_compression_pipeline(
         let mut writerstats = WriterStats {
             total_chunks: 0,
             total_written_bytes: 0,
+            verified_files: 0,
+            corrupt_files: 0,
+            verified_bytes: 0,
+            corrupt_bytes: 0,
         };
         let mut zdata_offset: u64 = 0;
 

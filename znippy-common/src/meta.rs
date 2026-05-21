@@ -17,6 +17,10 @@ pub struct ChunkMeta {
 pub struct WriterStats {
     pub total_chunks: u64,
     pub total_written_bytes: u64,
+    pub verified_files: usize,
+    pub corrupt_files: usize,
+    pub verified_bytes: u64,
+    pub corrupt_bytes: u64,
 }
 
 #[derive(Debug)]
