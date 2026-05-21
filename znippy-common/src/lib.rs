@@ -12,6 +12,9 @@ pub use chunkrevolver::{ChunkRevolver, get_chunk_slice, split_into_microchunks};
 pub mod meta;
 pub use meta::{ChunkMeta, FileMeta};
 
+pub mod plugin;
+pub mod plugins;
+
 use serde::{Deserialize, Serialize};
 
 pub mod decompress;

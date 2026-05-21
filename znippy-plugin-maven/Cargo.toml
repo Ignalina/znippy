@@ -1,0 +1,12 @@
+[package]
+name = "znippy-plugin-maven"
+version = "0.1.0"
+edition = "2024"
+description = "Maven/JAR metadata plugin for znippy (compiles to native + WASM)"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
