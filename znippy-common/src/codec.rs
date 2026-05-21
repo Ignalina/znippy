@@ -92,8 +92,8 @@ mod inner {
     use anyhow::{Result, anyhow};
 
     pub struct CompressCtx {
+        cctx: openzl_sys_rs::ZlCCtx,
         level: i32,
-        version: i32,
     }
 
     unsafe impl Send for CompressCtx {}
@@ -101,28 +101,23 @@ mod inner {
     impl CompressCtx {
         pub fn new(compression_level: i32) -> Result<Self> {
             use openzl_sys_rs::*;
-            let version = unsafe { ZL_getDefaultEncodingVersion() } as i32;
-            // Validate by creating one context
             let mut cctx = ZlCCtx::new().ok_or_else(|| anyhow!("ZL_CCtx_create failed"))?;
+            let version = unsafe { ZL_getDefaultEncodingVersion() } as i32;
+            // stickyParameters=1 keeps params across compress calls (reuse ctx)
+            cctx.set_parameter(ZL_CParam_ZL_CParam_stickyParameters, 1)
+                .map_err(|e| anyhow!(e))?;
             cctx.set_parameter(ZL_CParam_ZL_CParam_formatVersion, version)
                 .map_err(|e| anyhow!(e))?;
             cctx.set_parameter(ZL_CParam_ZL_CParam_compressionLevel, compression_level)
                 .map_err(|e| anyhow!(e))?;
-            drop(cctx);
-            Ok(Self { level: compression_level, version })
+            Ok(Self { cctx, level: compression_level })
         }
 
         pub fn compress(&mut self, input: &[u8]) -> Result<Vec<u8>> {
-            use openzl_sys_rs::*;
-            // OpenZL contexts are single-use: create per call
-            let mut cctx = ZlCCtx::new().ok_or_else(|| anyhow!("ZL_CCtx_create failed"))?;
-            cctx.set_parameter(ZL_CParam_ZL_CParam_formatVersion, self.version)
-                .map_err(|e| anyhow!(e))?;
-            cctx.set_parameter(ZL_CParam_ZL_CParam_compressionLevel, self.level)
-                .map_err(|e| anyhow!(e))?;
+            use openzl_sys_rs::zl_compress_bound;
             let bound = zl_compress_bound(input.len());
             let mut output = vec![0u8; bound];
-            let compressed_size = cctx.compress(&mut output, input)
+            let compressed_size = self.cctx.compress(&mut output, input)
                 .map_err(|e| anyhow!(e))?;
             output.truncate(compressed_size);
             Ok(output)
