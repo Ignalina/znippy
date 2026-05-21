@@ -48,10 +48,8 @@ fn bench_roundtrip(label: &str, entries: Vec<ArchiveEntry>) -> Result<BenchResul
     let report = compressor.finish()?;
     let compress_ms = t0.elapsed().as_millis();
 
-    // Measure output size
-    let znippy_size = fs::metadata(&archive_path)?.len();
-    let zdata_size = fs::metadata(archive_path.with_extension("zdata"))?.len();
-    let output_size = znippy_size + zdata_size;
+    // Measure output size (v2: single file, no .zdata)
+    let output_size = fs::metadata(&archive_path)?.len();
 
     // Decompress
     let decomp_dir = TempDir::new()?;
@@ -258,6 +256,7 @@ impl BenchResult {
 
 /// Download and cache a large Java project's dependencies (~2GB).
 /// Uses POM parser + transitive resolver to fetch JARs from Maven Central.
+#[cfg(feature = "resolve")]
 fn prepare_java_deps() -> PathBuf {
     let java_dir = cache_dir().join("java-deps");
     let marker = java_dir.join(".done");
@@ -512,6 +511,7 @@ fn decompress_zip_entry(data: &[u8], offset: usize, compression: u16, comp_size:
 
 #[test]
 #[ignore]
+#[cfg(feature = "resolve")]
 fn perf_real_java_deps() -> Result<()> {
     let java_dir = prepare_java_deps();
     if !java_dir.join(".done").exists() {
