@@ -12,15 +12,18 @@ readme = "../README.md"
 categories = ["compression", "filesystem", "data-structures"]    
 keywords = ["compression", "zstd", "parallel", "arrow", "blake3"]
 
+[features]
+default = ["zstd"]
+zstd = ["znippy-compress/zstd", "znippy-decompress/zstd", "znippy-common/zstd"]
+openzl = ["znippy-compress/openzl", "znippy-decompress/openzl", "znippy-common/openzl"]
+
 [dependencies]
 clap = { version = "4.5.51", features = ["derive"] }
 anyhow = { version = "1.0.100" }
-#znippy-compress = { path = "../znippy-compress" }
-znippy-compress = { version = "0.2.5" }
-#"znippy-decompress = { path ="../znippy-decompress" }
-znippy-decompress = { version = "0.2.5" }
-
-#znippy-common = { path ="../znippy-common" }
-znippy-common = { version = "0.2.5" }
-
+#znippy-compress = { path = "../znippy-compress", default-features = false }
+znippy-compress = { version = "0.2.5", default-features = false }
+#znippy-decompress = { path ="../znippy-decompress", default-features = false }
+znippy-decompress = { version = "0.2.5", default-features = false }
+#znippy-common = { path ="../znippy-common", default-features = false }
+znippy-common = { version = "0.2.5", default-features = false }
 env_logger = { version = "0.11.8" }

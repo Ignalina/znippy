@@ -15,7 +15,12 @@ keywords = ["compression", "zstd", "parallel", "arrow", "blake3"]
 
 
 
+[features]
+default = ["zstd"]
+zstd = ["znippy-common/zstd"]
+openzl = ["znippy-common/openzl"]
+
 [dependencies]
 anyhow = "1.0.100"
-#znippy-common = { path = "../znippy-common" }
-znippy-common = { version = "0.2.5" }
+#znippy-common = { path = "../znippy-common", default-features = false }
+znippy-common = { version = "0.2.5", default-features = false }
