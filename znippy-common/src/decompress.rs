@@ -71,7 +71,7 @@ pub fn decompress_archive(
 
     let (tx_return, rx_return): (Sender<(u8, u64)>, Receiver<(u8, u64)>) = unbounded();
 
-    // chunk: skickar decompressor til writer
+    // chunk: skickar decompressor → writer (ownership transfer, no copy)
     let (chunk_tx, chunk_rx): (Sender<(ChunkMeta, Vec<u8>)>, Receiver<_>) =
         bounded(config.max_core_in_flight);
 
@@ -401,10 +401,68 @@ pub fn decompress_archive(
         decompressor_threads.push(handle);
     }
 
-    // [WRITER]
-
+    // [VERIFY THREADS] — one per checksum group, run in parallel with writer
     let expected_checksums = file_checksums.unwrap_or_default();
     let num_groups = expected_checksums.len();
+
+    // [VERIFY THREADS] — one per checksum group, run in parallel with writer.
+    // Writer moves Vec<u8> ownership to the correct group channel after writing to disk.
+    // No Arc, no clone — pure ownership transfer.
+    let (verify_txs, verify_threads): (Vec<_>, Vec<_>) = (0..num_groups)
+        .map(|grp_idx| {
+            let (vtx, vrx): (Sender<(u32, Vec<u8>)>, Receiver<(u32, Vec<u8>)>) = bounded(64);
+            let expected = expected_checksums[grp_idx];
+            let handle = thread::spawn(move || -> (bool, u64) {
+                let mut hasher = Hasher::new();
+                let mut next_seq: u32 = 0;
+                let mut pending: std::collections::BTreeMap<u32, Vec<u8>> =
+                    std::collections::BTreeMap::new();
+                let mut total_bytes: u64 = 0;
+
+                while let Ok((seq, data)) = vrx.recv() {
+                    if seq == next_seq {
+                        hasher.update(&data);
+                        total_bytes += data.len() as u64;
+                        next_seq += 1;
+                        // Drain buffered sequential chunks
+                        while let Some(buffered) = pending.remove(&next_seq) {
+                            hasher.update(&buffered);
+                            total_bytes += buffered.len() as u64;
+                            next_seq += 1;
+                        }
+                    } else {
+                        pending.insert(seq, data);
+                    }
+                }
+                // Drain remaining
+                while let Some((&seq, _)) = pending.iter().next() {
+                    if seq == next_seq {
+                        let buffered = pending.remove(&seq).unwrap();
+                        hasher.update(&buffered);
+                        total_bytes += buffered.len() as u64;
+                        next_seq += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                let computed = *hasher.finalize().as_bytes();
+                let ok = computed == expected;
+                if ok {
+                    log::debug!("[verify] checksum_group {} OK", grp_idx);
+                } else {
+                    log::error!(
+                        "[verify] checksum_group {} MISMATCH: expected {}, got {}",
+                        grp_idx,
+                        hex::encode(expected),
+                        hex::encode(computed)
+                    );
+                }
+                (ok, total_bytes)
+            });
+            (vtx, handle)
+        })
+        .unzip();
 
     let writer_thread = thread::spawn(move || -> WriterStats {
         let mut total_chunks = 0u64;
@@ -421,9 +479,6 @@ pub fn decompress_archive(
 
         let mut total_written_bytes = 0u64;
 
-        // Checksum verification: collect (chunk_seq, data) per group, hash in order at end
-        let mut group_chunks: Vec<Vec<(u32, Vec<u8>)>> = vec![Vec::new(); num_groups];
-
         let mut open_files: HashMap<usize, File> = HashMap::new();
         let mut chunks_written: HashMap<usize, usize> = HashMap::new();
         let mut expected_chunks: HashMap<usize, usize> = HashMap::new();
@@ -431,12 +486,6 @@ pub fn decompress_archive(
         let mut peak_open = 0usize;
         let mut created_dirs: HashSet<PathBuf> = HashSet::new();
         while let Ok((chunk_meta, data)) = chunk_rx_cloned.recv() {
-            // Collect data for checksum verification
-            let grp = chunk_meta.checksum_group as usize;
-            if grp < num_groups {
-                group_chunks[grp].push((chunk_meta.chunk_seq, data.clone()));
-            }
-
             total_chunks += 1;
             total_written_bytes += data.len() as u64;
 
@@ -492,6 +541,12 @@ pub fn decompress_archive(
                     }
                 }
             }
+
+            // Move ownership to verify thread (no copy — writer is done with data)
+            let grp = chunk_meta.checksum_group as usize;
+            if grp < num_groups {
+                let _ = verify_txs[grp].send((chunk_meta.chunk_seq, data));
+            }
         }
 
         for (_, file) in open_files {
@@ -499,37 +554,25 @@ pub fn decompress_archive(
             current_open -= 1;
         }
 
-        // Verify checksums: sort each group by chunk_seq, hash in order, compare
+        // Drop verify senders so verify threads finish
+        drop(verify_txs);
+
+        // Collect verify results
         let mut verified_files = 0usize;
         let mut corrupt_files = 0usize;
         let mut verified_bytes = 0u64;
         let mut corrupt_bytes = 0u64;
 
-        for (grp_idx, mut chunks) in group_chunks.into_iter().enumerate() {
-            chunks.sort_by_key(|(seq, _)| *seq);
-            let mut hasher = Hasher::new();
-            let mut grp_bytes = 0u64;
-            for (_, data) in &chunks {
-                hasher.update(data);
-                grp_bytes += data.len() as u64;
-            }
-            let computed = *hasher.finalize().as_bytes();
-            if computed == expected_checksums[grp_idx] {
-                verified_bytes += grp_bytes;
-                log::debug!("[verify] checksum_group {} OK", grp_idx);
+        for handle in verify_threads {
+            let (ok, bytes) = handle.join().expect("verify thread panicked");
+            if ok {
+                verified_bytes += bytes;
             } else {
-                corrupt_bytes += grp_bytes;
+                corrupt_bytes += bytes;
                 corrupt_files += 1;
-                log::error!(
-                    "[verify] checksum_group {} MISMATCH: expected {}, got {}",
-                    grp_idx,
-                    hex::encode(expected_checksums[grp_idx]),
-                    hex::encode(computed)
-                );
             }
         }
 
-        // If all groups verified, count total files as verified
         if corrupt_files == 0 && num_groups > 0 {
             verified_files = batch_cloned_for_writer.num_rows();
         }
