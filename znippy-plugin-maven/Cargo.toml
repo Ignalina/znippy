@@ -9,4 +9,4 @@ license = "MIT"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-zip = { version = "2", default-features = false, features = ["deflate"] }
+miniz_oxide = "0.8"

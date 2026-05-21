@@ -318,3 +318,92 @@ znippy extract nexus-dump.znippy --group maven/ --out ./maven-mirror/
    - `znippy extract --group maven/libs-release` (prefix match)
    - `znippy list --extension holger_nexus_v1` (show extension fields)
 
+---
+
+## Section 5: Plugin System — Native + WASM with Host Services
+
+### Architecture
+
+WASM plugins run sandboxed but get native multi-core decompression via host functions.
+No threading inside WASM — all parallelism happens on the host side.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Host (znippy-common)                                       │
+│                                                             │
+│  ┌───────────┐  ┌────────────┐  ┌───────────┐              │
+│  │  ljar-rs  │  │ lbzip2-rs  │  │  lgz-rs   │  Native,     │
+│  │  (rayon)  │  │ (workers/  │  │ (parallel │  multi-core   │
+│  │           │  │  core)     │  │  gzip)    │              │
+│  └─────▲─────┘  └─────▲──────┘  └─────▲─────┘              │
+│        │               │               │                    │
+│  ══════╪═══════════════╪═══════════════╪════ wasmtime ═══╗  │
+│  ║     │               │               │                ║  │
+│  ║  ┌──┴───────────────┴───────────────┴──────────┐     ║  │
+│  ║  │  Host Functions (Linker)                    │     ║  │
+│  ║  │  • host_decompress(ptr, len, codec) → bytes │     ║  │
+│  ║  │  • host_archive_open(ptr, len, fmt) → hndl  │     ║  │
+│  ║  │  • host_archive_entry(hndl, name) → bytes   │     ║  │
+│  ║  │  • host_archive_list(hndl) → JSON           │     ║  │
+│  ║  │  • host_archive_close(hndl)                 │     ║  │
+│  ║  └──▲──────────────────────────▲───────────────┘     ║  │
+│  ║     │                          │                     ║  │
+│  ║  ┌──┴────────┐  ┌─────────────┴──┐  ┌───────────┐   ║  │
+│  ║  │  maven    │  │    image       │  │  custom   │   ║  │
+│  ║  │  .wasm    │  │    .wasm       │  │  .wasm    │   ║  │
+│  ║  │  (185KB)  │  │    (EXIF)      │  │  (user)   │   ║  │
+│  ║  └───────────┘  └────────────────┘  └───────────┘   ║  │
+│  ╚══════════════════════════════════════════════════════╝  │
+│                                                             │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  Native Plugins (compiled in, zero overhead)          │  │
+│  │  • CargoPlugin — filename parse, no decompression     │  │
+│  │  • (future: npm, docker, etc.)                        │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Host Function API
+
+WASM plugins import these from `"env"`:
+
+| Function | Signature | Returns |
+|----------|-----------|---------|
+| `host_decompress` | `(ptr, len, codec) → u64` | `(out_ptr << 32) \| out_len` |
+| `host_archive_open` | `(ptr, len, format) → u32` | Handle |
+| `host_archive_list` | `(handle) → u64` | JSON `["name1","name2",...]` |
+| `host_archive_entry` | `(handle, name_ptr, name_len) → u64` | Raw bytes of entry |
+| `host_archive_close` | `(handle)` | — |
+
+**Codec IDs:** 0=deflate, 1=gzip(lgz), 2=bzip2(lbzip2), 3=zstd
+
+**Archive Format IDs:** 0=jar/zip(ljar), 1=tar.gz, 2=tar.bz2
+
+### Data Flow
+
+All data crosses the WASM boundary as raw bytes `(ptr, len)`:
+- Host calls plugin's `alloc(size)` to get writeable WASM memory
+- Writes result bytes there, returns packed `(ptr << 32 | len)` as u64
+- Plugin unpacks: `ptr = result >> 32`, `len = result & 0xFFFFFFFF`
+- No serialization for binary data — strings are UTF-8 bytes
+
+### Native vs WASM Decision Matrix
+
+| Factor | Native | WASM |
+|--------|--------|------|
+| Latency | ~5μs/call | ~50μs/call |
+| Decompression | Direct (multi-core) | Via host functions (multi-core) |
+| Updatable | Recompile znippy | Drop in new .wasm |
+| Sandbox | None (full trust) | Full isolation |
+| Use for | Built-in types (cargo, npm) | Third-party, user plugins |
+
+### Backend Integration Plan
+
+| Backend | Library | Threading Model | Status |
+|---------|---------|-----------------|--------|
+| JAR/ZIP | ljar-rs | rayon thread pool | ✅ Minimal fallback, native TODO |
+| Bzip2 | lbzip2-rs | workers-per-core (no rayon) | 🔲 Wire to host_decompress |
+| Gzip | lgz-rs | parallel (planned) | 🔲 Pending lgz creation |
+| Zstd | znippy codec | znippy's own thread pool | ✅ Wired via codec layer |
+
+
