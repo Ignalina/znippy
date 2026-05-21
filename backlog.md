@@ -17,15 +17,25 @@
 ### Performance
 
 #### P1: mixed_repo compress regression (-68% vs v0.3)
-The `extend_from_slice` concatenation in `build_batch_zero_copy` still copies each
-chunk's bytes into one contiguous `Vec<u8>` for Arrow's LargeBinaryArray. The old
-.zdata format just did sequential `write()` syscalls — zero userspace copies.
+Two copies remain in the write path, both confirmed unavoidable within Arrow IPC:
+
+1. `build_batch_zero_copy`: `extend_from_slice` concatenates chunks into one contiguous
+   `Vec<u8>` for Arrow's LargeBinaryArray (required by Arrow columnar format).
+2. Arrow IPC `write_buffer()` (arrow-ipc writer.rs:2083): unconditionally does
+   `arrow_data.extend_from_slice(buffer)` to assemble all column buffers into one
+   contiguous `EncodedData.arrow_data: Vec<u8>` before writing to file.
+
+This is a known limitation: [apache/arrow-rs#9835](https://github.com/apache/arrow-rs/issues/9835).
+Arrow IPC has no scatter-gather or `write_vectored` support as of v57 (2025).
+Zero-copy writing requires shared memory (mmap), not supported for file serialization.
+
+The old .zdata format did sequential `write()` syscalls — zero userspace copies.
 
 **Possible fixes:**
-- Use Arrow's `write_all` with a custom `ArrayData` backed by multiple buffers (scatter-gather I/O)
-- Bypass Arrow IPC for the zdata column entirely: write a raw data section after the Arrow
-  footer (hybrid format — metadata in Arrow, data in raw appendix)
-- Investigate Arrow IPC LZ4/ZSTD body compression to let Arrow handle the column natively
+- Hybrid format: Arrow IPC for metadata + raw data appendix for zdata bytes
+  (write zdata after Arrow footer, store offset/length in footer metadata)
+- Wait for arrow-rs scatter-gather write support (tracked in #9835)
+- Accept as inherent trade-off of queryable single-file format
 
 #### P2: decompress regression for incompressible data (-34%)
 Reading LargeBinaryArray from Arrow IPC has more overhead than seeking into a flat file.
