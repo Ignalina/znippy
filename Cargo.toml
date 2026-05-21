@@ -5,8 +5,13 @@ members = [
     "znippy-decompress",
     "znippy-cli", 
     "znippy-common",
-     "znippy"
+    "znippy",
+    "tests",
 ]
 resolver = "2"
 
-
+[patch.crates-io]
+znippy-common = { path = "znippy-common" }
+znippy-compress = { path = "znippy-compress" }
+znippy-decompress = { path = "znippy-decompress" }
+znippy-cli = { path = "znippy-cli" }

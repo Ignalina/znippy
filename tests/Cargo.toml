@@ -1,0 +1,13 @@
+[package]
+name = "znippy-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+znippy-compress = { path = "../znippy-compress" }
+znippy-common = { path = "../znippy-common" }
+anyhow = "1.0.100"
+tempfile = "3"
+env_logger = "0.11.8"
+walkdir = "2.5.0"
