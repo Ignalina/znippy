@@ -345,12 +345,7 @@ fn bzip2_decompress(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn zstd_decompress(data: &[u8]) -> Option<Vec<u8>> {
-    #[cfg(feature = "zstd")]
-    {
-        crate::codec::decompress_frame(data).ok()
-    }
-    #[cfg(not(feature = "zstd"))]
-    { None }
+    crate::codec::decompress_frame(data).ok()
 }
 
 /// List entries in a JAR/ZIP using ljar-rs central directory scanner

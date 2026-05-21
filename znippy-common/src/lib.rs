@@ -3,6 +3,7 @@ extern crate core;
 pub mod codec;
 pub mod common_config;
 pub mod index;
+pub mod archive;
 mod int_ring;
 pub use int_ring::{ChunkQueue, RingBuffer};
 
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 pub mod decompress;
 mod skip;
 
+pub use archive::{ZnippyArchive, ZnippyReader};
 pub use decompress::decompress_archive;
 
 pub use index::{

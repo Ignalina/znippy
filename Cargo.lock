@@ -2894,7 +2894,6 @@ dependencies = [
  "sysinfo",
  "tar",
  "wasmtime",
- "zstd-sys-rs",
 ]
 
 [[package]]
@@ -2906,10 +2905,8 @@ dependencies = [
  "blake3",
  "crossbeam-channel",
  "log",
- "openzl-sys-rs",
  "walkdir",
  "znippy-common",
- "zstd-sys-rs",
 ]
 
 [[package]]
@@ -2965,16 +2962,4 @@ checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
 dependencies = [
  "cc",
  "pkg-config",
-]
-
-[[package]]
-name = "zstd-sys-rs"
-version = "1.5.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a60912227971e8c3d3613d12463245f156c07e9503e806f311c7c5eaba1a49a4"
-dependencies = [
- "bindgen",
- "cc",
- "glob",
- "libc",
 ]
