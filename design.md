@@ -1,5 +1,50 @@
 # Znippy Design Document
 
+## Design Laws
+
+### Law 1: Zero-Copy Channel Communication
+
+All inter-thread communication passes **offsets/indices into shared memory**, never data copies.
+
+- ChunkRevolver is a pre-allocated ring buffer of fixed slots
+- Producer writes data into slot N, sends only the slot index (usize) through the channel
+- Consumer receives the index, reads directly from the shared buffer at that offset
+- No `Vec<u8>` cloning, no channel-carried payloads — only pointer-sized messages
+
+**Rationale**: On 32 cores saturating NVMe (~7 GB/s), memcpy overhead from channel payloads
+would halve throughput. Sending an 8-byte offset instead of a 10MB chunk eliminates
+this entirely. The ring buffer also provides natural backpressure (producer blocks when
+all slots are in-flight).
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Shared Ring Buffer (ChunkRevolver)                  │
+│  [slot 0][slot 1][slot 2]...[slot N-1]              │
+└─────────────────────────────────────────────────────┘
+      ↑ write                    ↑ read
+      │                          │
+  Reader Thread              Compressor Thread
+      │                          │
+      └── channel.send(3) ──────→│  (only sends slot index = 3)
+                                 │
+                                 └── reads buffer[3] directly (zero copy)
+```
+
+### Law 2: No Allocation in Hot Path
+
+Compressor threads reuse their buffers across chunks:
+- ZSTD/OpenZL context is long-lived (created once per thread)
+- Output buffer is pre-allocated and reused
+- blake3 Hasher is `.update()`'d incrementally, never reallocated
+
+### Law 3: Deterministic Checksums Independent of Core Count
+
+blake3 checksum groups are bound to **chunk_seq** ordering, not thread identity.
+Any machine with any number of cores reproduces the same checksums by sorting
+decompressed chunks by chunk_seq before hashing.
+
+---
+
 ## Section 1: zstd Backend (v0.2.5, tagged `v0.2.5-zstd`)
 
 ### Format
@@ -55,12 +100,14 @@ Writer Thread
 
 | Test | In(MB) | Out(MB) | Ratio | Comp MB/s | Dec MB/s |
 |------|--------|---------|-------|-----------|----------|
-| text_500mb | 500.00 | 0.09 | 5404x | 1597 | 3086 |
-| binary_pattern_500mb | 500.00 | 0.19 | 2609x | 2463 | 3106 |
-| random_500mb (incompressible) | 500.00 | 500.04 | 1.00x | 176 | 2994 |
-| 100k_small_files_10kb | 976.56 | 12.54 | 77.9x | 3140 | 863 |
-| mixed_repo_530mb | 530.05 | 530.01 | 1.00x | 2199 | 2704 |
-| single_file_2gb | 2048.00 | 0.35 | 5868x | 3984 | 3089 |
+| text_500mb | 500.00 | 0.09 | 5404x | 1805 | 1185 |
+| binary_pattern_500mb | 500.00 | 0.19 | 2609x | 2732 | 1191 |
+| random_500mb (incompressible) | 500.00 | 500.04 | 1.00x | 179 | 1244 |
+| 100k_small_files_10kb | 976.56 | 12.54 | 77.9x | 3052 | 514 |
+| mixed_repo_530mb | 530.05 | 530.01 | 1.00x | 2637 | 974 |
+| single_file_2gb | 2048.00 | 0.35 | 5868x | 3357 | 1177 |
+
+*Run: 2025-05-21, 32-core AMD, NVMe, release build*
 
 ### Real-world data
 
