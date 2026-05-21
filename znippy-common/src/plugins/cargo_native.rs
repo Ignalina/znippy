@@ -1,67 +1,86 @@
 //! Native Cargo/crate registry plugin.
-//! Parses .crate tarballs to extract Cargo.toml metadata.
+//! Extracts crate name + version from .crate filenames (zero decompression cost).
+//! Optionally parses Cargo.toml inside the tarball for deps (only if needed).
 
 use crate::plugin::{ArchiveTypePlugin, ExtensionRow, ExtensionValue};
 use std::collections::HashMap;
-use std::io::Read;
 
-/// Native plugin that extracts crate metadata from .crate files.
-/// Reads the embedded Cargo.toml to get name, version, and dependencies.
-pub struct CargoPlugin;
+/// Native plugin that extracts crate metadata from .crate file paths.
+/// Name and version are parsed from the filename (no I/O needed).
+pub struct CargoPlugin {
+    /// If true, also decompress and parse Cargo.toml for dependency list
+    pub parse_deps: bool,
+}
 
 impl CargoPlugin {
     pub fn new() -> Self {
-        Self
+        Self { parse_deps: false }
     }
 
-    /// Parse a .crate file (gzip tar) and extract Cargo.toml contents
-    fn parse_crate_tarball(data: &[u8]) -> Option<CrateMeta> {
+    pub fn with_deps() -> Self {
+        Self { parse_deps: true }
+    }
+
+    /// Parse name and version from filename like "serde-1.0.200.crate"
+    fn parse_filename(path: &str) -> Option<(String, String)> {
+        let filename = path.rsplit('/').next()?;
+        let stem = filename.strip_suffix(".crate")?;
+        // Split at last hyphen followed by a digit (version start)
+        let mut split_pos = None;
+        for (i, c) in stem.char_indices() {
+            if c == '-' {
+                // Check if next char is a digit
+                if let Some(next) = stem[i+1..].chars().next() {
+                    if next.is_ascii_digit() {
+                        split_pos = Some(i);
+                    }
+                }
+            }
+        }
+        let pos = split_pos?;
+        let name = &stem[..pos];
+        let version = &stem[pos+1..];
+        Some((name.to_string(), version.to_string()))
+    }
+
+    /// Parse deps from .crate tarball (only when parse_deps = true)
+    #[cfg(feature = "ext-cargo")]
+    fn parse_deps_from_tarball(data: &[u8]) -> Vec<String> {
         use flate2::read::GzDecoder;
         use tar::Archive;
+        use std::io::Read;
 
         let gz = GzDecoder::new(data);
         let mut archive = Archive::new(gz);
 
-        for entry in archive.entries().ok()? {
-            let mut entry = entry.ok()?;
-            let path = entry.path().ok()?.to_string_lossy().to_string();
-            if path.ends_with("/Cargo.toml") || path == "Cargo.toml" {
-                let mut contents = String::new();
-                entry.read_to_string(&mut contents).ok()?;
-                return Self::parse_cargo_toml(&contents);
+        if let Ok(entries) = archive.entries() {
+            for entry in entries.flatten() {
+                let path = entry.path().ok().map(|p| p.to_string_lossy().to_string());
+                if let Some(p) = path {
+                    if p.ends_with("/Cargo.toml") || p == "Cargo.toml" {
+                        let mut contents = String::new();
+                        let mut entry = entry;
+                        if entry.read_to_string(&mut contents).is_ok() {
+                            return Self::extract_dep_names(&contents);
+                        }
+                    }
+                }
             }
         }
-        None
+        Vec::new()
     }
 
-    /// Parse Cargo.toml content into CrateMeta
-    fn parse_cargo_toml(contents: &str) -> Option<CrateMeta> {
-        // Simple TOML parsing — extract [package] name, version, and [dependencies] keys
-        let mut name = None;
-        let mut version = None;
+    #[cfg(feature = "ext-cargo")]
+    fn extract_dep_names(cargo_toml: &str) -> Vec<String> {
         let mut deps = Vec::new();
-        let mut in_package = false;
         let mut in_deps = false;
-
-        for line in contents.lines() {
+        for line in cargo_toml.lines() {
             let trimmed = line.trim();
-            if trimmed == "[package]" {
-                in_package = true;
-                in_deps = false;
-            } else if trimmed == "[dependencies]" || trimmed == "[dev-dependencies]" || trimmed == "[build-dependencies]" {
-                in_package = false;
-                in_deps = trimmed == "[dependencies]";
+            if trimmed == "[dependencies]" {
+                in_deps = true;
             } else if trimmed.starts_with('[') {
-                in_package = false;
                 in_deps = false;
-            } else if in_package {
-                if let Some(val) = extract_toml_string(trimmed, "name") {
-                    name = Some(val);
-                } else if let Some(val) = extract_toml_string(trimmed, "version") {
-                    version = Some(val);
-                }
             } else if in_deps {
-                // dep_name = "version" or dep_name = { version = "..." }
                 if let Some(dep_name) = trimmed.split('=').next() {
                     let dep_name = dep_name.trim();
                     if !dep_name.is_empty() && !dep_name.starts_with('#') {
@@ -70,33 +89,8 @@ impl CargoPlugin {
                 }
             }
         }
-
-        Some(CrateMeta {
-            name: name?,
-            version: version?,
-            deps,
-        })
+        deps
     }
-}
-
-/// Extract a string value from a simple TOML line like: key = "value"
-fn extract_toml_string(line: &str, key: &str) -> Option<String> {
-    let line = line.trim();
-    if !line.starts_with(key) {
-        return None;
-    }
-    let rest = line[key.len()..].trim();
-    if !rest.starts_with('=') {
-        return None;
-    }
-    let val = rest[1..].trim().trim_matches('"');
-    Some(val.to_string())
-}
-
-struct CrateMeta {
-    name: String,
-    version: String,
-    deps: Vec<String>,
 }
 
 impl ArchiveTypePlugin for CargoPlugin {
@@ -105,21 +99,24 @@ impl ArchiveTypePlugin for CargoPlugin {
     }
 
     fn type_id(&self) -> i8 {
-        2 // Extension union type_id for cargo_registry_v1
+        2
     }
 
     fn extract_metadata(&self, path: &str, data: &[u8]) -> Option<ExtensionRow> {
-        // Only process .crate files
-        if !path.ends_with(".crate") {
-            return None;
-        }
-
-        let meta = Self::parse_crate_tarball(data)?;
+        let (crate_name, version) = Self::parse_filename(path)?;
 
         let mut fields = HashMap::new();
-        fields.insert("crate_name".into(), ExtensionValue::Str(meta.name));
-        fields.insert("version".into(), ExtensionValue::Str(meta.version));
-        fields.insert("deps".into(), ExtensionValue::StrList(meta.deps));
+        fields.insert("crate_name".into(), ExtensionValue::Str(crate_name));
+        fields.insert("version".into(), ExtensionValue::Str(version));
+
+        #[cfg(feature = "ext-cargo")]
+        if self.parse_deps {
+            let deps = Self::parse_deps_from_tarball(data);
+            fields.insert("deps".into(), ExtensionValue::StrList(deps));
+        }
+
+        #[cfg(not(feature = "ext-cargo"))]
+        let _ = data; // suppress unused warning
 
         Some(ExtensionRow { fields })
     }
