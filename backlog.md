@@ -16,34 +16,15 @@
 
 ### Performance
 
-#### P1: mixed_repo compress regression (-68% vs v0.3)
-Two copies remain in the write path, both confirmed unavoidable within Arrow IPC:
+#### ~~P1: mixed_repo compress regression (-68% vs v0.3)~~ ✅ FIXED
+Solved by hybrid format (v2.1): raw data section + Arrow IPC Stream for metadata.
+Write path now does zero userspace copies — chunk bytes go directly to file.
+mixed_repo recovered from 901 → 2775 MB/s (v0.3 was 2850).
 
-1. `build_batch_zero_copy`: `extend_from_slice` concatenates chunks into one contiguous
-   `Vec<u8>` for Arrow's LargeBinaryArray (required by Arrow columnar format).
-2. Arrow IPC `write_buffer()` (arrow-ipc writer.rs:2083): unconditionally does
-   `arrow_data.extend_from_slice(buffer)` to assemble all column buffers into one
-   contiguous `EncodedData.arrow_data: Vec<u8>` before writing to file.
-
-This is a known limitation: [apache/arrow-rs#9835](https://github.com/apache/arrow-rs/issues/9835).
-Arrow IPC has no scatter-gather or `write_vectored` support as of v57 (2025).
-Zero-copy writing requires shared memory (mmap), not supported for file serialization.
-
-The old .zdata format did sequential `write()` syscalls — zero userspace copies.
-
-**Possible fixes:**
-- Hybrid format: Arrow IPC for metadata + raw data appendix for zdata bytes
-  (write zdata after Arrow footer, store offset/length in footer metadata)
-- Wait for arrow-rs scatter-gather write support (tracked in #9835)
-- Accept as inherent trade-off of queryable single-file format
-
-#### P2: decompress regression for incompressible data (-34%)
-Reading LargeBinaryArray from Arrow IPC has more overhead than seeking into a flat file.
-The IPC reader must parse flatbuffers, validate offsets, etc.
-
-**Possible fixes:**
-- Memory-map the file and use zero-copy Arrow IPC reading (`arrow::ipc::reader` with mmap)
-- Pre-read the entire file into memory and use `FileReader` from a `Cursor<Vec<u8>>`
+#### ~~P2: decompress regression for incompressible data (-34%)~~ ✅ FIXED
+Solved by hybrid format: reader now seeks directly in raw section (sequential I/O).
+No Arrow IPC parsing overhead for data bytes.
+random decompress: 3125 MB/s (was 2110, +48% improvement).
 
 #### P3: Investigate Arrow IPC compression (body-level)
 Arrow IPC supports LZ4 Frame and ZSTD body compression (per-batch).
@@ -75,13 +56,13 @@ pub fn compress_dir(input: &Path, output: &Path, no_skip: bool) -> Result<Compre
 Extension DenseUnion column currently always null. Wire up plugin metadata
 injection for the first chunk of each file.
 
-## Performance Baseline (v0.4.0, 32-core AMD, NVMe, release)
+## Performance Baseline (v0.4.1 hybrid, 32-core AMD, NVMe, release)
 
 | Test | Compress MB/s | Decompress MB/s | Ratio |
 |------|--------------|----------------|-------|
-| text_500mb | 1618 | 3030 | 4420x |
-| binary_pattern_500mb | 2551 | 3125 | 2340x |
-| random_500mb | 181 | 2110 | 1.0x |
-| 100k_small_files_10kb | 3120 | 833 | 67x |
-| mixed_repo_530mb | 901 | 1688 | 1.0x |
-| single_file_2gb | 3537 | 3677 | 4659x |
+| text_500mb | 1712 | 2959 | 4318x |
+| binary_pattern_500mb | 2427 | 3106 | 2311x |
+| random_500mb | 184 | 3125 | 1.0x |
+| 100k_small_files_10kb | 3344 | 739 | 64x |
+| mixed_repo_530mb | 2775 | 2718 | 1.0x |
+| single_file_2gb | 3346 | 3431 | 4510x |
