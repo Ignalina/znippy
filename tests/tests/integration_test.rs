@@ -285,7 +285,7 @@ fn test_index_schema_fields() {
     let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(
         field_names,
-        vec!["relative_path", "compressed", "uncompressed_size", "chunks"]
+        vec!["relative_path", "compressed", "uncompressed_size", "group", "chunks", "extension"]
     );
 }
 
