@@ -6,6 +6,7 @@ members = [
     "znippy-cli", 
     "znippy-common",
     "znippy",
+    "znippy-plugin-maven",
     "tests",
 ]
 resolver = "2"
