@@ -2,30 +2,36 @@
 
 use arrow::array::*;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::common_config::{CONFIG, StrategicConfig};
+use crate::common_config::StrategicConfig;
 use crate::{ChunkMeta, FileMeta, decompress_archive};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use arrow::array::{
     Array, ArrayBuilder, ArrayRef, BooleanArray, BooleanBuilder, FixedSizeBinaryArray, ListArray,
     ListBuilder, StringArray, StringBuilder, StructArray, StructBuilder, UInt64Array,
     UInt64Builder, make_builder,
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema, UnionFields, UnionMode};
-use arrow::ipc::reader::FileReader;
 use arrow::record_batch::RecordBatch;
 use once_cell::sync::Lazy;
 
-/// v2 schema: one row per chunk, zdata inline
+/// File magic for the hybrid format (v2.1): raw data + Arrow IPC Stream metadata
+pub const ZNIPPY_MAGIC: &[u8; 8] = b"ZNIPV21\0";
+/// Trailer magic (last 4 bytes of file)
+pub const ZNIPPY_TRAILER_MAGIC: &[u8; 4] = b"ZNIP";
+
+/// v2.1 schema: metadata-only (no zdata column — data is in raw section)
 pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("relative_path", DataType::Utf8, false),
         Field::new("chunk_seq", DataType::UInt32, false),
         Field::new("fdata_offset", DataType::UInt64, false),
+        Field::new("archive_offset", DataType::UInt64, false),
+        Field::new("compressed_size", DataType::UInt64, false),
         Field::new("checksum_group", DataType::UInt8, false),
         Field::new("compressed", DataType::Boolean, false),
         Field::new("uncompressed_size", DataType::UInt64, false),
@@ -38,7 +44,6 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
             ),
             true,
         ),
-        Field::new("zdata", DataType::LargeBinary, false),
     ]))
 });
 
@@ -246,7 +251,6 @@ pub fn build_arrow_batch_from_files(
     files: &[FileMeta],
     input_dir: &Path,
 ) -> arrow::error::Result<RecordBatch> {
-    // Convert old FileMeta format to chunk rows for the v2 schema
     let mut rows: Vec<ChunkRow> = Vec::new();
     for file in files {
         let full_path = Path::new(&file.relative_path);
@@ -257,16 +261,16 @@ pub fn build_arrow_batch_from_files(
             .to_string();
 
         if file.chunks.is_empty() {
-            // Empty file: one row with empty zdata
             rows.push(ChunkRow {
                 relative_path: rel_path,
                 chunk_seq: 0,
                 fdata_offset: 0,
+                archive_offset: 0,
+                compressed_size: 0,
                 checksum_group: 0,
                 compressed: file.compressed,
                 uncompressed_size: 0,
                 repo: None,
-                zdata: Vec::new(),
             });
         } else {
             for chunk in &file.chunks {
@@ -274,11 +278,12 @@ pub fn build_arrow_batch_from_files(
                     relative_path: rel_path.clone(),
                     chunk_seq: chunk.chunk_seq,
                     fdata_offset: chunk.fdata_offset,
+                    archive_offset: chunk.archive_offset,
+                    compressed_size: chunk.compressed_size,
                     checksum_group: chunk.checksum_group,
                     compressed: chunk.compressed,
                     uncompressed_size: chunk.uncompressed_size,
                     repo: None,
-                    zdata: Vec::new(), // zdata filled by caller
                 });
             }
         }
@@ -286,22 +291,23 @@ pub fn build_arrow_batch_from_files(
     build_arrow_batch_from_chunks(&rows)
 }
 
-/// A single chunk row for the v2 format
+/// A single chunk row for the v2.1 format (metadata only, no zdata)
 #[derive(Debug, Clone)]
 pub struct ChunkRow {
     pub relative_path: String,
     pub chunk_seq: u32,
     pub fdata_offset: u64,
+    pub archive_offset: u64,
+    pub compressed_size: u64,
     pub checksum_group: u8,
     pub compressed: bool,
     pub uncompressed_size: u64,
     pub repo: Option<String>,
-    pub zdata: Vec<u8>,
 }
 
-/// Build a RecordBatch from chunk rows (v2 single-file format)
+/// Build a RecordBatch from chunk rows (v2.1 hybrid format — metadata only)
 pub fn build_arrow_batch_from_chunks(rows: &[ChunkRow]) -> arrow::error::Result<RecordBatch> {
-    use arrow::array::{LargeBinaryBuilder, UInt32Builder, UInt8Builder};
+    use arrow::array::{UInt32Builder, UInt8Builder};
 
     let schema = ZNIPPY_INDEX_SCHEMA.as_ref().clone();
     let len = rows.len();
@@ -309,16 +315,19 @@ pub fn build_arrow_batch_from_chunks(rows: &[ChunkRow]) -> arrow::error::Result<
     let mut path_builder = StringBuilder::with_capacity(len, len * 64);
     let mut seq_builder = UInt32Builder::with_capacity(len);
     let mut fdata_builder = UInt64Builder::with_capacity(len);
+    let mut archive_builder = UInt64Builder::with_capacity(len);
+    let mut csize_builder = UInt64Builder::with_capacity(len);
     let mut group_builder = UInt8Builder::with_capacity(len);
     let mut compressed_builder = BooleanBuilder::with_capacity(len);
     let mut size_builder = UInt64Builder::with_capacity(len);
     let mut repo_builder = StringBuilder::new();
-    let mut zdata_builder = LargeBinaryBuilder::new();
 
     for row in rows {
         path_builder.append_value(&row.relative_path);
         seq_builder.append_value(row.chunk_seq);
         fdata_builder.append_value(row.fdata_offset);
+        archive_builder.append_value(row.archive_offset);
+        csize_builder.append_value(row.compressed_size);
         group_builder.append_value(row.checksum_group);
         compressed_builder.append_value(row.compressed);
         size_builder.append_value(row.uncompressed_size);
@@ -326,7 +335,6 @@ pub fn build_arrow_batch_from_chunks(rows: &[ChunkRow]) -> arrow::error::Result<
             Some(r) => repo_builder.append_value(r),
             None => repo_builder.append_null(),
         }
-        zdata_builder.append_value(&row.zdata);
     }
 
     RecordBatch::try_new(
@@ -335,20 +343,20 @@ pub fn build_arrow_batch_from_chunks(rows: &[ChunkRow]) -> arrow::error::Result<
             Arc::new(path_builder.finish()),
             Arc::new(seq_builder.finish()),
             Arc::new(fdata_builder.finish()),
+            Arc::new(archive_builder.finish()),
+            Arc::new(csize_builder.finish()),
             Arc::new(group_builder.finish()),
             Arc::new(compressed_builder.finish()),
             Arc::new(size_builder.finish()),
             Arc::new(repo_builder.finish()),
             Arc::new(new_null_union_array(len)),
-            Arc::new(zdata_builder.finish()),
         ],
     )
 }
 
-/// Build a RecordBatch directly from (ChunkMeta, compressed_data) pairs.
-/// Zero-copy for the zdata column: concatenates all data into one buffer
-/// and constructs LargeBinaryArray from offsets + values without per-row copies.
-pub fn build_batch_zero_copy<F>(
+/// Build a metadata-only RecordBatch from (ChunkMeta, compressed_data) pairs.
+/// No zdata column — data is written separately to the raw section.
+pub fn build_metadata_batch<F>(
     chunks: &[(ChunkMeta, Arc<[u8]>)],
     path_resolver: F,
 ) -> arrow::error::Result<RecordBatch>
@@ -356,7 +364,6 @@ where
     F: Fn(u64) -> String,
 {
     use arrow::array::{UInt32Builder, UInt8Builder};
-    use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 
     let schema = ZNIPPY_INDEX_SCHEMA.as_ref().clone();
     let len = chunks.len();
@@ -364,36 +371,24 @@ where
     let mut path_builder = StringBuilder::with_capacity(len, len * 64);
     let mut seq_builder = UInt32Builder::with_capacity(len);
     let mut fdata_builder = UInt64Builder::with_capacity(len);
+    let mut archive_builder = UInt64Builder::with_capacity(len);
+    let mut csize_builder = UInt64Builder::with_capacity(len);
     let mut group_builder = UInt8Builder::with_capacity(len);
     let mut compressed_builder = BooleanBuilder::with_capacity(len);
     let mut size_builder = UInt64Builder::with_capacity(len);
     let mut repo_builder = StringBuilder::new();
 
-    // Build zdata as zero-copy: compute total size, allocate once, memcpy each chunk
-    let total_bytes: usize = chunks.iter().map(|(_, data)| data.len()).sum();
-    let mut values_buf: Vec<u8> = Vec::with_capacity(total_bytes);
-    let mut offsets: Vec<i64> = Vec::with_capacity(len + 1);
-    offsets.push(0);
-
-    for (meta, data) in chunks {
+    for (meta, _data) in chunks {
         path_builder.append_value(path_resolver(meta.file_index));
         seq_builder.append_value(meta.chunk_seq);
         fdata_builder.append_value(meta.fdata_offset);
+        archive_builder.append_value(meta.archive_offset);
+        csize_builder.append_value(meta.compressed_size);
         group_builder.append_value(meta.checksum_group);
         compressed_builder.append_value(meta.compressed);
         size_builder.append_value(meta.uncompressed_size);
         repo_builder.append_null(); // TODO: support repo column
-
-        values_buf.extend_from_slice(data);
-        offsets.push(values_buf.len() as i64);
     }
-
-    // Construct LargeBinaryArray from raw buffers (one allocation, no per-row copy)
-    let offsets_buffer = OffsetBuffer::new(ScalarBuffer::from(offsets));
-    let values_buffer = Buffer::from_vec(values_buf);
-    let zdata_array = unsafe {
-        arrow_array::LargeBinaryArray::new_unchecked(offsets_buffer, values_buffer, None)
-    };
 
     RecordBatch::try_new(
         Arc::new(schema),
@@ -401,12 +396,13 @@ where
             Arc::new(path_builder.finish()),
             Arc::new(seq_builder.finish()),
             Arc::new(fdata_builder.finish()),
+            Arc::new(archive_builder.finish()),
+            Arc::new(csize_builder.finish()),
             Arc::new(group_builder.finish()),
             Arc::new(compressed_builder.finish()),
             Arc::new(size_builder.finish()),
             Arc::new(repo_builder.finish()),
             Arc::new(new_null_union_array(len)),
-            Arc::new(zdata_array),
         ],
     )
 }
@@ -552,29 +548,43 @@ pub fn build_holger_nexus_union(entries: &[Option<HolgerNexusExt>]) -> arrow::ar
     ).unwrap()
 }
 
+/// Read a znippy hybrid archive: trailer → Arrow IPC Stream metadata.
+/// Returns (schema_with_metadata, batches).
 pub fn read_znippy_index(path: &Path) -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
-    let file = File::open(path)?;
-    let reader = FileReader::try_new(BufReader::new(file), None)?;
+    use arrow::ipc::reader::StreamReader;
+
+    let mut file = File::open(path)?;
+
+    // Read trailer: last 12 bytes = [arrow_start: u64 LE][magic: "ZNIP"]
+    file.seek(SeekFrom::End(-12))?;
+    let mut trailer = [0u8; 12];
+    file.read_exact(&mut trailer)?;
+
+    let magic = &trailer[8..12];
+    if magic != ZNIPPY_TRAILER_MAGIC {
+        return Err(anyhow::anyhow!("Not a valid znippy file (bad trailer magic)"));
+    }
+    let arrow_start = u64::from_le_bytes(trailer[0..8].try_into().unwrap());
+
+    // Read Arrow IPC Stream from arrow_start to EOF-12
+    let file_len = file.seek(SeekFrom::End(0))?;
+    let stream_len = file_len - 12 - arrow_start;
+    file.seek(SeekFrom::Start(arrow_start))?;
+    let mut stream_buf = vec![0u8; stream_len as usize];
+    file.read_exact(&mut stream_buf)?;
+
+    let cursor = std::io::Cursor::new(stream_buf);
+    let reader = StreamReader::try_new(cursor, None)?;
     let schema = reader.schema();
-    let custom_metadata = reader.custom_metadata().clone();
-    let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>()?;
+
+    let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Failed to read Arrow stream: {}", e))?;
+
+    // Extract custom metadata from schema (checksums, config)
     eprintln!(
         "Batch schema fields: {:?}",
         schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
     );
-
-    // Merge footer custom_metadata into schema metadata for backward compatibility
-    if !custom_metadata.is_empty() {
-        let mut merged = schema.metadata().clone();
-        for (k, v) in custom_metadata {
-            merged.entry(k).or_insert(v);
-        }
-        let merged_schema = Arc::new(Schema::new_with_metadata(
-            schema.fields().to_vec(),
-            merged,
-        ));
-        return Ok((merged_schema, batches));
-    }
 
     Ok((schema, batches))
 }

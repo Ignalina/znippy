@@ -1,8 +1,6 @@
 use anyhow::Result;
 use anyhow::anyhow;
-use arrow::array::Array;
-use arrow::ipc::writer::FileWriter;
-use blake3::Hasher; // Blake3 import
+use blake3::Hasher;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -15,7 +13,7 @@ use znippy_common::chunkrevolver::{Chunk, ChunkRevolver, SendPtr, get_chunk_slic
 use znippy_common::common_config::CONFIG;
 use znippy_common::index::{
     build_arrow_metadata_for_checksums_and_config, should_skip_compression,
-    build_batch_zero_copy,
+    build_metadata_batch,
 };
 use znippy_common::meta::{ChunkMeta, WriterStats};
 use znippy_common::{
@@ -295,6 +293,7 @@ pub fn compress_dir(
 
                                 chunk_meta = ChunkMeta {
                                     zdata_offset: 0,
+                                    archive_offset: 0,
                                     fdata_offset,
                                     file_index,
                                     chunk_seq,
@@ -318,6 +317,7 @@ pub fn compress_dir(
                                         Arc::from(compressed_vec.into_boxed_slice());
                                     let chunk_meta = ChunkMeta {
                                         zdata_offset: 0,
+                                    archive_offset: 0,
                                         fdata_offset,
                                         file_index,
                                         chunk_seq,
@@ -335,7 +335,8 @@ pub fn compress_dir(
                                         let compressed_chunk: Arc<[u8]> =
                                             Arc::from(compressed_vec.into_boxed_slice());
                                         let chunk_meta = ChunkMeta {
-                                            zdata_offset: 0, // to be set by writer
+                                            zdata_offset: 0,
+                                    archive_offset: 0, // to be set by writer
                                             fdata_offset,
                                             file_index,
                                             chunk_seq,
@@ -388,22 +389,24 @@ pub fn compress_dir(
         compressor_threads.push(handle);
     }
 
-    // Writer thread — streams batches to Arrow IPC file incrementally
-    let output_for_writer = output.clone();
-    let writer_thread = thread::spawn(move || -> (WriterStats, FileWriter<std::io::BufWriter<File>>) {
-        use znippy_common::index::ZNIPPY_INDEX_SCHEMA;
+    // Channel for checksums
+    let (checksum_tx, checksum_rx) = bounded::<Vec<[u8; 32]>>(1);
 
-        const BATCH_FLUSH_BYTES: u64 = 64 * 1024 * 1024; // flush every 64MB of zdata
+    // Writer thread — hybrid format: raw data section + Arrow IPC Stream metadata
+    let output_for_writer = output.clone();
+    let writer_thread = thread::spawn(move || -> WriterStats {
+        use znippy_common::index::{ZNIPPY_MAGIC, ZNIPPY_TRAILER_MAGIC, ZNIPPY_INDEX_SCHEMA};
+        use znippy_common::index::build_metadata_batch;
 
         let output_path = output_for_writer.with_extension("znippy");
         let file = File::create(&output_path).expect("Failed to create output file");
-        let buf_writer = std::io::BufWriter::new(file);
-        let schema = ZNIPPY_INDEX_SCHEMA.as_ref().clone();
-        let mut arrow_writer = FileWriter::try_new(buf_writer, &schema)
-            .expect("Failed to create Arrow writer");
+        let mut writer = std::io::BufWriter::new(file);
 
-        let mut chunk_buf: Vec<(ChunkMeta, Arc<[u8]>)> = Vec::new();
-        let mut buffered_bytes: u64 = 0;
+        // Write file header magic
+        writer.write_all(ZNIPPY_MAGIC).expect("Failed to write magic");
+        let mut current_offset: u64 = ZNIPPY_MAGIC.len() as u64;
+
+        let mut all_meta: Vec<(ChunkMeta, Arc<[u8]>)> = Vec::new();
         let mut writerstats = WriterStats {
             total_chunks: 0,
             total_written_bytes: 0,
@@ -413,36 +416,49 @@ pub fn compress_dir(
             corrupt_bytes: 0,
         };
 
-        let flush = |buf: &mut Vec<(ChunkMeta, Arc<[u8]>)>, writer: &mut FileWriter<std::io::BufWriter<File>>| {
-            let batch = build_batch_zero_copy(buf, |file_index| {
-                let idx = file_index as usize;
-                all_files_for_writer[idx]
-                    .strip_prefix(&input_dir_cloned)
-                    .unwrap_or(&all_files_for_writer[idx])
-                    .to_string_lossy()
-                    .to_string()
-            }).expect("Failed to build batch");
-            writer.write(&batch).expect("Failed to write batch");
-            buf.clear();
-        };
-
-        while let Ok((compressed_data, chunk_meta)) = rx_compressed.recv() {
+        while let Ok((compressed_data, mut chunk_meta)) = rx_compressed.recv() {
             writerstats.total_chunks += 1;
             let data_len = compressed_data.len() as u64;
             writerstats.total_written_bytes += data_len;
-            buffered_bytes += data_len;
-            chunk_buf.push((chunk_meta, compressed_data));
 
-            if buffered_bytes >= BATCH_FLUSH_BYTES {
-                flush(&mut chunk_buf, &mut arrow_writer);
-                buffered_bytes = 0;
-            }
+            // Write raw chunk bytes directly — ZERO copies
+            writer.write_all(&compressed_data).expect("Failed to write chunk data");
+
+            chunk_meta.archive_offset = current_offset;
+            chunk_meta.compressed_size = data_len;
+            current_offset += data_len;
+
+            all_meta.push((chunk_meta, Arc::from([] as [u8; 0])));
         }
 
-        // Flush remaining
-        if !chunk_buf.is_empty() {
-            flush(&mut chunk_buf, &mut arrow_writer);
-        }
+        // Wait for checksums
+        let checksums = checksum_rx.recv().expect("Failed to receive checksums");
+
+        let arrow_start = current_offset;
+        let meta_map = build_arrow_metadata_for_checksums_and_config(&checksums, &CONFIG);
+        let schema_with_meta = arrow::datatypes::Schema::new_with_metadata(
+            ZNIPPY_INDEX_SCHEMA.fields().to_vec(),
+            meta_map,
+        );
+
+        let batch = build_metadata_batch(&all_meta, |file_index| {
+            let idx = file_index as usize;
+            all_files_for_writer[idx]
+                .strip_prefix(&input_dir_cloned)
+                .unwrap_or(&all_files_for_writer[idx])
+                .to_string_lossy()
+                .to_string()
+        }).expect("Failed to build metadata batch");
+
+        use arrow::ipc::writer::StreamWriter;
+        let mut stream_writer = StreamWriter::try_new(&mut writer, &schema_with_meta)
+            .expect("Failed to create Arrow stream writer");
+        stream_writer.write(&batch).expect("Failed to write metadata batch");
+        stream_writer.finish().expect("Failed to finish Arrow stream");
+
+        writer.write_all(&arrow_start.to_le_bytes()).expect("Failed to write trailer offset");
+        writer.write_all(ZNIPPY_TRAILER_MAGIC).expect("Failed to write trailer magic");
+        writer.flush().expect("Failed to flush");
 
         log::info!(
             "[writer] Done {} chunks, total {} bytes",
@@ -450,7 +466,7 @@ pub fn compress_dir(
             writerstats.total_written_bytes
         );
 
-        (writerstats, arrow_writer)
+        writerstats
     });
 
     // Wait for reader thread to finish
@@ -478,20 +494,13 @@ pub fn compress_dir(
         checksums.len()
     );
 
-    // After compressor threads are done, drop tx_compressed
+    // Signal writer: no more chunks, here are the checksums
     drop(tx_compressed);
-    log::debug!("[compressor] tx_compressed dropped after compressors finished");
+    checksum_tx.send(checksums).expect("Failed to send checksums to writer");
     log::debug!("[writer] Waiting for writer thread to finish");
-    let (writerstats, mut arrow_writer) = writer_thread.join().unwrap();
+    let writerstats = writer_thread.join().unwrap();
 
-    // Write checksums and config as custom metadata in the IPC footer
-    let metadata = build_arrow_metadata_for_checksums_and_config(&checksums, &CONFIG);
-    for (key, value) in &metadata {
-        arrow_writer.write_metadata(key, value);
-    }
-    arrow_writer.finish()?;
-
-    log::info!("[main] Single-file archive written: {:?}", output_path);
+    log::info!("[main] Hybrid archive written: {:?}", output_path);
 
     let report = CompressionReport {
         total_files,

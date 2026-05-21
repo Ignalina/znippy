@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct ChunkMeta {
     pub zdata_offset: u64,
     pub fdata_offset: u64,
+    pub archive_offset: u64,
     pub file_index: u64,
     pub chunk_seq: u32,
     pub checksum_group: u8, // Added checksum to ChunkMeta

@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use arrow::array::{Array, AsArray, UInt64Array};
+use arrow::array::Array;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
-use arrow_array::{BooleanArray, StringArray, UInt32Array, LargeBinaryArray};
+use arrow_array::{BooleanArray, StringArray, UInt32Array, UInt64Array};
 
 use crate::codec;
 use crate::index::read_znippy_index;
@@ -32,15 +32,14 @@ pub trait ZnippyReader: Send + Sync {
     fn file_size(&self, relative_path: &str) -> Option<u64>;
 }
 
-/// A znippy archive opened for random-access reads (v2 single-file format).
-/// Loads the index into memory on open, then serves extract requests
-/// by reading inline zdata from the Arrow batch.
+/// A znippy archive opened for random-access reads (v2.1 hybrid format).
+/// Loads metadata into memory on open, reads raw chunks on demand.
 pub struct ZnippyArchive {
     index_path: PathBuf,
     schema: Arc<Schema>,
     /// path → file entry with row indices for its chunks
     file_index: HashMap<String, FileEntry>,
-    /// The raw batch — holds zdata column in memory
+    /// The metadata batch (no zdata — just offsets/sizes)
     batches: Vec<RecordBatch>,
 }
 
@@ -128,25 +127,37 @@ impl ZnippyReader for ZnippyArchive {
     }
 
     fn extract_file(&self, relative_path: &str) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+
         let entry = self.file_index.get(relative_path)
             .ok_or_else(|| anyhow!("file not found in archive: {}", relative_path))?;
 
         let batch = &self.batches[0]; // TODO: multi-batch support
-        let zdata_col = batch.column_by_name("zdata")
-            .ok_or_else(|| anyhow!("missing zdata column"))?
-            .as_any().downcast_ref::<LargeBinaryArray>()
-            .ok_or_else(|| anyhow!("zdata not LargeBinaryArray"))?;
+        let fdata_offset_col = batch.column_by_name("fdata_offset")
+            .ok_or_else(|| anyhow!("missing fdata_offset column"))?
+            .as_any().downcast_ref::<UInt64Array>()
+            .ok_or_else(|| anyhow!("fdata_offset not UInt64Array"))?;
+        let compressed_size_col = batch.column_by_name("compressed_size")
+            .ok_or_else(|| anyhow!("missing compressed_size column"))?
+            .as_any().downcast_ref::<UInt64Array>()
+            .ok_or_else(|| anyhow!("compressed_size not UInt64Array"))?;
 
+        let mut file = std::fs::File::open(&self.index_path)?;
         let mut result = Vec::with_capacity(entry.uncompressed_size as usize);
 
         for &row in &entry.chunk_rows {
-            let chunk_bytes = zdata_col.value(row);
+            let offset = fdata_offset_col.value(row);
+            let size = compressed_size_col.value(row) as usize;
+
+            file.seek(SeekFrom::Start(offset))?;
+            let mut chunk_buf = vec![0u8; size];
+            file.read_exact(&mut chunk_buf)?;
 
             if entry.compressed {
-                let decompressed = codec::decompress_frame(chunk_bytes)?;
+                let decompressed = codec::decompress_frame(&chunk_buf)?;
                 result.extend_from_slice(&decompressed);
             } else {
-                result.extend_from_slice(chunk_bytes);
+                result.extend_from_slice(&chunk_buf);
             }
         }
 

@@ -79,22 +79,36 @@ pub fn decompress_archive(
     let out_dir = Arc::new(out_dir.to_path_buf());
     let out_dir_cloned = Arc::clone(&out_dir);
 
-    // READER — iterate rows, copy zdata into ring buffer
+    // READER — iterate metadata rows, read raw chunk bytes from file
+    let index_path_for_reader = index_path.to_path_buf();
     let reader_thread = {
         let done_rx = rx_return.clone();
         let work_tx_array = work_tx_array.clone();
 
         thread::spawn(move || -> ReaderStats {
+            use std::io::{BufReader, Read, Seek, SeekFrom};
+
             let mut inflight_chunks = 0usize;
 
-            let zdata_col = batch_for_reader
-                .column_by_name("zdata")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<arrow_array::LargeBinaryArray>()
-                .unwrap();
+            // Open the archive file for reading raw chunk data
+            let file = File::open(&index_path_for_reader)
+                .expect("Failed to open archive for reading");
+            let mut reader = BufReader::new(file);
+
             let fdata_offset_col = batch_for_reader
                 .column_by_name("fdata_offset")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            let archive_offset_col = batch_for_reader
+                .column_by_name("archive_offset")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            let compressed_size_col = batch_for_reader
+                .column_by_name("compressed_size")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<UInt64Array>()
@@ -125,9 +139,9 @@ pub fn decompress_archive(
                 .unwrap();
 
             for row_idx in 0..total_rows {
-                let zdata_bytes = zdata_col.value(row_idx);
-                let compressed_size = zdata_bytes.len() as u64;
                 let fdata_offset = fdata_offset_col.value(row_idx);
+                let archive_offset = archive_offset_col.value(row_idx);
+                let compressed_size = compressed_size_col.value(row_idx);
                 let chunk_seq = chunk_seq_col.value(row_idx);
                 let checksum_group = checksum_group_col.value(row_idx);
                 let compressed = compressed_col.value(row_idx);
@@ -149,12 +163,15 @@ pub fn decompress_archive(
                     }
                 };
 
-                // Copy zdata into ring buffer slot
-                chunk_data[..zdata_bytes.len()].copy_from_slice(zdata_bytes);
+                // Read raw chunk bytes from archive file into ring buffer slot
+                reader.seek(SeekFrom::Start(archive_offset)).expect("seek failed");
+                reader.read_exact(&mut chunk_data[..compressed_size as usize])
+                    .expect("Failed to read chunk data");
 
                 let meta = ChunkMeta {
-                    zdata_offset: 0, // not used in v2
+                    zdata_offset: 0,
                     fdata_offset,
+                    archive_offset,
                     compressed_size,
                     chunk_seq,
                     checksum_group,
