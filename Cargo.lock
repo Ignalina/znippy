@@ -621,6 +621,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "errno"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
+name = "fastrand"
+version = "2.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -896,6 +912,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
 name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1121,6 +1143,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1238,6 +1273,19 @@ dependencies = [
  "objc2-io-kit",
  "rayon",
  "windows",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.3.4",
+ "once_cell",
+ "rustix",
+ "windows-sys",
 ]
 
 [[package]]
@@ -1561,7 +1609,7 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 name = "znippy"
 version = "0.2.5"
 dependencies = [
- "znippy-cli 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "znippy-cli",
 ]
 
 [[package]]
@@ -1571,47 +1619,14 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger",
- "znippy-common 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
- "znippy-compress 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
- "znippy-decompress 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
-]
-
-[[package]]
-name = "znippy-cli"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff9ece36bd93a428a5bb2bc8a202f8b2dc25f0bd2bce7beba4fb5349af73b0af"
-dependencies = [
- "anyhow",
- "clap",
- "env_logger",
- "znippy-common 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
- "znippy-compress 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
- "znippy-decompress 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "znippy-common",
+ "znippy-compress",
+ "znippy-decompress",
 ]
 
 [[package]]
 name = "znippy-common"
 version = "0.2.5"
-dependencies = [
- "anyhow",
- "arrow",
- "arrow-array",
- "blake3",
- "crossbeam-channel",
- "hex",
- "log",
- "once_cell",
- "serde",
- "sysinfo",
- "zstd-sys-rs",
-]
-
-[[package]]
-name = "znippy-common"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e351012b39533944144d7fe49b0884e12e819c0dbdb5dcb8bf845829b9a402eb"
 dependencies = [
  "anyhow",
  "arrow",
@@ -1636,42 +1651,28 @@ dependencies = [
  "crossbeam-channel",
  "log",
  "walkdir",
- "znippy-common 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "znippy-common",
  "zstd-sys-rs",
 ]
 
 [[package]]
-name = "znippy-compress"
+name = "znippy-decompress"
 version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b26ba43165b92e24b13bfbe94a2583fb1d231a383878135ac4d279a9499e7f98"
 dependencies = [
  "anyhow",
- "arrow",
- "blake3",
- "crossbeam-channel",
- "log",
+ "znippy-common",
+]
+
+[[package]]
+name = "znippy-tests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "tempfile",
  "walkdir",
- "znippy-common 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
- "zstd-sys-rs",
-]
-
-[[package]]
-name = "znippy-decompress"
-version = "0.2.5"
-dependencies = [
- "anyhow",
- "znippy-common 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
-]
-
-[[package]]
-name = "znippy-decompress"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "159a47a6bdfdb44d1876c90b29f133d583c8b92b923888b6b611581ddd6f26fa"
-dependencies = [
- "anyhow",
- "znippy-common 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "znippy-common",
+ "znippy-compress",
 ]
 
 [[package]]
