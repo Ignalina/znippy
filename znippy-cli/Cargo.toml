@@ -20,6 +20,6 @@ znippy-compress = { version = "0.5.0" }
 #znippy-compress = { path = "../znippy-compress" }
 znippy-decompress = { version = "0.5.0" }
 #znippy-decompress = { path ="../znippy-decompress" }
-znippy-common = { version = "0.5.0" }
+znippy-common = { version = "0.5.0", features = ["host-decompressors"] }
 #znippy-common = { path ="../znippy-common" }
 env_logger = { version = "0.11.8" }

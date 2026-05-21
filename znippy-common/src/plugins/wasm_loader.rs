@@ -333,40 +333,95 @@ fn miniz_oxide_decompress(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn gzip_decompress(data: &[u8]) -> Option<Vec<u8>> {
-    // TODO: wire lgz-rs here for parallel gzip decompression
-    // Fallback: single-threaded via miniz_oxide
-    miniz_oxide::inflate::decompress_to_vec_zlib(data).ok()
+    #[cfg(feature = "host-decompressors")]
+    {
+        lgz::decompress_gz(data).ok()
+    }
+    #[cfg(not(feature = "host-decompressors"))]
+    {
+        miniz_oxide::inflate::decompress_to_vec_zlib(data).ok()
+    }
 }
 
 fn bzip2_decompress(data: &[u8]) -> Option<Vec<u8>> {
-    // TODO: wire lbzip2-rs here (workers-per-core, no rayon)
-    // Fallback: not available without lbzip2 dep
-    None
+    #[cfg(feature = "host-decompressors")]
+    {
+        lbzip2::parallel::decompress_parallel(data).ok()
+    }
+    #[cfg(not(feature = "host-decompressors"))]
+    {
+        None
+    }
 }
 
 fn zstd_decompress(data: &[u8]) -> Option<Vec<u8>> {
     crate::codec::decompress_frame(data).ok()
 }
 
-/// List entries in a JAR/ZIP using ljar-rs central directory scanner
+/// List entries in a JAR/ZIP using ljar-rs parallel decompressor
 fn jar_list_entries(data: &[u8]) -> Option<Vec<ArchiveEntry>> {
-    // TODO: wire ljar::decompress_jar(data) here for parallel multi-core extraction
-    // For now: use minimal central directory scan + single-entry inflate
-    // (same approach as znippy-plugin-maven's internal parser)
-    //
-    // When ljar-rs gets a `no_rayon` feature or we link it natively here,
-    // this becomes: ljar::decompress_jar(data).map(|entries| entries.into_iter()...)
-    minimal_jar_entries(data)
+    #[cfg(feature = "host-decompressors")]
+    {
+        ljar::decompress_jar(data).ok().map(|entries| {
+            entries
+                .into_iter()
+                .map(|e| ArchiveEntry {
+                    name: e.name,
+                    uncompressed_size: e.data.len() as u64,
+                    data: e.data,
+                })
+                .collect()
+        })
+    }
+    #[cfg(not(feature = "host-decompressors"))]
+    {
+        minimal_jar_entries(data)
+    }
 }
 
 fn tar_gz_list_entries(data: &[u8]) -> Option<Vec<ArchiveEntry>> {
-    // TODO: lgz decompress → tar parse
-    None
+    #[cfg(feature = "host-decompressors")]
+    {
+        let decompressed = lgz::decompress_gz(data).ok()?;
+        tar_entries_from_bytes(&decompressed)
+    }
+    #[cfg(not(feature = "host-decompressors"))]
+    {
+        None
+    }
 }
 
 fn tar_bz2_list_entries(data: &[u8]) -> Option<Vec<ArchiveEntry>> {
-    // TODO: lbzip2 decompress → tar parse
-    None
+    #[cfg(feature = "host-decompressors")]
+    {
+        let decompressed = lbzip2::parallel::decompress_parallel(data).ok()?;
+        tar_entries_from_bytes(&decompressed)
+    }
+    #[cfg(not(feature = "host-decompressors"))]
+    {
+        None
+    }
+}
+
+#[cfg(feature = "host-decompressors")]
+fn tar_entries_from_bytes(tar_data: &[u8]) -> Option<Vec<ArchiveEntry>> {
+    use std::io::Read;
+    let mut archive = tar::Archive::new(tar_data);
+    let mut entries = Vec::new();
+    for entry in archive.entries().ok()? {
+        let mut entry = entry.ok()?;
+        if entry.header().entry_type().is_file() {
+            let name = entry.path().ok()?.to_string_lossy().into_owned();
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).ok()?;
+            entries.push(ArchiveEntry {
+                name,
+                uncompressed_size: data.len() as u64,
+                data,
+            });
+        }
+    }
+    Some(entries)
 }
 
 // ─── Minimal JAR parser (for bootstrap until ljar native link) ───────

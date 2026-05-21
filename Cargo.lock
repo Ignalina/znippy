@@ -1407,6 +1407,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lbzip2"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b9cb3390f487cf05e891f4a82129421a767db6ec2e46b1e54806db3541af820"
+dependencies = [
+ "memchr",
+ "rayon",
+]
+
+[[package]]
 name = "leb128fmt"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1470,6 +1480,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lgz"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57ef10da4090ed047bce75bc96fbb6f943df01571f0383066dbbbc727558535f"
+dependencies = [
+ "flate2",
+ "linflate",
+ "rayon",
+ "tar",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1501,6 +1523,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "linflate"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec91256e71124ea2a536302fa0cd1aa435cbf6a8d4d01cf0d3e1585389eff8e0"
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1511,6 +1539,16 @@ name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
+
+[[package]]
+name = "ljar"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6644fb69b336f4b9aff77e24874616a9d82f8a3e715375cdd5914010f3c485d5"
+dependencies = [
+ "linflate",
+ "rayon",
+]
 
 [[package]]
 name = "log"
@@ -3271,6 +3309,9 @@ dependencies = [
  "crossbeam-channel",
  "flate2",
  "hex",
+ "lbzip2",
+ "lgz",
+ "ljar",
  "log",
  "miniz_oxide",
  "once_cell",

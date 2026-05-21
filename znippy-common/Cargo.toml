@@ -14,6 +14,7 @@ keywords = ["compression", "zstd", "parallel", "arrow", "blake3"]
 default = []
 ext-cargo = ["dep:flate2", "dep:tar"]
 wasm-plugins = ["dep:wasmtime", "dep:miniz_oxide"]
+host-decompressors = ["dep:ljar", "dep:lbzip2", "dep:lgz", "dep:tar"]
 
 [dependencies]
 openzl-sys-rs = "0.1.0"
@@ -31,3 +32,6 @@ hex = "0.4.3"
 arrow = "57.0.0"
 arrow-array = "57.0.0"
 crossbeam-channel = "0.5.15"
+ljar = { version = "0.1.0", optional = true }
+lbzip2 = { version = "0.4.2", optional = true }
+lgz = { version = "0.2.0", optional = true }
