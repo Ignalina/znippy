@@ -302,7 +302,8 @@ pub struct ChunkRow {
 
 /// Build a RecordBatch from chunk rows (v0.5 Arrow IPC with zdata)
 pub fn build_arrow_batch_from_chunks(rows: &[ChunkRow]) -> arrow::error::Result<RecordBatch> {
-    use arrow::array::{UInt32Builder, UInt8Builder, LargeBinaryBuilder};
+    use arrow::array::{UInt32Builder, UInt8Builder};
+    use arrow::buffer::{Buffer, OffsetBuffer};
 
     let schema = ZNIPPY_INDEX_SCHEMA.as_ref().clone();
     let len = rows.len();
@@ -314,7 +315,11 @@ pub fn build_arrow_batch_from_chunks(rows: &[ChunkRow]) -> arrow::error::Result<
     let mut compressed_builder = BooleanBuilder::with_capacity(len);
     let mut size_builder = UInt64Builder::with_capacity(len);
     let mut repo_builder = StringBuilder::new();
-    let mut zdata_builder = LargeBinaryBuilder::new();
+
+    let total_data_size: usize = rows.iter().map(|r| r.zdata.len()).sum();
+    let mut offsets: Vec<i64> = Vec::with_capacity(len + 1);
+    let mut values: Vec<u8> = Vec::with_capacity(total_data_size);
+    offsets.push(0);
 
     for row in rows {
         path_builder.append_value(&row.relative_path);
@@ -327,8 +332,13 @@ pub fn build_arrow_batch_from_chunks(rows: &[ChunkRow]) -> arrow::error::Result<
             Some(r) => repo_builder.append_value(r),
             None => repo_builder.append_null(),
         }
-        zdata_builder.append_value(&*row.zdata);
+        values.extend_from_slice(&*row.zdata);
+        offsets.push(values.len() as i64);
     }
+
+    let offsets_buffer = OffsetBuffer::new(offsets.into());
+    let values_buffer = Buffer::from(values);
+    let zdata_array = arrow::array::LargeBinaryArray::new(offsets_buffer, values_buffer, None);
 
     RecordBatch::try_new(
         Arc::new(schema),
@@ -341,13 +351,13 @@ pub fn build_arrow_batch_from_chunks(rows: &[ChunkRow]) -> arrow::error::Result<
             Arc::new(size_builder.finish()),
             Arc::new(repo_builder.finish()),
             Arc::new(new_null_union_array(len)),
-            Arc::new(zdata_builder.finish()),
+            Arc::new(zdata_array),
         ],
     )
 }
 
 /// Build a RecordBatch from (ChunkMeta, compressed_data) pairs.
-/// Uses Arrow Buffer::from() for zdata — zero-copy ownership transfer.
+/// Constructs zdata LargeBinaryArray directly from buffers — avoids builder copy.
 pub fn build_metadata_batch<F>(
     chunks: &[(ChunkMeta, Arc<[u8]>)],
     path_resolver: F,
@@ -355,7 +365,8 @@ pub fn build_metadata_batch<F>(
 where
     F: Fn(u64) -> String,
 {
-    use arrow::array::{UInt32Builder, UInt8Builder, LargeBinaryBuilder};
+    use arrow::array::{UInt32Builder, UInt8Builder};
+    use arrow::buffer::{Buffer, OffsetBuffer};
 
     let schema = ZNIPPY_INDEX_SCHEMA.as_ref().clone();
     let len = chunks.len();
@@ -367,7 +378,12 @@ where
     let mut compressed_builder = BooleanBuilder::with_capacity(len);
     let mut size_builder = UInt64Builder::with_capacity(len);
     let mut repo_builder = StringBuilder::new();
-    let mut zdata_builder = LargeBinaryBuilder::new();
+
+    // Build zdata as concatenated buffer + offsets (zero-copy from owned Vecs)
+    let total_data_size: usize = chunks.iter().map(|(_, d)| d.len()).sum();
+    let mut offsets: Vec<i64> = Vec::with_capacity(len + 1);
+    let mut values: Vec<u8> = Vec::with_capacity(total_data_size);
+    offsets.push(0);
 
     for (meta, data) in chunks {
         path_builder.append_value(path_resolver(meta.file_index));
@@ -376,9 +392,16 @@ where
         group_builder.append_value(meta.checksum_group);
         compressed_builder.append_value(meta.compressed);
         size_builder.append_value(meta.uncompressed_size);
-        repo_builder.append_null(); // TODO: support repo column
-        zdata_builder.append_value(&**data);
+        repo_builder.append_null();
+
+        values.extend_from_slice(data);
+        offsets.push(values.len() as i64);
     }
+
+    // Construct LargeBinaryArray directly from buffers (one copy into values vec above)
+    let offsets_buffer = OffsetBuffer::new(offsets.into());
+    let values_buffer = Buffer::from(values);
+    let zdata_array = arrow::array::LargeBinaryArray::new(offsets_buffer, values_buffer, None);
 
     RecordBatch::try_new(
         Arc::new(schema),
@@ -391,7 +414,7 @@ where
             Arc::new(size_builder.finish()),
             Arc::new(repo_builder.finish()),
             Arc::new(new_null_union_array(len)),
-            Arc::new(zdata_builder.finish()),
+            Arc::new(zdata_array),
         ],
     )
 }
