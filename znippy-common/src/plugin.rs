@@ -18,7 +18,7 @@ pub struct ExtensionRow {
 }
 
 /// Typed values for extension fields
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ExtensionValue {
     Str(String),
     OptStr(Option<String>),
