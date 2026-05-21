@@ -340,6 +340,8 @@ fn test_verify_via_decompress() -> Result<()> {
     let report = znippy_common::decompress_archive(&archive_path, true, decomp_dir.path())?;
     assert_eq!(report.corrupt_files, 0);
     assert_eq!(report.total_files, 1);
+    assert_eq!(report.verified_files, 1, "File should be verified via blake3 checksum");
+    assert!(report.verified_bytes > 0, "Should have verified bytes");
 
     // Verify content matches
     let content = fs::read(decomp_dir.path().join("check.bin"))?;
