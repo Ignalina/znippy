@@ -12,6 +12,61 @@
 - [x] Footer custom_metadata for checksums (reader merges transparently)
 - [x] Empty file handling (emit one empty compressed chunk)
 
+## Done (v0.5.0)
+- [x] Valid Arrow IPC Stream format (DuckDB/Polars/pyarrow can query directly)
+- [x] Direct buffer construction (bypass LargeBinaryBuilder copy)
+- [x] Removed custom hybrid format (trailer, magic, raw section)
+
+## Arrow IPC Serialization Bottleneck — Technical Analysis
+
+### The numbers
+
+| Write strategy | mixed_repo (530MB, uncompressed) | Bottleneck |
+|---|---|---|
+| **Direct NVMe write** (`write_all()`) | **2775 MB/s** | NVMe bandwidth |
+| **Arrow IPC Stream** (current v0.5) | **777 MB/s** | `extend_from_slice` |
+
+**Ratio: 3.6x slower due to Arrow IPC serialization copy.**
+
+### Root cause
+
+`arrow-ipc-57.3.0/src/writer.rs` line 2083:
+```rust
+fn write_buffer(arrow_data: &mut Vec<u8>, buffer: &Buffer, ...) {
+    arrow_data.extend_from_slice(buffer);  // ← mandatory memcpy
+}
+```
+
+Every buffer in every RecordBatch is copied into a contiguous `Vec<u8>` before
+being written to disk. No scatter-gather / `write_vectored` support exists.
+
+### What we tried (eliminated, made no difference)
+
+1. ~~`LargeBinaryBuilder::append_value()`~~ → replaced with direct `Buffer::from(vec)` construction
+2. Direct `OffsetBuffer` + `Buffer` assembly (avoids builder's internal realloc)
+3. Result: 799 → 777 MB/s (noise). **The IPC writer copy dominates.**
+
+### Why direct NVMe write is 3.6x faster
+
+```
+Direct:  ring_buffer → write_all(data) → NVMe    (1 syscall, 0 userspace copies)
+Arrow:   ring_buffer → Vec values → Buffer → extend_from_slice → write() → NVMe
+                        copy #1              copy #2 (IPC writer)
+```
+
+### Path to fix (upstream)
+
+- Issue: apache/arrow-rs#9835 — "Support write_vectored / scatter-gather in IPC writer"
+- **We commented on the issue with our benchmark data** (2025-05-21): 3.6x throughput loss, 777 vs 2775 MB/s
+- Fix: IPC writer writes buffer slices directly instead of concatenating into Vec
+- **Our code is already structured for this** — if upstream ships the fix, `cargo update` recovers full speed. Zero code changes needed on our side.
+
+### Decision: we keep Arrow IPC (v0.5)
+
+- 777 MB/s is still fast (saturates 6 Gbit/s network, exceeds SATA SSD)
+- DuckDB/Polars queryability is worth the tradeoff
+- Upstream fix will eventually land — we get the speed back for free
+
 ## TODO
 
 ### Performance
@@ -56,13 +111,16 @@ pub fn compress_dir(input: &Path, output: &Path, no_skip: bool) -> Result<Compre
 Extension DenseUnion column currently always null. Wire up plugin metadata
 injection for the first chunk of each file.
 
-## Performance Baseline (v0.4.1 hybrid, 32-core AMD, NVMe, release)
+## Performance Baseline (v0.5.0 Arrow IPC, 32-core AMD, NVMe, release)
 
 | Test | Compress MB/s | Decompress MB/s | Ratio |
 |------|--------------|----------------|-------|
-| text_500mb | 1712 | 2959 | 4318x |
-| binary_pattern_500mb | 2427 | 3106 | 2311x |
-| random_500mb | 184 | 3125 | 1.0x |
-| 100k_small_files_10kb | 3344 | 739 | 64x |
-| mixed_repo_530mb | 2775 | 2718 | 1.0x |
-| single_file_2gb | 3346 | 3431 | 4510x |
+| text_500mb | 1707 | 3049 | 4471x |
+| binary_pattern_500mb | 2370 | 2809 | 2354x |
+| random_500mb | 152 | 1312 | 1.0x |
+| 100k_small_files_10kb | 3150 | 751 | 67x |
+| mixed_repo_530mb | 777 | 1241 | 1.0x |
+| single_file_2gb | 3442 | 3089 | 4673x |
+
+Note: mixed_repo limited by Arrow IPC serialization copy (apache/arrow-rs#9835).
+Direct NVMe write achieves 2775 MB/s for same workload.
