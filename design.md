@@ -95,18 +95,20 @@ decompressed chunks by chunk_seq before hashing.
 │  │     (fills slots)               (each: own CCtx, own buf)      │    │
 │  │          │                              │                       │    │
 │  │          └── send(slot_idx) ──────────→ │ read slot, compress   │    │
-│  │                                         │ zstd/openzl           │    │
+│  │                                         │ openzl (or skip)      │    │
 │  │                                         │ blake3 checksum       │    │
 │  │                                         ▼                       │    │
 │  └─────────────────────────────────────────┼───────────────────────┘    │
 │                                            │                            │
 │  ┌─────────────────────────────────────────▼───────────────────────┐    │
-│  │  Phase 4: Write (Arrow IPC, single-file)                       │    │
+│  │  Phase 4: Write (Arrow IPC Stream, single-file)                │    │
 │  │                                                                 │    │
-│  │  Compressed chunk → inline zdata column (per-row)               │    │
-│  │  Index row: path, chunk_seq, offset, size, checksum_group,      │    │
-│  │             compressed, extension                               │    │
-│  │             ↑ metadata from Phase 2 attached on chunk_seq=0     │    │
+│  │  Dual pipeline per chunk:                                       │    │
+│  │    compressed=true  → Buffer::from(compressed_vec)              │    │
+│  │    compressed=false → Buffer::from(raw_vec) — ZERO COPY         │    │
+│  │                                                                 │    │
+│  │  Both paths: ownership transfer to Arrow Buffer (no memcpy)     │    │
+│  │  Result: valid Arrow IPC Stream file (DuckDB-readable)          │    │
 │  │                                                                 │    │
 │  │  Flush Arrow batch every N chunks (bounded memory)              │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
@@ -128,9 +130,13 @@ ChunkRevolver slot     │  memcpy into ring buffer (necessary — fixed slot si
                        │
 Compressor thread      │  reads slot in-place (zero-copy)
                        │
-Output buffer          │  compressed result (reused across chunks)
+                       ├── compressed=true:  OpenZL → Vec<u8> (new alloc)
+                       │                     Buffer::from(vec) — ownership xfer
+                       │
+                       └── compressed=false: copy slot → Vec<u8>
+                                            Buffer::from(vec) — ownership xfer
                        ▼
-Arrow IPC write        inline as zdata column row, done
+Arrow IPC write        zdata column row — Buffer already constructed, no extra copy
 ```
 
 ### Allocations Per File: Exactly 2
@@ -295,26 +301,114 @@ The parallel pipeline stays identical. Only the compress/decompress calls change
 
 ---
 
-## Section 3: Single-file Format Migration (v0.4, current)
+## Section 3: Single-file Format (v0.5, current)
 
-### Current → Target
+### Format
+
+Single valid Arrow IPC Stream file — readable by DuckDB/Polars/pyarrow directly:
 
 ```
-BEFORE (v0.2.5):
-  archive.znippy  (Arrow IPC index, ~4.5MB for 53k files)
-  archive.zdata   (compressed chunks, ~174MB)
-
-AFTER (v0.4):
-  archive.znippy  (Arrow IPC, one row per chunk, data inline)
+archive.znippy  (Arrow IPC Stream, one row per chunk, data inline as zdata column)
 ```
+
+```sql
+-- DuckDB can query the archive directly:
+SELECT relative_path, uncompressed_size FROM 'archive.znippy';
+SELECT * FROM 'nexus-export.znippy' WHERE repo = 'libs-release';
+```
+
+### Schema (one row per chunk)
+
+```
+relative_path     Utf8
+chunk_seq         UInt32
+fdata_offset      UInt64
+checksum_group    UInt8
+compressed        Boolean
+uncompressed_size UInt64
+repo              Utf8 (nullable)
+extension         DenseUnion (nullable, plugin metadata on chunk_seq=0)
+zdata             LargeBinary (compressed or raw chunk bytes)
+```
+
+### Dual-Pipeline Architecture (Zero-Copy)
+
+Files are split into two pipelines based on whether compression is needed:
+
+```
+═══════════════════════════════════════════════════════════════
+PIPELINE A: COMPRESS (compressed=true)
+═══════════════════════════════════════════════════════════════
+
+  File bytes
+      │
+      ▼
+  ┌─────────────────┐
+  │  Split chunks   │  (ChunkRevolver ring buffer)
+  └────────┬────────┘
+           │
+     ┌─────┼─────┐        (parallel across cores)
+     ▼     ▼     ▼
+  ┌─────┐┌─────┐┌─────┐
+  │OpenZL││OpenZL││OpenZL│  compress each chunk
+  │  +  ││  +  ││  +  │
+  │blake3││blake3││blake3│  hash original data
+  └──┬───┘└──┬───┘└──┬───┘
+     │     │     │
+     ▼     ▼     ▼
+  ┌─────────────────────────────┐
+  │ Arrow IPC writer            │  Buffer::from(compressed_vec)
+  │ (zdata = compressed bytes)  │  ownership transfer, no extra copy
+  └─────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════
+PIPELINE B: STORE AS-IS (compressed=false, size known upfront)
+═══════════════════════════════════════════════════════════════
+
+  File bytes (known size!)
+      │
+      ├──────────────────────────────────┐
+      │                                  │
+      ▼                                  ▼
+  ┌─────────────────┐     ┌───────────────────────────────┐
+  │  Split chunks   │     │  Arrow IPC writer             │
+  └────────┬────────┘     │  (zdata = raw bytes)          │  ZERO COPY
+           │              │  Buffer::from(vec) — no copy  │  (parallel!)
+     ┌─────┼─────┐       └───────────────────────────────┘
+     ▼     ▼     ▼
+  ┌─────┐┌─────┐┌─────┐
+  │blake3││blake3││blake3│  hash only (parallel across cores)
+  └──┬───┘└──┬───┘└──┬───┘
+     │     │     │
+     ▼     ▼     ▼
+  ┌─────────────────────┐
+  │ Checksum complete   │  (data already in Arrow IPC!)
+  └─────────────────────┘
+```
+
+### Key Insight: Zero-Copy for Uncompressed Files
+
+For files that skip compression (already-compressed: .jpg, .mp4, .gz, .jar, .png):
+- Size is known upfront (= original file size)
+- Data doesn't change — raw bytes go directly into Arrow `Buffer`
+- `Buffer::from(vec)` transfers ownership without copying
+- blake3 hashing runs in parallel on the same data — doesn't block the write
+- Result: disk-speed writes for the common case (media, pre-compressed files)
+
+For compressed files:
+- OpenZL produces a `Vec<u8>` output
+- Convert to Arrow `Buffer::from(compressed_vec)` — ownership transfer, one allocation
+- The "extend_from_slice" copy in Arrow IPC is avoided because we construct the Buffer directly
 
 ### Benefits
 
-- Single file to manage, copy, transfer
-- Still queryable by DuckDB/Polars/DataFusion
-- Column pruning: read metadata without loading chunk data
-- Multi-repo support via `repo` column + row group partitioning
-- Streaming write: flush batch every N chunks (bounded memory)
+- **Single file** to manage, copy, transfer
+- **Valid Arrow IPC** — DuckDB/Polars/pyarrow read it directly
+- **Column pruning** — read metadata without loading chunk data
+- **Zero-copy writes** — uncompressed files bypass all buffer copies
+- **Multi-repo support** via `repo` column + row group partitioning
+- **Streaming write** — flush batch every N chunks (bounded memory)
 
 ### Multi-repo / Nexus Mode
 

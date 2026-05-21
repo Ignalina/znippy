@@ -292,8 +292,6 @@ pub fn compress_dir(
                                 output = Arc::from(input);
 
                                 chunk_meta = ChunkMeta {
-                                    zdata_offset: 0,
-                                    archive_offset: 0,
                                     fdata_offset,
                                     file_index,
                                     chunk_seq,
@@ -316,8 +314,6 @@ pub fn compress_dir(
                                     let compressed_chunk: Arc<[u8]> =
                                         Arc::from(compressed_vec.into_boxed_slice());
                                     let chunk_meta = ChunkMeta {
-                                        zdata_offset: 0,
-                                    archive_offset: 0,
                                         fdata_offset,
                                         file_index,
                                         chunk_seq,
@@ -335,8 +331,6 @@ pub fn compress_dir(
                                         let compressed_chunk: Arc<[u8]> =
                                             Arc::from(compressed_vec.into_boxed_slice());
                                         let chunk_meta = ChunkMeta {
-                                            zdata_offset: 0,
-                                    archive_offset: 0, // to be set by writer
                                             fdata_offset,
                                             file_index,
                                             chunk_seq,
@@ -347,7 +341,7 @@ pub fn compress_dir(
                                         };
                                         fdata_offset += micro.len() as u64;
                                         log::debug!(
-                                            "[compressor {}] did File_index {} chunk nr {} size {} micro nr {} chunk size {} out {} zdata_offset = {}",
+                                            "[compressor {}] did File_index {} chunk nr {} size {} micro nr {} chunk size {} out {}",
                                             compressor_group,
                                             file_index,
                                             chunk_nr,
@@ -355,7 +349,6 @@ pub fn compress_dir(
                                             micro_nr,
                                             micro.len(),
                                             chunk_meta.compressed_size,
-                                            chunk_meta.zdata_offset
                                         );
 
                                         tx_compressed.send((compressed_chunk, chunk_meta))?;
@@ -392,19 +385,15 @@ pub fn compress_dir(
     // Channel for checksums
     let (checksum_tx, checksum_rx) = bounded::<Vec<[u8; 32]>>(1);
 
-    // Writer thread — hybrid format: raw data section + Arrow IPC Stream metadata
+    // Writer thread — Arrow IPC Stream format (valid Arrow file, DuckDB-readable)
     let output_for_writer = output.clone();
     let writer_thread = thread::spawn(move || -> WriterStats {
-        use znippy_common::index::{ZNIPPY_MAGIC, ZNIPPY_TRAILER_MAGIC, ZNIPPY_INDEX_SCHEMA};
+        use znippy_common::index::{ZNIPPY_INDEX_SCHEMA};
         use znippy_common::index::build_metadata_batch;
 
         let output_path = output_for_writer.with_extension("znippy");
         let file = File::create(&output_path).expect("Failed to create output file");
         let mut writer = std::io::BufWriter::new(file);
-
-        // Write file header magic
-        writer.write_all(ZNIPPY_MAGIC).expect("Failed to write magic");
-        let mut current_offset: u64 = ZNIPPY_MAGIC.len() as u64;
 
         let mut all_meta: Vec<(ChunkMeta, Arc<[u8]>)> = Vec::new();
         let mut writerstats = WriterStats {
@@ -416,25 +405,17 @@ pub fn compress_dir(
             corrupt_bytes: 0,
         };
 
-        while let Ok((compressed_data, mut chunk_meta)) = rx_compressed.recv() {
+        while let Ok((compressed_data, chunk_meta)) = rx_compressed.recv() {
             writerstats.total_chunks += 1;
             let data_len = compressed_data.len() as u64;
             writerstats.total_written_bytes += data_len;
 
-            // Write raw chunk bytes directly — ZERO copies
-            writer.write_all(&compressed_data).expect("Failed to write chunk data");
-
-            chunk_meta.archive_offset = current_offset;
-            chunk_meta.compressed_size = data_len;
-            current_offset += data_len;
-
-            all_meta.push((chunk_meta, Arc::from([] as [u8; 0])));
+            all_meta.push((chunk_meta, compressed_data));
         }
 
         // Wait for checksums
         let checksums = checksum_rx.recv().expect("Failed to receive checksums");
 
-        let arrow_start = current_offset;
         let meta_map = build_arrow_metadata_for_checksums_and_config(&checksums, &CONFIG);
         let schema_with_meta = arrow::datatypes::Schema::new_with_metadata(
             ZNIPPY_INDEX_SCHEMA.fields().to_vec(),
@@ -453,11 +434,8 @@ pub fn compress_dir(
         use arrow::ipc::writer::StreamWriter;
         let mut stream_writer = StreamWriter::try_new(&mut writer, &schema_with_meta)
             .expect("Failed to create Arrow stream writer");
-        stream_writer.write(&batch).expect("Failed to write metadata batch");
+        stream_writer.write(&batch).expect("Failed to write batch");
         stream_writer.finish().expect("Failed to finish Arrow stream");
-
-        writer.write_all(&arrow_start.to_le_bytes()).expect("Failed to write trailer offset");
-        writer.write_all(ZNIPPY_TRAILER_MAGIC).expect("Failed to write trailer magic");
         writer.flush().expect("Failed to flush");
 
         log::info!(

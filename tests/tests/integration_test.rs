@@ -291,13 +291,12 @@ fn test_index_schema_fields() {
             "relative_path",
             "chunk_seq",
             "fdata_offset",
-            "archive_offset",
-            "compressed_size",
             "checksum_group",
             "compressed",
             "uncompressed_size",
             "repo",
             "extension",
+            "zdata",
         ]
     );
 }

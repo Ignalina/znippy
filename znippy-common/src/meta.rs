@@ -1,14 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-/// Metadata för en enskild chunk i arkivet (.zdata)
+/// Metadata för en enskild chunk i arkivet
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkMeta {
-    pub zdata_offset: u64,
     pub fdata_offset: u64,
-    pub archive_offset: u64,
     pub file_index: u64,
     pub chunk_seq: u32,
-    pub checksum_group: u8, // Added checksum to ChunkMeta
+    pub checksum_group: u8,
     pub compressed: bool,
     pub uncompressed_size: u64,
     pub compressed_size: u64,

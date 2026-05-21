@@ -300,8 +300,6 @@ fn run_compression_pipeline(
                             if skip {
                                 let output: Arc<[u8]> = Arc::from(input);
                                 let chunk_meta = ChunkMeta {
-                                    zdata_offset: 0,
-                                    archive_offset: 0,
                                     fdata_offset,
                                     file_index,
                                     chunk_seq,
@@ -317,13 +315,10 @@ fn run_compression_pipeline(
                                     split_into_microchunks(input, CONFIG.zstd_output_buffer_size);
 
                                 if micro_chunks.is_empty() {
-                                    // Empty file: emit a single empty chunk to preserve file in archive
                                     let compressed_vec = cctx.compress(&[])?;
                                     let compressed_chunk: Arc<[u8]> =
                                         Arc::from(compressed_vec.into_boxed_slice());
                                     let chunk_meta = ChunkMeta {
-                                        zdata_offset: 0,
-                                    archive_offset: 0,
                                         fdata_offset,
                                         file_index,
                                         chunk_seq,
@@ -340,8 +335,6 @@ fn run_compression_pipeline(
                                         let compressed_chunk: Arc<[u8]> =
                                             Arc::from(compressed_vec.into_boxed_slice());
                                         let chunk_meta = ChunkMeta {
-                                            zdata_offset: 0,
-                                    archive_offset: 0,
                                             fdata_offset,
                                             file_index,
                                             chunk_seq,
@@ -375,22 +368,17 @@ fn run_compression_pipeline(
     // Channel for checksums: sent after compressor threads finish
     let (checksum_tx, checksum_rx) = bounded::<Vec<[u8; 32]>>(1);
 
-    // Writer thread — hybrid format: raw data section + Arrow IPC Stream metadata
+    // Writer thread — Arrow IPC Stream format (valid Arrow file, DuckDB-readable)
     let output_for_writer = output.clone();
     let writer_thread = thread::spawn(move || -> WriterStats {
         use std::io::Write;
-        use znippy_common::index::{ZNIPPY_MAGIC, ZNIPPY_TRAILER_MAGIC, ZNIPPY_INDEX_SCHEMA};
+        use znippy_common::index::{ZNIPPY_INDEX_SCHEMA};
         use znippy_common::index::build_metadata_batch;
 
         let output_path = output_for_writer.with_extension("znippy");
         let file = File::create(&output_path).expect("Failed to create output file");
         let mut writer = std::io::BufWriter::new(file);
 
-        // Write file header magic
-        writer.write_all(ZNIPPY_MAGIC).expect("Failed to write magic");
-        let mut current_offset: u64 = ZNIPPY_MAGIC.len() as u64;
-
-        // Accumulate metadata for Arrow stream (small — just offsets/paths/sizes)
         let mut all_meta: Vec<(ChunkMeta, Arc<[u8]>)> = Vec::new();
         let mut writerstats = WriterStats {
             total_chunks: 0,
@@ -401,28 +389,17 @@ fn run_compression_pipeline(
             corrupt_bytes: 0,
         };
 
-        while let Ok((compressed_data, mut chunk_meta)) = rx_compressed.recv() {
+        while let Ok((compressed_data, chunk_meta)) = rx_compressed.recv() {
             writerstats.total_chunks += 1;
             let data_len = compressed_data.len() as u64;
             writerstats.total_written_bytes += data_len;
 
-            // Write raw chunk bytes directly — ZERO userspace copies
-            writer.write_all(&compressed_data).expect("Failed to write chunk data");
-
-            // Record where this chunk lives in the raw section
-            chunk_meta.archive_offset = current_offset;
-            chunk_meta.compressed_size = data_len;
-            current_offset += data_len;
-
-            // Keep a dummy Arc for metadata batch builder (not used for data)
-            all_meta.push((chunk_meta, Arc::from([] as [u8; 0])));
+            all_meta.push((chunk_meta, compressed_data));
         }
 
         // Wait for checksums from main thread
         let checksums = checksum_rx.recv().expect("Failed to receive checksums");
 
-        // Build schema with checksums + config as metadata
-        let arrow_start = current_offset;
         let meta_map = build_arrow_metadata_for_checksums_and_config(&checksums, &CONFIG);
         let schema_with_meta = arrow::datatypes::Schema::new_with_metadata(
             ZNIPPY_INDEX_SCHEMA.fields().to_vec(),
@@ -434,23 +411,17 @@ fn run_compression_pipeline(
             paths[file_index as usize].clone()
         }).expect("Failed to build metadata batch");
 
-        // Write Arrow IPC Stream (schema carries checksums in metadata)
         use arrow::ipc::writer::StreamWriter;
         let mut stream_writer = StreamWriter::try_new(&mut writer, &schema_with_meta)
             .expect("Failed to create Arrow stream writer");
-        stream_writer.write(&batch).expect("Failed to write metadata batch");
+        stream_writer.write(&batch).expect("Failed to write batch");
         stream_writer.finish().expect("Failed to finish Arrow stream");
-
-        // Write trailer: [arrow_start: u64 LE][magic: "ZNIP"]
-        writer.write_all(&arrow_start.to_le_bytes()).expect("Failed to write trailer offset");
-        writer.write_all(ZNIPPY_TRAILER_MAGIC).expect("Failed to write trailer magic");
         writer.flush().expect("Failed to flush");
 
         log::info!(
-            "[writer] Done {} chunks, total {} bytes, arrow_start={}",
+            "[writer] Done {} chunks, total {} bytes",
             writerstats.total_chunks,
             writerstats.total_written_bytes,
-            arrow_start
         );
 
         writerstats
@@ -479,7 +450,7 @@ fn run_compression_pipeline(
 
     let writerstats = writer_thread.join().unwrap();
 
-    log::info!("[stream] Hybrid archive written");
+    log::info!("[stream] Arrow IPC archive written");
 
     let report = CompressionReport {
         total_files,
