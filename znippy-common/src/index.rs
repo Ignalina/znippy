@@ -345,6 +345,72 @@ pub fn build_arrow_batch_from_chunks(rows: &[ChunkRow]) -> arrow::error::Result<
     )
 }
 
+/// Build a RecordBatch directly from (ChunkMeta, compressed_data) pairs.
+/// Zero-copy for the zdata column: concatenates all data into one buffer
+/// and constructs LargeBinaryArray from offsets + values without per-row copies.
+pub fn build_batch_zero_copy<F>(
+    chunks: &[(ChunkMeta, Arc<[u8]>)],
+    path_resolver: F,
+) -> arrow::error::Result<RecordBatch>
+where
+    F: Fn(u64) -> String,
+{
+    use arrow::array::{UInt32Builder, UInt8Builder};
+    use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+
+    let schema = ZNIPPY_INDEX_SCHEMA.as_ref().clone();
+    let len = chunks.len();
+
+    let mut path_builder = StringBuilder::with_capacity(len, len * 64);
+    let mut seq_builder = UInt32Builder::with_capacity(len);
+    let mut fdata_builder = UInt64Builder::with_capacity(len);
+    let mut group_builder = UInt8Builder::with_capacity(len);
+    let mut compressed_builder = BooleanBuilder::with_capacity(len);
+    let mut size_builder = UInt64Builder::with_capacity(len);
+    let mut repo_builder = StringBuilder::new();
+
+    // Build zdata as zero-copy: compute total size, allocate once, memcpy each chunk
+    let total_bytes: usize = chunks.iter().map(|(_, data)| data.len()).sum();
+    let mut values_buf: Vec<u8> = Vec::with_capacity(total_bytes);
+    let mut offsets: Vec<i64> = Vec::with_capacity(len + 1);
+    offsets.push(0);
+
+    for (meta, data) in chunks {
+        path_builder.append_value(path_resolver(meta.file_index));
+        seq_builder.append_value(meta.chunk_seq);
+        fdata_builder.append_value(meta.fdata_offset);
+        group_builder.append_value(meta.checksum_group);
+        compressed_builder.append_value(meta.compressed);
+        size_builder.append_value(meta.uncompressed_size);
+        repo_builder.append_null(); // TODO: support repo column
+
+        values_buf.extend_from_slice(data);
+        offsets.push(values_buf.len() as i64);
+    }
+
+    // Construct LargeBinaryArray from raw buffers (one allocation, no per-row copy)
+    let offsets_buffer = OffsetBuffer::new(ScalarBuffer::from(offsets));
+    let values_buffer = Buffer::from_vec(values_buf);
+    let zdata_array = unsafe {
+        arrow_array::LargeBinaryArray::new_unchecked(offsets_buffer, values_buffer, None)
+    };
+
+    RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(path_builder.finish()),
+            Arc::new(seq_builder.finish()),
+            Arc::new(fdata_builder.finish()),
+            Arc::new(group_builder.finish()),
+            Arc::new(compressed_builder.finish()),
+            Arc::new(size_builder.finish()),
+            Arc::new(repo_builder.finish()),
+            Arc::new(new_null_union_array(len)),
+            Arc::new(zdata_array),
+        ],
+    )
+}
+
 /// Create a null Utf8 array of given length
 fn new_null_utf8_array(len: usize) -> StringArray {
     let mut builder = StringBuilder::new();

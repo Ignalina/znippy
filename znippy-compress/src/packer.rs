@@ -14,8 +14,8 @@ use walkdir::WalkDir;
 use znippy_common::chunkrevolver::{Chunk, ChunkRevolver, SendPtr, get_chunk_slice};
 use znippy_common::common_config::CONFIG;
 use znippy_common::index::{
-    build_arrow_metadata_for_checksums_and_config, should_skip_compression, ChunkRow,
-    build_arrow_batch_from_chunks,
+    build_arrow_metadata_for_checksums_and_config, should_skip_compression,
+    build_batch_zero_copy,
 };
 use znippy_common::meta::{ChunkMeta, WriterStats};
 use znippy_common::{
@@ -402,7 +402,7 @@ pub fn compress_dir(
         let mut arrow_writer = FileWriter::try_new(buf_writer, &schema)
             .expect("Failed to create Arrow writer");
 
-        let mut chunk_rows: Vec<(ChunkMeta, Vec<u8>)> = Vec::new();
+        let mut chunk_buf: Vec<(ChunkMeta, Arc<[u8]>)> = Vec::new();
         let mut buffered_bytes: u64 = 0;
         let mut writerstats = WriterStats {
             total_chunks: 0,
@@ -413,68 +413,35 @@ pub fn compress_dir(
             corrupt_bytes: 0,
         };
 
+        let flush = |buf: &mut Vec<(ChunkMeta, Arc<[u8]>)>, writer: &mut FileWriter<std::io::BufWriter<File>>| {
+            let batch = build_batch_zero_copy(buf, |file_index| {
+                let idx = file_index as usize;
+                all_files_for_writer[idx]
+                    .strip_prefix(&input_dir_cloned)
+                    .unwrap_or(&all_files_for_writer[idx])
+                    .to_string_lossy()
+                    .to_string()
+            }).expect("Failed to build batch");
+            writer.write(&batch).expect("Failed to write batch");
+            buf.clear();
+        };
+
         while let Ok((compressed_data, chunk_meta)) = rx_compressed.recv() {
             writerstats.total_chunks += 1;
             let data_len = compressed_data.len() as u64;
             writerstats.total_written_bytes += data_len;
             buffered_bytes += data_len;
-            chunk_rows.push((chunk_meta, compressed_data.to_vec()));
+            chunk_buf.push((chunk_meta, compressed_data));
 
             if buffered_bytes >= BATCH_FLUSH_BYTES {
-                let rows: Vec<ChunkRow> = chunk_rows
-                    .drain(..)
-                    .map(|(meta, data)| {
-                        let idx = meta.file_index as usize;
-                        let rel_path = all_files_for_writer[idx]
-                            .strip_prefix(&input_dir_cloned)
-                            .unwrap_or(&all_files_for_writer[idx])
-                            .to_string_lossy()
-                            .to_string();
-                        ChunkRow {
-                            relative_path: rel_path,
-                            chunk_seq: meta.chunk_seq,
-                            fdata_offset: meta.fdata_offset,
-                            checksum_group: meta.checksum_group,
-                            compressed: meta.compressed,
-                            uncompressed_size: meta.uncompressed_size,
-                            repo: None,
-                            zdata: data,
-                        }
-                    })
-                    .collect();
-                let batch = build_arrow_batch_from_chunks(&rows)
-                    .expect("Failed to build batch");
-                arrow_writer.write(&batch).expect("Failed to write batch");
+                flush(&mut chunk_buf, &mut arrow_writer);
                 buffered_bytes = 0;
             }
         }
 
         // Flush remaining
-        if !chunk_rows.is_empty() {
-            let rows: Vec<ChunkRow> = chunk_rows
-                .into_iter()
-                .map(|(meta, data)| {
-                    let idx = meta.file_index as usize;
-                    let rel_path = all_files_for_writer[idx]
-                        .strip_prefix(&input_dir_cloned)
-                        .unwrap_or(&all_files_for_writer[idx])
-                        .to_string_lossy()
-                        .to_string();
-                    ChunkRow {
-                        relative_path: rel_path,
-                        chunk_seq: meta.chunk_seq,
-                        fdata_offset: meta.fdata_offset,
-                        checksum_group: meta.checksum_group,
-                        compressed: meta.compressed,
-                        uncompressed_size: meta.uncompressed_size,
-                        repo: None,
-                        zdata: data,
-                    }
-                })
-                .collect();
-            let batch = build_arrow_batch_from_chunks(&rows)
-                .expect("Failed to build batch");
-            arrow_writer.write(&batch).expect("Failed to write batch");
+        if !chunk_buf.is_empty() {
+            flush(&mut chunk_buf, &mut arrow_writer);
         }
 
         log::info!(
