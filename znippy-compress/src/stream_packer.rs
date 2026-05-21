@@ -17,10 +17,10 @@ use znippy_common::{
     CompressionReport, FileMeta, attach_metadata, build_arrow_batch_from_files,
     split_into_microchunks,
 };
+#[cfg(feature = "zstd")]
 use zstd_sys_rs::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
+#[cfg(feature = "zstd")]
 use zstd_sys_rs::*;
-
-use crate::packer::compress2_microchunk;
 
 /// An entry to be compressed into the archive.
 /// Contains the relative path within the archive and the raw file bytes.
@@ -295,13 +295,10 @@ fn run_compression_pipeline(
             let mut hasher = Hasher::new();
             let mut chunk_seq: u32 = 0;
 
+            let mut cctx = znippy_common::codec::CompressCtx::new(CONFIG.compression_level)
+                .expect("Failed to create compression context");
+
             unsafe {
-                let cctx = ZSTD_createCCtx();
-                assert!(!cctx.is_null(), "ZSTD_createCCtx failed");
-
-                ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, CONFIG.compression_level);
-                ZSTD_CCtx_setParameter(cctx, ZSTD_c_nbWorkers, CONFIG.max_core_in_compress as i32);
-
                 loop {
                     match rx_chunk.recv() {
                         Ok((file_index, mut fdata_offset, ring_nr, chunk_nr, length, skip)) => {
@@ -333,7 +330,7 @@ fn run_compression_pipeline(
                                     split_into_microchunks(input, CONFIG.zstd_output_buffer_size);
 
                                 for micro in micro_chunks.iter() {
-                                    let compressed_vec = compress2_microchunk(cctx, micro)?;
+                                    let compressed_vec = cctx.compress(micro)?;
                                     let compressed_chunk: Arc<[u8]> =
                                         Arc::from(compressed_vec.into_boxed_slice());
                                     let chunk_meta = ChunkMeta {
@@ -357,7 +354,6 @@ fn run_compression_pipeline(
                     }
                 }
 
-                ZSTD_freeCCtx(cctx);
                 drop(tx_compressed);
                 drop(tx_ret);
                 drop(rx_chunk);

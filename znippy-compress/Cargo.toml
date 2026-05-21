@@ -10,17 +10,20 @@ readme = "../README.md"
 categories = ["compression", "filesystem", "data-structures"]    
 keywords = ["compression", "zstd", "parallel", "arrow", "blake3"]
 
-
-
+[features]
+default = ["zstd"]
+zstd = ["dep:zstd-sys-rs", "znippy-common/zstd"]
+openzl = ["dep:openzl-sys-rs", "znippy-common/openzl"]
 
 [dependencies]
-zstd-sys-rs = "1.5.10"
+zstd-sys-rs = { version = "1.5.10", optional = true }
+openzl-sys-rs = { version = "0.1.0", optional = true }
 walkdir = "2.5.0"
 blake3 = "1.8.2"
 anyhow = "1.0.100"
 crossbeam-channel = "0.5.15"
 arrow = "57.0.0"
-znippy-common = { version = "0.2.5" }
-#znippy-common = { path = "../znippy-common" }
+znippy-common = { version = "0.2.5", default-features = false }
+#znippy-common = { path = "../znippy-common", default-features = false }
 log = "0.4.28"
 
