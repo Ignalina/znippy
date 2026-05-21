@@ -4,9 +4,14 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+default = ["zstd"]
+zstd = ["znippy-compress/zstd", "znippy-common/zstd"]
+openzl = ["znippy-compress/openzl", "znippy-common/openzl"]
+
 [dependencies]
-znippy-compress = { path = "../znippy-compress" }
-znippy-common = { path = "../znippy-common" }
+znippy-compress = { path = "../znippy-compress", default-features = false }
+znippy-common = { path = "../znippy-common", default-features = false }
 anyhow = "1.0.100"
 tempfile = "3"
 env_logger = "0.11.8"

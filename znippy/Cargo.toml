@@ -10,7 +10,11 @@ readme = "../README.md"
 categories = ["command-line-utilities", "compression"]
 keywords = ["zstd", "arrow", "blake3", "cli","polars"]
 
-[dependencies]
-#znippy-cli = { path ="../znippy-cli" }
+[features]
+default = ["zstd"]
+zstd = ["znippy-cli/zstd"]
+openzl = ["znippy-cli/openzl"]
 
-znippy-cli = "0.2.5"
+[dependencies]
+#znippy-cli = { path ="../znippy-cli", default-features = false }
+znippy-cli = { version = "0.2.5", default-features = false }
