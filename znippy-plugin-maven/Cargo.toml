@@ -1,6 +1,6 @@
 [package]
 name = "znippy-plugin-maven"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
 description = "Maven/JAR metadata plugin for znippy (compiles to native + WASM)"
 license = "MIT"
