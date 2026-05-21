@@ -17,10 +17,6 @@ use znippy_common::{
     CompressionReport, FileMeta, attach_metadata, build_arrow_batch_from_files,
     split_into_microchunks,
 };
-#[cfg(feature = "zstd")]
-use zstd_sys_rs::ZSTD_cParameter::{ZSTD_c_compressionLevel, ZSTD_c_nbWorkers};
-#[cfg(feature = "zstd")]
-use zstd_sys_rs::*;
 
 /// An entry to be compressed into the archive.
 /// Contains the relative path within the archive and the raw file bytes.
