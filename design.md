@@ -101,11 +101,12 @@ decompressed chunks by chunk_seq before hashing.
 │  └─────────────────────────────────────────┼───────────────────────┘    │
 │                                            │                            │
 │  ┌─────────────────────────────────────────▼───────────────────────┐    │
-│  │  Phase 4: Write (Arrow IPC + zdata)                             │    │
+│  │  Phase 4: Write (Arrow IPC, single-file)                       │    │
 │  │                                                                 │    │
-│  │  Compressed chunk → .zdata file (append)                        │    │
-│  │  Index row: path, offset, size, checksum, group, extension      │    │
-│  │             ↑ metadata from Phase 2 attached here               │    │
+│  │  Compressed chunk → inline zdata column (per-row)               │    │
+│  │  Index row: path, chunk_seq, offset, size, checksum_group,      │    │
+│  │             compressed, extension                               │    │
+│  │             ↑ metadata from Phase 2 attached on chunk_seq=0     │    │
 │  │                                                                 │    │
 │  │  Flush Arrow batch every N chunks (bounded memory)              │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
@@ -129,7 +130,7 @@ Compressor thread      │  reads slot in-place (zero-copy)
                        │
 Output buffer          │  compressed result (reused across chunks)
                        ▼
-.zdata append          write to disk, done
+Arrow IPC write        inline as zdata column row, done
 ```
 
 ### Allocations Per File: Exactly 2
@@ -221,7 +222,7 @@ Writer Thread
 
 ---
 
-## Section 2: OpenZL Backend (v0.4, planned)
+## Section 2: OpenZL Backend (v0.3.0, current)
 
 ### Motivation
 
@@ -230,19 +231,21 @@ Writer Thread
 - **Universal decompressor**: single decoder handles all file types (from frame header)
 - **Higher ratios on structured data** at equal or higher speed than zstd
 
-### Format (v0.3 + OpenZL)
+### Format (v0.4 single-file)
 
 Single-file output — Arrow IPC with inline data:
 
 ```
 Schema (one row per chunk):
-  relative_path   Utf8
-  chunk_seq       UInt32
-  fdata_offset    UInt64
-  checksum_group  UInt8
-  compressed      Boolean
-  repo            Utf8 (optional, for multi-repo/Nexus)
-  zdata           LargeBinary (compressed chunk bytes)
+  relative_path    Utf8
+  chunk_seq        UInt32
+  fdata_offset     UInt64
+  checksum_group   UInt8
+  compressed       Boolean
+  uncompressed_size UInt64
+  repo             Utf8 (optional, for multi-repo/Nexus)
+  extension        DenseUnion (nullable, plugin metadata on chunk_seq=0)
+  zdata            LargeBinary (compressed chunk bytes)
 ```
 
 - Multi-batch writes (flush every N chunks → bounded memory)
@@ -292,7 +295,7 @@ The parallel pipeline stays identical. Only the compress/decompress calls change
 
 ---
 
-## Section 3: Single-file Format Migration (v0.3)
+## Section 3: Single-file Format Migration (v0.4, current)
 
 ### Current → Target
 
@@ -301,7 +304,7 @@ BEFORE (v0.2.5):
   archive.znippy  (Arrow IPC index, ~4.5MB for 53k files)
   archive.zdata   (compressed chunks, ~174MB)
 
-AFTER (v0.3):
+AFTER (v0.4):
   archive.znippy  (Arrow IPC, one row per chunk, data inline)
 ```
 

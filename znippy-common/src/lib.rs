@@ -25,10 +25,11 @@ pub use archive::{ZnippyArchive, ZnippyReader};
 pub use decompress::decompress_archive;
 
 pub use index::{
-    HolgerNexusExt, VerifyReport, ZNIPPY_INDEX_SCHEMA, attach_metadata,
-    build_arrow_batch_from_files, build_holger_nexus_union, extension_union_fields,
-    extract_config_from_arrow_metadata, is_probably_compressed, list_archive_contents,
-    read_znippy_index, should_skip_compression, verify_archive_integrity, znippy_index_schema,
+    ChunkRow, HolgerNexusExt, VerifyReport, ZNIPPY_INDEX_SCHEMA, attach_metadata,
+    build_arrow_batch_from_chunks, build_arrow_batch_from_files, build_holger_nexus_union,
+    extension_union_fields, extract_config_from_arrow_metadata, is_probably_compressed,
+    list_archive_contents, read_znippy_index, should_skip_compression, verify_archive_integrity,
+    znippy_index_schema,
 };
 
 #[derive(Debug)]

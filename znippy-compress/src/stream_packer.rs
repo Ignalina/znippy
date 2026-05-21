@@ -2,19 +2,20 @@ use anyhow::{Result, anyhow};
 use arrow::ipc::writer::FileWriter;
 use blake3::Hasher;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Write};
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use znippy_common::chunkrevolver::{ChunkRevolver, SendPtr, get_chunk_slice};
 use znippy_common::common_config::CONFIG;
 use znippy_common::index::{
-    build_arrow_metadata_for_checksums_and_config, should_skip_compression,
+    build_arrow_metadata_for_checksums_and_config, should_skip_compression, ChunkRow,
+    build_arrow_batch_from_chunks,
 };
 use znippy_common::meta::{ChunkMeta, WriterStats};
 use znippy_common::{
-    CompressionReport, FileMeta, attach_metadata, build_arrow_batch_from_files,
+    CompressionReport, attach_metadata,
     split_into_microchunks,
 };
 
@@ -54,10 +55,10 @@ impl StreamCompressor {
 /// Start a streaming compression pipeline.
 ///
 /// Returns a `StreamCompressor` handle. Feed `ArchiveEntry` items via `handle.sender().send(entry)`,
-/// then call `handle.finish()` to finalize the .znippy + .zdata archive.
+/// then call `handle.finish()` to finalize the single-file .znippy archive.
 ///
 /// # Arguments
-/// * `output` - Base path for output files (produces output.znippy + output.zdata)
+/// * `output` - Base path for output file (produces output.znippy)
 /// * `no_skip` - If true, compress all files regardless of extension
 pub fn compress_stream(output: &PathBuf, no_skip: bool) -> Result<StreamCompressor> {
     let (tx_entry, rx_entry): (Sender<ArchiveEntry>, Receiver<ArchiveEntry>) = unbounded();
@@ -134,16 +135,6 @@ fn run_compression_pipeline(
         Receiver<(Arc<[u8]>, ChunkMeta)>,
     ) = unbounded();
     let (tx_return, rx_return): (Sender<(u8, u64)>, Receiver<(u8, u64)>) = unbounded();
-
-    let output_zdata_path = output.with_extension("zdata");
-    log::debug!("Creating zdata file at: {:?}", output_zdata_path);
-    let zdata_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&output_zdata_path)?;
-    let mut writer =
-        BufWriter::with_capacity((CONFIG.file_split_block_size / 2) as usize, zdata_file);
 
     let mut revolver = ChunkRevolver::new(&CONFIG);
     let base_ptrs = revolver.base_ptrs();
@@ -325,8 +316,9 @@ fn run_compression_pipeline(
                                 let micro_chunks =
                                     split_into_microchunks(input, CONFIG.zstd_output_buffer_size);
 
-                                for micro in micro_chunks.iter() {
-                                    let compressed_vec = cctx.compress(micro)?;
+                                if micro_chunks.is_empty() {
+                                    // Empty file: emit a single empty chunk to preserve file in archive
+                                    let compressed_vec = cctx.compress(&[])?;
                                     let compressed_chunk: Arc<[u8]> =
                                         Arc::from(compressed_vec.into_boxed_slice());
                                     let chunk_meta = ChunkMeta {
@@ -337,11 +329,29 @@ fn run_compression_pipeline(
                                         checksum_group: compressor_group,
                                         compressed_size: compressed_chunk.len() as u64,
                                         compressed: true,
-                                        uncompressed_size: micro.len() as u64,
+                                        uncompressed_size: 0,
                                     };
-                                    fdata_offset += micro.len() as u64;
                                     tx_compressed.send((compressed_chunk, chunk_meta))?;
                                     chunk_seq += 1;
+                                } else {
+                                    for micro in micro_chunks.iter() {
+                                        let compressed_vec = cctx.compress(micro)?;
+                                        let compressed_chunk: Arc<[u8]> =
+                                            Arc::from(compressed_vec.into_boxed_slice());
+                                        let chunk_meta = ChunkMeta {
+                                            zdata_offset: 0,
+                                            fdata_offset,
+                                            file_index,
+                                            chunk_seq,
+                                            checksum_group: compressor_group,
+                                            compressed_size: compressed_chunk.len() as u64,
+                                            compressed: true,
+                                            uncompressed_size: micro.len() as u64,
+                                        };
+                                        fdata_offset += micro.len() as u64;
+                                        tx_compressed.send((compressed_chunk, chunk_meta))?;
+                                        chunk_seq += 1;
+                                    }
                                 }
                             }
                             tx_ret.send((ring_nr, chunk_nr));
@@ -361,18 +371,9 @@ fn run_compression_pipeline(
     }
 
     // Writer thread (identical to compress_dir)
-    let output_for_writer = output.clone();
+    // Writer thread — collect chunk rows inline (v2: no .zdata file)
     let writer_thread = thread::spawn(move || {
-        let mut file_metadata: Vec<FileMeta> = relative_paths_for_writer
-            .iter()
-            .map(|path| FileMeta {
-                relative_path: path.clone(),
-                compressed: false,
-                uncompressed_size: 0,
-                chunks: Vec::new(),
-            })
-            .collect();
-
+        let mut chunk_rows: Vec<(ChunkMeta, Vec<u8>)> = Vec::new();
         let mut writerstats = WriterStats {
             total_chunks: 0,
             total_written_bytes: 0,
@@ -381,44 +382,37 @@ fn run_compression_pipeline(
             verified_bytes: 0,
             corrupt_bytes: 0,
         };
-        let mut zdata_offset: u64 = 0;
 
-        while let Ok((compressed_data, mut chunk_meta)) = rx_compressed.recv() {
-            let idx = chunk_meta.file_index as usize;
-
-            if idx >= file_metadata.len() {
-                log::error!(
-                    "[writer] Invalid file_index {}: file_metadata.len() = {}",
-                    idx,
-                    file_metadata.len()
-                );
-                continue;
-            }
-
-            let file = &mut file_metadata[idx];
-            file.compressed = chunk_meta.compressed;
-            file.uncompressed_size += chunk_meta.uncompressed_size;
-            chunk_meta.zdata_offset = zdata_offset;
-
-            if let Err(e) = writer.write_all(&compressed_data) {
-                log::error!("[writer] Write error: {}", e);
-                continue;
-            }
-
-            file.chunks.push(chunk_meta);
-            zdata_offset += compressed_data.len() as u64;
+        while let Ok((compressed_data, chunk_meta)) = rx_compressed.recv() {
             writerstats.total_chunks += 1;
             writerstats.total_written_bytes += compressed_data.len() as u64;
+            chunk_rows.push((chunk_meta, compressed_data.to_vec()));
         }
 
         log::info!(
-            "[writer] Done {} chunks, total written {} bytes",
+            "[writer] Done {} chunks, total {} bytes",
             writerstats.total_chunks,
             writerstats.total_written_bytes
         );
 
-        // Build arrow batch using relative paths directly
-        let batch = build_arrow_batch_from_files(&file_metadata, std::path::Path::new(""));
+        let rows: Vec<ChunkRow> = chunk_rows
+            .into_iter()
+            .map(|(meta, data)| {
+                let rel_path = relative_paths_for_writer[meta.file_index as usize].clone();
+                ChunkRow {
+                    relative_path: rel_path,
+                    chunk_seq: meta.chunk_seq,
+                    fdata_offset: meta.fdata_offset,
+                    checksum_group: meta.checksum_group,
+                    compressed: meta.compressed,
+                    uncompressed_size: meta.uncompressed_size,
+                    repo: None,
+                    zdata: data,
+                }
+            })
+            .collect();
+
+        let batch = build_arrow_batch_from_chunks(&rows);
         (writerstats, batch)
     });
 
@@ -443,17 +437,17 @@ fn run_compression_pipeline(
 
     let (writerstats, batch) = writer_thread.join().unwrap();
 
-    // Build and write Arrow index
+    // Build and write single-file Arrow archive
     let metadata = build_arrow_metadata_for_checksums_and_config(&checksums, &CONFIG);
     let final_batch = attach_metadata(batch?, metadata)?;
 
-    let index_path = output.with_extension("znippy");
-    let index_file = File::create(&index_path)?;
+    let output_path = output.with_extension("znippy");
+    let index_file = File::create(&output_path)?;
     let mut arrow_writer = FileWriter::try_new(index_file, &final_batch.schema())?;
     arrow_writer.write(&final_batch)?;
     arrow_writer.finish()?;
 
-    log::info!("[stream] Arrow index written to {:?}", index_path);
+    log::info!("[stream] Single-file archive written to {:?}", output_path);
 
     let report = CompressionReport {
         total_files,

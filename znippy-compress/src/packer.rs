@@ -8,7 +8,6 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::net::Shutdown::Write as OtherWrite;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -16,11 +15,12 @@ use walkdir::WalkDir;
 use znippy_common::chunkrevolver::{Chunk, ChunkRevolver, SendPtr, get_chunk_slice};
 use znippy_common::common_config::CONFIG;
 use znippy_common::index::{
-    build_arrow_metadata_for_checksums_and_config, should_skip_compression,
+    build_arrow_metadata_for_checksums_and_config, should_skip_compression, ChunkRow,
+    build_arrow_batch_from_chunks,
 };
 use znippy_common::meta::{ChunkMeta, WriterStats};
 use znippy_common::{
-    CompressionReport, FileMeta, attach_metadata, build_arrow_batch_from_files,
+    CompressionReport, FileMeta, attach_metadata,
     split_into_microchunks,
 };
 fn strip_prefix<'a>(base: &'a Path, full: &'a Path) -> PathBuf {
@@ -81,15 +81,7 @@ pub fn compress_dir(
     ) = unbounded();
     let (tx_return, rx_return): (Sender<(u8, u64)>, Receiver<(u8, u64)>) = unbounded();
 
-    let output_zdata_path = output.with_extension("zdata");
-    log::debug!("Creating zdata file at: {:?}", output_zdata_path);
-    let zdata_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&output_zdata_path)?;
-    let mut writer =
-        BufWriter::with_capacity((CONFIG.file_split_block_size / 2) as usize, zdata_file);
+    let output_path = output.with_extension("znippy");
 
     let mut revolver = ChunkRevolver::new(&CONFIG);
     let base_ptrs = revolver.base_ptrs();
@@ -320,36 +312,55 @@ pub fn compress_dir(
                                 let micro_chunks =
                                     split_into_microchunks(input, CONFIG.zstd_output_buffer_size);
 
-                                for (micro_nr, micro) in micro_chunks.iter().enumerate() {
-                                    let compressed_vec = cctx.compress(micro)?;
-
+                                if micro_chunks.is_empty() {
+                                    // Empty file: emit one empty chunk to preserve in archive
+                                    let compressed_vec = cctx.compress(&[])?;
                                     let compressed_chunk: Arc<[u8]> =
                                         Arc::from(compressed_vec.into_boxed_slice());
                                     let chunk_meta = ChunkMeta {
-                                        zdata_offset: 0, // to be set by writer
+                                        zdata_offset: 0,
                                         fdata_offset,
                                         file_index,
                                         chunk_seq,
                                         checksum_group: compressor_group,
                                         compressed_size: compressed_chunk.len() as u64,
                                         compressed: true,
-                                        uncompressed_size: micro.len() as u64,
+                                        uncompressed_size: 0,
                                     };
-                                    fdata_offset += micro.len() as u64;
-                                    log::debug!(
-                                        "[compressor {}] did File_index {} chunk nr {} size {} micro nr {} chunk size {} out {} zdata_offset = {}",
-                                        compressor_group,
-                                        file_index,
-                                        chunk_nr,
-                                        length,
-                                        micro_nr,
-                                        micro.len(),
-                                        chunk_meta.compressed_size,
-                                        chunk_meta.zdata_offset
-                                    );
-
                                     tx_compressed.send((compressed_chunk, chunk_meta))?;
                                     chunk_seq += 1;
+                                } else {
+                                    for (micro_nr, micro) in micro_chunks.iter().enumerate() {
+                                        let compressed_vec = cctx.compress(micro)?;
+
+                                        let compressed_chunk: Arc<[u8]> =
+                                            Arc::from(compressed_vec.into_boxed_slice());
+                                        let chunk_meta = ChunkMeta {
+                                            zdata_offset: 0, // to be set by writer
+                                            fdata_offset,
+                                            file_index,
+                                            chunk_seq,
+                                            checksum_group: compressor_group,
+                                            compressed_size: compressed_chunk.len() as u64,
+                                            compressed: true,
+                                            uncompressed_size: micro.len() as u64,
+                                        };
+                                        fdata_offset += micro.len() as u64;
+                                        log::debug!(
+                                            "[compressor {}] did File_index {} chunk nr {} size {} micro nr {} chunk size {} out {} zdata_offset = {}",
+                                            compressor_group,
+                                            file_index,
+                                            chunk_nr,
+                                            length,
+                                            micro_nr,
+                                            micro.len(),
+                                            chunk_meta.compressed_size,
+                                            chunk_meta.zdata_offset
+                                        );
+
+                                        tx_compressed.send((compressed_chunk, chunk_meta))?;
+                                        chunk_seq += 1;
+                                    }
                                 }
                             }
                             tx_ret.send((ring_nr, chunk_nr));
@@ -381,17 +392,7 @@ pub fn compress_dir(
     // Writer thread
     let output = output.clone(); // klona innan writer_thread
     let writer_thread = thread::spawn(move || {
-        let mut file_metadata: Vec<FileMeta> = Vec::with_capacity(all_files_for_writer.len());
-
-        file_metadata = all_files_for_writer
-            .iter()
-            .map(|path| FileMeta {
-                relative_path: path.to_string_lossy().to_string(),
-                compressed: false,
-                uncompressed_size: 0,
-                chunks: Vec::new(),
-            })
-            .collect();
+        let mut chunk_rows: Vec<(ChunkMeta, Vec<u8>)> = Vec::new();
 
         let mut writerstats = WriterStats {
             total_chunks: 0,
@@ -401,81 +402,43 @@ pub fn compress_dir(
             verified_bytes: 0,
             corrupt_bytes: 0,
         };
-        let mut zdata_offset: u64 = 0;
 
-        let mut zero_fdata_per_file: std::collections::HashMap<u64, usize> =
-            std::collections::HashMap::new();
-        while let Ok((compressed_data, mut chunk_meta)) = rx_compressed.recv() {
-            //            log::debug!("[writer] Received compressed block from file with index {}:  length {} start write at offset {}", chunk_meta.file_index, compressed_data.len(),zdata_offset);
-
-            // Inuti loopen, direkt efter while-raden:
-            if chunk_meta.fdata_offset == 0 {
-                let count = zero_fdata_per_file
-                    .entry(chunk_meta.file_index)
-                    .or_default();
-                *count += 1;
-                if *count > 1 {
-                    panic!(
-                        "❌ More than one chunk with fdata_offset == 0 for file_index {} (count = {})",
-                        chunk_meta.file_index, count
-                    );
-                }
-            }
-
-            let idx = chunk_meta.file_index as usize;
-
-            debug_assert_eq!(
-                compressed_data.len() as u64,
-                chunk_meta.compressed_size,
-                "Mismatch between actual compressed data length ({}) and chunk_meta.compressed_size ({}) for file_index {}, chunk_seq {}",
-                compressed_data.len(),
-                chunk_meta.compressed_size,
-                chunk_meta.file_index,
-                chunk_meta.chunk_seq
-            );
-
-            if idx >= file_metadata.len() {
-                log::error!(
-                    "[writer] Invalid file_index {}: file_metadata.len() = {}",
-                    idx,
-                    file_metadata.len()
-                );
-                continue;
-            }
-
-            let file = &mut file_metadata[idx];
-            let path = &all_files_for_writer[idx];
-            let uncompressed_size = chunk_meta.uncompressed_size;
-
-            file.relative_path = path.to_string_lossy().to_string();
-            file.compressed = chunk_meta.compressed;
-            file.uncompressed_size += uncompressed_size;
-            // Always push the chunk metadata
-            chunk_meta.zdata_offset = zdata_offset;
-
-            if let Err(e) = writer.write_all(&compressed_data) {
-                log::error!("[writer] Write error: {}", e);
-                continue;
-            }
-
-            let chunk_seq = chunk_meta.chunk_seq;
-            let file_index = chunk_meta.file_index;
-            let expected_size = chunk_meta.uncompressed_size;
-
-            file.chunks.push(chunk_meta); // move happens here
-
-            zdata_offset += compressed_data.len() as u64;
+        while let Ok((compressed_data, chunk_meta)) = rx_compressed.recv() {
             writerstats.total_chunks += 1;
-            writerstats.total_written_bytes += compressed_data.len() as u64; // Update the total output bytes
+            writerstats.total_written_bytes += compressed_data.len() as u64;
+            chunk_rows.push((chunk_meta, compressed_data.to_vec()));
         }
 
         log::info!(
-            "[writer] Done {} chunks , total written {} bytes)",
+            "[writer] Done {} chunks, total {} bytes",
             writerstats.total_chunks,
             writerstats.total_written_bytes
         );
 
-        let batch = build_arrow_batch_from_files(&file_metadata, &input_dir_cloned);
+        // Build ChunkRow array for Arrow batch
+        let rows: Vec<ChunkRow> = chunk_rows
+            .into_iter()
+            .map(|(meta, data)| {
+                let idx = meta.file_index as usize;
+                let rel_path = all_files_for_writer[idx]
+                    .strip_prefix(&input_dir_cloned)
+                    .unwrap_or(&all_files_for_writer[idx])
+                    .to_string_lossy()
+                    .to_string();
+                ChunkRow {
+                    relative_path: rel_path,
+                    chunk_seq: meta.chunk_seq,
+                    fdata_offset: meta.fdata_offset,
+                    checksum_group: meta.checksum_group,
+                    compressed: meta.compressed,
+                    uncompressed_size: meta.uncompressed_size,
+                    repo: None,
+                    zdata: data,
+                }
+            })
+            .collect();
+
+        let batch = build_arrow_batch_from_chunks(&rows);
         (writerstats, batch)
     });
 
@@ -490,7 +453,6 @@ pub fn compress_dir(
 
     let mut checksums: Vec<[u8; 32]> = Vec::with_capacity(CONFIG.max_core_in_compress as usize);
 
-    let mut i = 0;
     for handle in compressor_threads {
         let Ok((compressor_group, checksum)): Result<(u8, [u8; 32]), anyhow::Error> =
             handle.join().unwrap()
@@ -519,18 +481,13 @@ pub fn compress_dir(
 
     log::debug!("[writer] writer_thread finished");
 
-    // Create index file
-    let index_path = output.with_extension("znippy");
-    let index_file = File::create(&index_path)?;
-
-    // Create FileWriter
+    // Write single .znippy file (v2 format — no .zdata)
+    let index_file = File::create(&output_path)?;
     let mut writer = FileWriter::try_new(index_file, &final_batch.schema())?;
-
-    // Write batch
     writer.write(&final_batch)?;
-    writer.finish()?; // ← Ensure writer is properly finished
+    writer.finish()?;
 
-    log::info!("[main] Arrow index written and finished.");
+    log::info!("[main] Single-file archive written: {:?}", output_path);
 
     let report = CompressionReport {
         total_files,
@@ -553,4 +510,3 @@ pub fn compress_dir(
 
     Ok(report)
 }
-

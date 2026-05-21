@@ -20,27 +20,16 @@ use arrow::ipc::reader::FileReader;
 use arrow::record_batch::RecordBatch;
 use once_cell::sync::Lazy;
 
+/// v2 schema: one row per chunk, zdata inline
 pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("relative_path", DataType::Utf8, false),
-        Field::new("compressed", DataType::Boolean, true),
+        Field::new("chunk_seq", DataType::UInt32, false),
+        Field::new("fdata_offset", DataType::UInt64, false),
+        Field::new("checksum_group", DataType::UInt8, false),
+        Field::new("compressed", DataType::Boolean, false),
         Field::new("uncompressed_size", DataType::UInt64, false),
-        Field::new("group", DataType::Utf8, true),
-        Field::new(
-            "chunks",
-            DataType::List(Arc::new(Field::new(
-                "item",
-                DataType::Struct(Fields::from(vec![
-                    Field::new("zdata_offset", DataType::UInt64, false),
-                    Field::new("fdata_offset", DataType::UInt64, false),
-                    Field::new("length", DataType::UInt64, false),
-                    Field::new("chunk_seq", DataType::UInt32, false),
-                    Field::new("checksum_group", DataType::UInt8, false),
-                ])),
-                true,
-            ))),
-            true,
-        ),
+        Field::new("repo", DataType::Utf8, true),
         Field::new(
             "extension",
             DataType::Union(
@@ -49,6 +38,7 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
             ),
             true,
         ),
+        Field::new("zdata", DataType::LargeBinary, false),
     ]))
 });
 
@@ -99,6 +89,9 @@ pub fn build_arrow_metadata_for_checksums_and_config(
     config: &StrategicConfig,
 ) -> HashMap<String, String> {
     let mut metadata = HashMap::new();
+
+    // Format version
+    metadata.insert("znippy_format_version".into(), "2".into());
 
     // Lägg in checksummor
     for (i, hash) in checksums.iter().enumerate() {
@@ -253,94 +246,101 @@ pub fn build_arrow_batch_from_files(
     files: &[FileMeta],
     input_dir: &Path,
 ) -> arrow::error::Result<RecordBatch> {
-    let schema = ZNIPPY_INDEX_SCHEMA.as_ref().clone();
-
-    let mut relative_path_builder = StringBuilder::new();
-    let mut compressed_builder = BooleanBuilder::new();
-    let mut uncompressed_size_builder = UInt64Builder::new();
-
-    // Create the StructBuilder for chunk data
-    let chunk_struct_builder = StructBuilder::new(
-        vec![
-            Field::new("zdata_offset", DataType::UInt64, false),
-            Field::new("fdata_offset", DataType::UInt64, false),
-            Field::new("length", DataType::UInt64, false),
-            Field::new("chunk_seq", DataType::UInt32, false),
-            Field::new("checksum_group", DataType::UInt8, false),
-        ],
-        vec![
-            Box::new(UInt64Builder::new()),
-            Box::new(UInt64Builder::new()),
-            Box::new(UInt64Builder::new()),
-            Box::new(UInt32Builder::new()),
-            Box::new(UInt8Builder::new()),
-        ],
-    );
-
-    let mut chunks_builder = ListBuilder::new(chunk_struct_builder);
-
+    // Convert old FileMeta format to chunk rows for the v2 schema
+    let mut rows: Vec<ChunkRow> = Vec::new();
     for file in files {
-        // Append each file's path, compression status, and uncompressed size
-
         let full_path = Path::new(&file.relative_path);
         let rel_path = full_path
             .strip_prefix(input_dir)
-            .expect("❌ build_arrow_batch_from_files: file path is not under input_dir")
-            .to_string_lossy();
+            .unwrap_or(full_path)
+            .to_string_lossy()
+            .to_string();
 
-        relative_path_builder.append_value(&rel_path);
-
-        compressed_builder.append_value(file.compressed);
-        uncompressed_size_builder.append_value(file.uncompressed_size);
-
-        // Access the values for appending chunk data
-        let struct_builder = chunks_builder.values();
-
-        // If there are no chunks, append null for this file's chunk list
         if file.chunks.is_empty() {
-            chunks_builder.append_null();
-            continue;
+            // Empty file: one row with empty zdata
+            rows.push(ChunkRow {
+                relative_path: rel_path,
+                chunk_seq: 0,
+                fdata_offset: 0,
+                checksum_group: 0,
+                compressed: file.compressed,
+                uncompressed_size: 0,
+                repo: None,
+                zdata: Vec::new(),
+            });
+        } else {
+            for chunk in &file.chunks {
+                rows.push(ChunkRow {
+                    relative_path: rel_path.clone(),
+                    chunk_seq: chunk.chunk_seq,
+                    fdata_offset: chunk.fdata_offset,
+                    checksum_group: chunk.checksum_group,
+                    compressed: chunk.compressed,
+                    uncompressed_size: chunk.uncompressed_size,
+                    repo: None,
+                    zdata: Vec::new(), // zdata filled by caller
+                });
+            }
         }
-        log::debug!(
-            "Batch schema stats → file: {} has  {} chunks",
-            file.relative_path,
-            file.chunks.len()
-        );
+    }
+    build_arrow_batch_from_chunks(&rows)
+}
 
-        // Iterate over the chunks in the file and append the data to the struct
-        for chunk in &file.chunks {
-            // Check and append values to the struct builder
-            let zdata_offset_builder = struct_builder.field_builder::<UInt64Builder>(0).unwrap();
-            zdata_offset_builder.append_value(chunk.zdata_offset);
+/// A single chunk row for the v2 format
+#[derive(Debug, Clone)]
+pub struct ChunkRow {
+    pub relative_path: String,
+    pub chunk_seq: u32,
+    pub fdata_offset: u64,
+    pub checksum_group: u8,
+    pub compressed: bool,
+    pub uncompressed_size: u64,
+    pub repo: Option<String>,
+    pub zdata: Vec<u8>,
+}
 
-            // Check and append values to the struct builder
-            let fdata_offset_builder = struct_builder.field_builder::<UInt64Builder>(1).unwrap();
-            fdata_offset_builder.append_value(chunk.fdata_offset);
+/// Build a RecordBatch from chunk rows (v2 single-file format)
+pub fn build_arrow_batch_from_chunks(rows: &[ChunkRow]) -> arrow::error::Result<RecordBatch> {
+    use arrow::array::{LargeBinaryBuilder, UInt32Builder, UInt8Builder};
 
-            let length_builder = struct_builder.field_builder::<UInt64Builder>(2).unwrap();
-            length_builder.append_value(chunk.compressed_size);
+    let schema = ZNIPPY_INDEX_SCHEMA.as_ref().clone();
+    let len = rows.len();
 
-            let chunk_seq_builder = struct_builder.field_builder::<UInt32Builder>(3).unwrap();
-            chunk_seq_builder.append_value(chunk.chunk_seq);
+    let mut path_builder = StringBuilder::with_capacity(len, len * 64);
+    let mut seq_builder = UInt32Builder::with_capacity(len);
+    let mut fdata_builder = UInt64Builder::with_capacity(len);
+    let mut group_builder = UInt8Builder::with_capacity(len);
+    let mut compressed_builder = BooleanBuilder::with_capacity(len);
+    let mut size_builder = UInt64Builder::with_capacity(len);
+    let mut repo_builder = StringBuilder::new();
+    let mut zdata_builder = LargeBinaryBuilder::new();
 
-            let checksum_group_builder = struct_builder.field_builder::<UInt8Builder>(4).unwrap();
-            checksum_group_builder.append_value(chunk.checksum_group);
-
-            struct_builder.append(true); // Append this chunk
+    for row in rows {
+        path_builder.append_value(&row.relative_path);
+        seq_builder.append_value(row.chunk_seq);
+        fdata_builder.append_value(row.fdata_offset);
+        group_builder.append_value(row.checksum_group);
+        compressed_builder.append_value(row.compressed);
+        size_builder.append_value(row.uncompressed_size);
+        match &row.repo {
+            Some(r) => repo_builder.append_value(r),
+            None => repo_builder.append_null(),
         }
-
-        chunks_builder.append(true); // Append this file's chunks to the list
+        zdata_builder.append_value(&row.zdata);
     }
 
     RecordBatch::try_new(
         Arc::new(schema),
         vec![
-            Arc::new(relative_path_builder.finish()),
+            Arc::new(path_builder.finish()),
+            Arc::new(seq_builder.finish()),
+            Arc::new(fdata_builder.finish()),
+            Arc::new(group_builder.finish()),
             Arc::new(compressed_builder.finish()),
-            Arc::new(uncompressed_size_builder.finish()),
-            Arc::new(new_null_utf8_array(files.len())),  // group (NULL = default)
-            Arc::new(chunks_builder.finish()),
-            Arc::new(new_null_union_array(files.len())), // extension (NULL = none)
+            Arc::new(size_builder.finish()),
+            Arc::new(repo_builder.finish()),
+            Arc::new(new_null_union_array(len)),
+            Arc::new(zdata_builder.finish()),
         ],
     )
 }

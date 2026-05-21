@@ -48,9 +48,10 @@ fn test_stream_compress_single_small_file() -> Result<()> {
 
     assert_eq!(report.total_files, 1);
     assert!(archive_path.exists(), ".znippy file should exist");
+    // v2 format: single file, no separate .zdata
     assert!(
-        archive_path.with_extension("zdata").exists(),
-        ".zdata file should exist"
+        !archive_path.with_extension("zdata").exists(),
+        ".zdata file should NOT exist in v2 format"
     );
 
     // Round-trip: decompress and verify
@@ -114,7 +115,7 @@ fn test_stream_compress_empty_file() -> Result<()> {
 
     assert_eq!(report.total_files, 1);
 
-    // Verify the index records the file even if empty
+    // v2: empty file still gets one row (chunk_seq=0 with empty compressed data)
     let (_schema, batches) = znippy_common::read_znippy_index(&archive_path)?;
     assert_eq!(batches[0].num_rows(), 1);
 
@@ -228,7 +229,8 @@ fn test_compress_dir_basic() -> Result<()> {
 
     assert_eq!(report.total_files, 2);
     assert!(archive_path.exists());
-    assert!(archive_path.with_extension("zdata").exists());
+    // v2 format: single file, no separate .zdata
+    assert!(!archive_path.with_extension("zdata").exists());
 
     // Decompress and verify
     let decomp_dir = TempDir::new()?;
@@ -285,7 +287,17 @@ fn test_index_schema_fields() {
     let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(
         field_names,
-        vec!["relative_path", "compressed", "uncompressed_size", "group", "chunks", "extension"]
+        vec![
+            "relative_path",
+            "chunk_seq",
+            "fdata_offset",
+            "checksum_group",
+            "compressed",
+            "uncompressed_size",
+            "repo",
+            "extension",
+            "zdata",
+        ]
     );
 }
 
