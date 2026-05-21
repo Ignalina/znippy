@@ -17,70 +17,88 @@ Built on **Apache Arrow IPC** + **OpenZL** (zstd+lz4 under the hood).
 | Java raw (191k files) | 1,236 MB | 444 MB | 2.8x | 83.0 MB/s | 526 MB/s |
 | rust crates (53k files) | 1,298 MB | 174 MB | 7.5x | 41 MB/s | 1,417 MB/s |
 
-## Architecture
+## Architecture — Dual-Pipeline (v0.5)
 
-```mermaid
-flowchart LR
-    subgraph Input
-        Files[Input Files]
-    end
+Single `.znippy` file = valid Arrow IPC Stream. Queryable by DuckDB/Polars/pyarrow directly:
 
-    subgraph "Reader Thread"
-        Reader[Reader] --> Split[Split into chunks<br/>10MB default]
-        Split --> Revolver((ChunkRevolver))
-    end
-
-    subgraph "Compressor Threads (1..N cores)"
-        Revolver --> C0[Core 0<br/>OpenZL + blake3]
-        Revolver --> C1[Core 1<br/>OpenZL + blake3]
-        Revolver --> C2[Core 2<br/>...]
-        Revolver --> CN[Core N<br/>OpenZL + blake3]
-    end
-
-    subgraph "Writer Thread"
-        C0 --> Writer[Writer]
-        C1 --> Writer
-        C2 --> Writer
-        CN --> Writer
-    end
-
-    subgraph Output
-        Writer --> Archive[".znippy<br/>(Arrow IPC index +<br/>checksums + config)"]
-        Writer --> Zdata[".zdata<br/>(compressed chunks)"]
-    end
-
-    Files --> Reader
+```sql
+SELECT relative_path, uncompressed_size FROM 'archive.znippy';
 ```
 
-## Decompression Pipeline
+Two pipelines based on whether compression is needed:
 
-```mermaid
-flowchart LR
-    subgraph Input
-        Index[".znippy index"] --> Reader
-        Zdata[".zdata"] --> Reader
-    end
+### Pipeline A: Compress (compressible files)
 
-    subgraph "Reader Thread"
-        Reader[Reader<br/>seek + read chunks]
-        Reader --> Revolver((ChunkRevolver))
-    end
+```
+  File bytes
+      │
+      ▼
+  ┌─────────────────┐
+  │  Split chunks   │  (ChunkRevolver ring buffer)
+  └────────┬────────┘
+           │
+     ┌─────┼─────┐        parallel across all cores
+     ▼     ▼     ▼
+  ┌─────┐┌─────┐┌─────┐
+  │OpenZL││OpenZL││OpenZL│  compress each chunk
+  │  +  ││  +  ││  +  │
+  │blake3││blake3││blake3│  hash original data
+  └──┬───┘└──┬───┘└──┬───┘
+     │     │     │
+     ▼     ▼     ▼
+  ┌─────────────────────────────┐
+  │ Arrow IPC writer            │  Buffer::from(compressed_vec)
+  │ (zdata = compressed bytes)  │  ownership transfer
+  └─────────────────────────────┘
+```
 
-    subgraph "Decompressor Threads (1..N cores)"
-        Revolver --> D0[Core 0<br/>zstd decompress]
-        Revolver --> D1[Core 1<br/>zstd decompress]
-        Revolver --> D2[Core 2<br/>...]
-        Revolver --> DN[Core N<br/>zstd decompress]
-    end
+### Pipeline B: Store as-is (pre-compressed: .jpg, .mp4, .gz, .jar, .png)
 
-    subgraph "Writer Thread"
-        D0 --> Writer[Writer<br/>+ blake3 verify]
-        D1 --> Writer
-        D2 --> Writer
-        DN --> Writer
-    end
+```
+  File bytes (size known upfront!)
+      │
+      ├──────────────────────────────────┐
+      │                                  │
+      ▼                                  ▼
+  ┌─────────────────┐     ┌───────────────────────────────┐
+  │  Split chunks   │     │  Arrow IPC writer             │
+  └────────┬────────┘     │  (zdata = raw bytes)          │  ZERO COPY
+           │              │  Buffer::from(vec)            │  (parallel!)
+     ┌─────┼─────┐       └───────────────────────────────┘
+     ▼     ▼     ▼
+  ┌─────┐┌─────┐┌─────┐
+  │blake3││blake3││blake3│  hash only (parallel across cores)
+  └──┬───┘└──┬───┘└──┬───┘
+     │     │     │
+     ▼     ▼     ▼
+  ┌─────────────────────┐
+  │ Checksum complete   │  (data already written!)
+  └─────────────────────┘
+```
 
-    Writer --> Output[Restored Files]
+### Decompression
+
+```
+  archive.znippy (Arrow IPC Stream)
+      │
+      ▼
+  ┌──────────────────────┐
+  │ Reader Thread        │  read zdata column from Arrow batches
+  │ (Arrow IPC reader)   │
+  └──────────┬───────────┘
+             │
+       ┌─────┼─────┐        parallel across all cores
+       ▼     ▼     ▼
+    ┌─────┐┌─────┐┌─────┐
+    │OpenZL││OpenZL││OpenZL│  decompress (or passthrough if stored raw)
+    │  +  ││  +  ││  +  │
+    │blake3││blake3││blake3│  verify checksum
+    └──┬───┘└──┬───┘└──┬───┘
+       │     │     │
+       ▼     ▼     ▼
+    ┌─────────────────────┐
+    │ Writer Thread       │  write restored files to disk
+    └─────────────────────┘
 ```
 
 ## Features
@@ -109,9 +127,10 @@ znippy list --input archive.znippy
 
 ## Roadmap
 
-- **v0.3.0** (current): OpenZL backend, plugin system (WASM + native), ZnippyArchive API
-- **v0.4**: Single-file format (Arrow IPC with inline binary column per chunk)
-- **v0.5**: Per-file-type specialized compression via plugins
+- **v0.3.0**: OpenZL backend, plugin system (WASM + native), ZnippyArchive API
+- **v0.4.0**: Single-file format (Arrow IPC with inline zdata column)
+- **v0.5.0** (current): Dual-pipeline architecture, DuckDB/Polars queryable, zero-copy for uncompressed
+- **next**: Upstream Arrow IPC scatter-gather fix → auto-recover full NVMe throughput
 
 ## Fan arts
 
