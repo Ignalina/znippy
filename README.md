@@ -4,15 +4,17 @@
 # Znippy
 
 High-performance archive format with per-file compression, parallel processing, and random access.
-Built on **Apache Arrow IPC** + **zstd** (migrating to **OpenZL**).
+Built on **Apache Arrow IPC** + **OpenZL** (zstd+lz4 under the hood).
 
-## Benchmarks (32-core, zstd level 19)
+## Benchmarks (32-core, OpenZL)
 
 | Test | In | Out | Ratio | Compress | Decompress |
 |------|-----|-----|-------|----------|------------|
-| text 500MB | 500 MB | 0.09 MB | 5404x | 1,597 MB/s | 3,086 MB/s |
-| single file 2GB | 2,048 MB | 0.35 MB | 5868x | 3,984 MB/s | 3,089 MB/s |
-| 100k small files | 977 MB | 12.5 MB | 77.9x | 3,140 MB/s | 863 MB/s |
+| text 500MB | 500 MB | 0.11 MB | 4668x | 1,493 MB/s | 2,941 MB/s |
+| single file 2GB | 2,048 MB | 0.40 MB | 5095x | 3,483 MB/s | 3,127 MB/s |
+| 100k small files | 977 MB | 16.9 MB | 57.8x | 3,071 MB/s | 769 MB/s |
+| Rust deps (41k files) | 988 MB | 137 MB | 7.2x | 67.6 MB/s | 1,337 MB/s |
+| Java raw (191k files) | 1,236 MB | 444 MB | 2.8x | 83.0 MB/s | 526 MB/s |
 | rust crates (53k files) | 1,298 MB | 174 MB | 7.5x | 41 MB/s | 1,417 MB/s |
 
 ## Architecture
@@ -29,10 +31,10 @@ flowchart LR
     end
 
     subgraph "Compressor Threads (1..N cores)"
-        Revolver --> C0[Core 0<br/>zstd/OpenZL + blake3]
-        Revolver --> C1[Core 1<br/>zstd/OpenZL + blake3]
+        Revolver --> C0[Core 0<br/>OpenZL + blake3]
+        Revolver --> C1[Core 1<br/>OpenZL + blake3]
         Revolver --> C2[Core 2<br/>...]
-        Revolver --> CN[Core N<br/>zstd/OpenZL + blake3]
+        Revolver --> CN[Core N<br/>OpenZL + blake3]
     end
 
     subgraph "Writer Thread"
@@ -107,9 +109,9 @@ znippy list --input archive.znippy
 
 ## Roadmap
 
-- **v0.2.5** (current, tagged `v0.2.5-zstd`): zstd + Arrow IPC, 2-file format
-- **v0.3**: Single-file format (Arrow IPC with inline binary column per chunk)
-- **v0.4**: OpenZL backend — per-file-type specialized compression
+- **v0.3.0** (current): OpenZL backend, plugin system (WASM + native), ZnippyArchive API
+- **v0.4**: Single-file format (Arrow IPC with inline binary column per chunk)
+- **v0.5**: Per-file-type specialized compression via plugins
 
 ## Fan arts
 
