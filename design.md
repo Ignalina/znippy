@@ -245,3 +245,76 @@ independent of `repo`.
 - Each batch contains ~100 chunks × 10MB = ~1GB max
 - Flush batch → start new batch → constant memory
 - Arrow IPC supports unlimited batches per file
+
+---
+
+## Section 4: Extension Metadata (DenseUnion)
+
+### Concept
+
+The index schema includes ONE nullable column `extension` of type `DenseUnion`.
+Each archive is written by one application — the union is monomorphic per archive
+(all rows use the same variant). Reader checks the union type ID to know the schema.
+
+```
+extension: DenseUnion<
+  photoalbum_v1: Struct<{ album: Utf8, sort_order: UInt32, thumbnail: Binary }>,
+  holger_nexus_v1: Struct<{ group: Utf8, artifact_type: Utf8, version: Utf8 }>,
+  // future extensions add new variants — old readers ignore unknown type IDs
+>
+```
+
+### Design Rules
+
+1. **One column** — `extension` (DenseUnion, nullable)
+2. **Monomorphic per archive** — all rows use the same variant (or NULL)
+3. **Self-describing** — union type ID + schema = app knows what it reads
+4. **Backward compatible** — new variants don't break old readers (unknown ID → skip)
+5. **Zero-copy** — native Arrow nested type, DuckDB/Polars read it natively
+6. **Column pruning** — don't read `extension` if you don't care about it
+
+### Holger Nexus Extension (`holger_nexus_v1`)
+
+For Holger's "dump all Nexus repos into one znippy":
+
+```
+Struct<{
+  group: Utf8,           // e.g. "libs-release", "libs-snapshot", "maven-central"
+  artifact_type: Utf8,   // e.g. "maven", "cargo", "npm", "docker"
+  version: Utf8,         // artifact version string
+}>
+```
+
+Combined with the `group` column (hierarchical path):
+- `group` column: `"maven/libs-release"`, `"cargo/internal"`
+- `extension` (holger_nexus_v1): rich metadata per file (type, version)
+
+### Query Examples
+
+```sql
+-- DuckDB: query extension fields directly
+SELECT relative_path, extension.group, extension.version
+FROM 'nexus-dump.znippy'
+WHERE extension.artifact_type = 'maven';
+
+-- Selective extract by group prefix
+znippy extract nexus-dump.znippy --group maven/ --out ./maven-mirror/
+```
+
+### What Holger Needs to Implement
+
+1. **Writer side** (Holger → znippy):
+   - Walk Nexus repos, for each artifact:
+     - `relative_path`: full path within repo
+     - `group`: `"{type}/{repo_name}"` (hierarchical)
+     - `extension` (holger_nexus_v1): `{ group, artifact_type, version }`
+   - Call `znippy-compress` stream API with `ArchiveEntry` + extension data
+
+2. **Reader side** (znippy → Holger):
+   - Read index, filter by `group` prefix or extension fields
+   - Selective decompress by offset
+
+3. **CLI flags**:
+   - `znippy extract --group maven/libs-release` (prefix match)
+   - `znippy list --extension holger_nexus_v1` (show extension fields)
+

@@ -15,7 +15,7 @@ use arrow::array::{
     ListBuilder, StringArray, StringBuilder, StructArray, StructBuilder, UInt64Array,
     UInt64Builder, make_builder,
 };
-use arrow::datatypes::{DataType, Field, Fields, Schema};
+use arrow::datatypes::{DataType, Field, Fields, Schema, UnionFields, UnionMode};
 use arrow::ipc::reader::FileReader;
 use arrow::record_batch::RecordBatch;
 use once_cell::sync::Lazy;
@@ -25,6 +25,7 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
         Field::new("relative_path", DataType::Utf8, false),
         Field::new("compressed", DataType::Boolean, true),
         Field::new("uncompressed_size", DataType::UInt64, false),
+        Field::new("group", DataType::Utf8, true),
         Field::new(
             "chunks",
             DataType::List(Arc::new(Field::new(
@@ -40,8 +41,44 @@ pub static ZNIPPY_INDEX_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
             ))),
             true,
         ),
+        Field::new(
+            "extension",
+            DataType::Union(
+                extension_union_fields(),
+                UnionMode::Dense,
+            ),
+            true,
+        ),
     ]))
 });
+
+/// Extension union variants — add new extensions here.
+/// Type ID 0 = holger_nexus_v1, Type ID 1 = photoalbum_v1
+pub fn extension_union_fields() -> UnionFields {
+    UnionFields::new(
+        vec![0, 1],
+        vec![
+            Field::new(
+                "holger_nexus_v1",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("group", DataType::Utf8, false),
+                    Field::new("artifact_type", DataType::Utf8, false),
+                    Field::new("version", DataType::Utf8, true),
+                ])),
+                true,
+            ),
+            Field::new(
+                "photoalbum_v1",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("album", DataType::Utf8, false),
+                    Field::new("sort_order", DataType::UInt32, false),
+                    Field::new("thumbnail", DataType::Binary, true),
+                ])),
+                true,
+            ),
+        ],
+    )
+}
 
 pub fn build_arrow_metadata_for_checksums_and_config(
     checksums: &[[u8; 32]],
@@ -287,9 +324,137 @@ pub fn build_arrow_batch_from_files(
             Arc::new(relative_path_builder.finish()),
             Arc::new(compressed_builder.finish()),
             Arc::new(uncompressed_size_builder.finish()),
+            Arc::new(new_null_utf8_array(files.len())),  // group (NULL = default)
             Arc::new(chunks_builder.finish()),
+            Arc::new(new_null_union_array(files.len())), // extension (NULL = none)
         ],
     )
+}
+
+/// Create a null Utf8 array of given length
+fn new_null_utf8_array(len: usize) -> StringArray {
+    let mut builder = StringBuilder::new();
+    for _ in 0..len {
+        builder.append_null();
+    }
+    builder.finish()
+}
+
+/// Create a null DenseUnion array (extension column, all nulls)
+fn new_null_union_array(len: usize) -> arrow::array::UnionArray {
+    use arrow::buffer::ScalarBuffer;
+    let type_ids: Vec<i8> = vec![0; len];
+    // Each row points to its own offset in the null child
+    let offsets: Vec<i32> = (0..len as i32).collect();
+    let fields = extension_union_fields();
+
+    // Child arrays with `len` null entries so offsets are valid
+    let holger_fields = Fields::from(vec![
+        Field::new("group", DataType::Utf8, false),
+        Field::new("artifact_type", DataType::Utf8, false),
+        Field::new("version", DataType::Utf8, true),
+    ]);
+    let photo_fields = Fields::from(vec![
+        Field::new("album", DataType::Utf8, false),
+        Field::new("sort_order", DataType::UInt32, false),
+        Field::new("thumbnail", DataType::Binary, true),
+    ]);
+
+    let holger_child = StructArray::new_null(holger_fields, len);
+    let photo_child = StructArray::new_null(photo_fields, 0);
+
+    let children: Vec<ArrayRef> = vec![
+        Arc::new(holger_child),
+        Arc::new(photo_child),
+    ];
+
+    arrow::array::UnionArray::try_new(
+        fields,
+        ScalarBuffer::from(type_ids),
+        Some(ScalarBuffer::from(offsets)),
+        children,
+    ).unwrap()
+}
+
+// ─── Extension Data Types ────────────────────────────────────────────
+
+/// Holger Nexus extension metadata (per-file)
+#[derive(Debug, Clone)]
+pub struct HolgerNexusExt {
+    pub group: String,
+    pub artifact_type: String,
+    pub version: Option<String>,
+}
+
+/// Build a DenseUnion array for holger_nexus_v1 extension
+pub fn build_holger_nexus_union(entries: &[Option<HolgerNexusExt>]) -> arrow::array::UnionArray {
+    use arrow::buffer::ScalarBuffer;
+
+    let fields = extension_union_fields();
+    let len = entries.len();
+
+    let mut group_builder = StringBuilder::new();
+    let mut type_builder = StringBuilder::new();
+    let mut version_builder = StringBuilder::new();
+
+    let mut type_ids: Vec<i8> = Vec::with_capacity(len);
+    let mut offsets: Vec<i32> = Vec::with_capacity(len);
+    let mut holger_count: i32 = 0;
+
+    for entry in entries {
+        match entry {
+            Some(ext) => {
+                type_ids.push(0); // holger_nexus_v1 = type_id 0
+                offsets.push(holger_count);
+                holger_count += 1;
+                group_builder.append_value(&ext.group);
+                type_builder.append_value(&ext.artifact_type);
+                match &ext.version {
+                    Some(v) => version_builder.append_value(v),
+                    None => version_builder.append_null(),
+                }
+            }
+            None => {
+                // No extension — point at offset 0 of holger variant (will be masked by null)
+                type_ids.push(0);
+                offsets.push(0);
+            }
+        }
+    }
+
+    let holger_struct = StructArray::from(vec![
+        (
+            Arc::new(Field::new("group", DataType::Utf8, false)),
+            Arc::new(group_builder.finish()) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("artifact_type", DataType::Utf8, false)),
+            Arc::new(type_builder.finish()) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("version", DataType::Utf8, true)),
+            Arc::new(version_builder.finish()) as ArrayRef,
+        ),
+    ]);
+
+    let photo_fields = Fields::from(vec![
+        Field::new("album", DataType::Utf8, false),
+        Field::new("sort_order", DataType::UInt32, false),
+        Field::new("thumbnail", DataType::Binary, true),
+    ]);
+    let photo_child = StructArray::new_null(photo_fields, 0);
+
+    let children: Vec<ArrayRef> = vec![
+        Arc::new(holger_struct),
+        Arc::new(photo_child),
+    ];
+
+    arrow::array::UnionArray::try_new(
+        fields,
+        ScalarBuffer::from(type_ids),
+        Some(ScalarBuffer::from(offsets)),
+        children,
+    ).unwrap()
 }
 
 pub fn read_znippy_index(path: &Path) -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
