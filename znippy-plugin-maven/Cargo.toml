@@ -10,3 +10,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 miniz_oxide = "0.8"
+quick-xml = "0.36"
+ureq = { version = "2", optional = true }
+
+[features]
+default = []
+resolve = ["ureq"]

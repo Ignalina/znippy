@@ -15,6 +15,8 @@ struct BenchResult {
     compress_ms: u128,
     decompress_ms: u128,
     file_count: usize,
+    compressed_files: u64,
+    skipped_files: u64,
 }
 
 impl BenchResult {
@@ -43,7 +45,7 @@ fn bench_roundtrip(label: &str, entries: Vec<ArchiveEntry>) -> Result<BenchResul
     for entry in entries {
         compressor.sender().send(entry)?;
     }
-    let _report = compressor.finish()?;
+    let report = compressor.finish()?;
     let compress_ms = t0.elapsed().as_millis();
 
     // Measure output size
@@ -64,6 +66,8 @@ fn bench_roundtrip(label: &str, entries: Vec<ArchiveEntry>) -> Result<BenchResul
         compress_ms,
         decompress_ms,
         file_count: 0,
+        compressed_files: report.compressed_files,
+        skipped_files: report.uncompressed_files,
     })
 }
 
@@ -238,7 +242,10 @@ fn print_single_result(r: &BenchResult) {
         r.compress_speed_mbs(),
         r.decompress_speed_mbs(),
     );
-    println!("  Files: {}", r.file_count);
+    println!(
+        "  Files: {} (compressed: {}, skipped: {})",
+        r.file_count, r.compressed_files, r.skipped_files
+    );
     println!();
 }
 
@@ -250,7 +257,7 @@ impl BenchResult {
 }
 
 /// Download and cache a large Java project's dependencies (~2GB).
-/// Uses Spring Boot + Kafka + Elasticsearch as dep-heavy POM.
+/// Uses POM parser + transitive resolver to fetch JARs from Maven Central.
 fn prepare_java_deps() -> PathBuf {
     let java_dir = cache_dir().join("java-deps");
     let marker = java_dir.join(".done");
@@ -259,13 +266,11 @@ fn prepare_java_deps() -> PathBuf {
         return java_dir;
     }
 
-    println!("  Downloading Java dependencies (~2GB)...");
+    println!("  Resolving Java dependencies from Maven Central...");
     fs::create_dir_all(&java_dir).unwrap();
 
-    let pom = r#"<?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    let pom = br#"<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
     <modelVersion>4.0.0</modelVersion>
     <groupId>com.bench</groupId>
     <artifactId>znippy-bench</artifactId>
@@ -275,7 +280,6 @@ fn prepare_java_deps() -> PathBuf {
         <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-jpa</artifactId><version>3.2.5</version></dependency>
         <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-security</artifactId><version>3.2.5</version></dependency>
         <dependency><groupId>org.springframework.kafka</groupId><artifactId>spring-kafka</artifactId><version>3.1.4</version></dependency>
-        <dependency><groupId>org.elasticsearch.client</groupId><artifactId>elasticsearch-rest-high-level-client</artifactId><version>7.17.21</version></dependency>
         <dependency><groupId>io.netty</groupId><artifactId>netty-all</artifactId><version>4.1.109.Final</version></dependency>
         <dependency><groupId>com.google.guava</groupId><artifactId>guava</artifactId><version>33.2.0-jre</version></dependency>
         <dependency><groupId>org.apache.hadoop</groupId><artifactId>hadoop-client</artifactId><version>3.3.6</version></dependency>
@@ -287,29 +291,28 @@ fn prepare_java_deps() -> PathBuf {
     </dependencies>
 </project>"#;
 
-    let pom_path = java_dir.join("pom.xml");
-    fs::write(&pom_path, pom).unwrap();
+    use znippy_plugin_maven::resolver::{resolve_transitive, download_artifact_to_file};
 
-    let deps_dir = java_dir.join("deps");
-    fs::create_dir_all(&deps_dir).unwrap();
+    println!("  Resolving transitive dependencies (depth=3)...");
+    let all_deps = resolve_transitive(pom, 3);
+    println!("  Resolved {} total artifacts", all_deps.len());
 
-    let status = Command::new("mvn")
-        .args([
-            "dependency:copy-dependencies",
-            &format!("-DoutputDirectory={}", deps_dir.display()),
-            "-DincludeScope=runtime",
-            "-f", &pom_path.to_string_lossy(),
-        ])
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {
-            fs::write(&marker, "ok").unwrap();
+    let mut downloaded = 0;
+    for coord in &all_deps {
+        let dest = java_dir.join(coord.filename());
+        if dest.exists() {
+            downloaded += 1;
+            continue;
         }
-        _ => {
-            eprintln!("  WARNING: mvn failed — is Maven installed?");
+        if download_artifact_to_file(coord, &dest) {
+            downloaded += 1;
+            if downloaded % 50 == 0 {
+                println!("  Downloaded {}/{} artifacts...", downloaded, all_deps.len());
+            }
         }
     }
+    println!("  Done: {} artifacts downloaded", downloaded);
+    fs::write(&marker, format!("{} artifacts", all_deps.len())).unwrap();
     java_dir
 }
 
@@ -392,28 +395,155 @@ bevy_ecs = "0.13"
     rust_dir
 }
 
+/// Extract JAR contents into a cached `raw/` directory. Reuses cache if present.
+fn prepare_java_raw(java_dir: &Path) -> PathBuf {
+    let raw_dir = java_dir.join("raw");
+    let marker = raw_dir.join(".done");
+    if marker.exists() {
+        println!("  [cached] Exploded JARs at {}", raw_dir.display());
+        return raw_dir;
+    }
+
+    println!("  Exploding JARs into raw files...");
+    fs::create_dir_all(&raw_dir).unwrap();
+
+    let mut total_files = 0usize;
+    for entry in walkdir::WalkDir::new(java_dir).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() { continue; }
+        let path = entry.path();
+        if !path.to_string_lossy().ends_with(".jar") { continue; }
+
+        let data = match fs::read(path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let jar_name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let jar_out = raw_dir.join(&jar_name);
+        fs::create_dir_all(&jar_out).ok();
+
+        if let Some(files) = extract_jar_contents(&jar_name, &data) {
+            for f in files {
+                // Strip the jar_name/ prefix we added
+                let rel = f.relative_path.strip_prefix(&format!("{}/", jar_name))
+                    .unwrap_or(&f.relative_path);
+                let dest = jar_out.join(rel);
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).ok();
+                }
+                fs::write(&dest, &f.data).ok();
+                total_files += 1;
+            }
+        }
+    }
+
+    println!("  Exploded {} raw files", total_files);
+    fs::write(&marker, format!("{} files", total_files)).unwrap();
+    raw_dir
+}
+
+/// Extract all files from a JAR/ZIP into ArchiveEntries with raw (decompressed) data.
+fn extract_jar_contents(jar_name: &str, data: &[u8]) -> Option<Vec<ArchiveEntry>> {
+    let eocd_pos = find_eocd_bench(data)?;
+    let cd_offset = u32::from_le_bytes(data[eocd_pos + 16..eocd_pos + 20].try_into().ok()?) as usize;
+    let cd_entries = u16::from_le_bytes(data[eocd_pos + 10..eocd_pos + 12].try_into().ok()?) as usize;
+
+    let mut results = Vec::new();
+    let mut pos = cd_offset;
+
+    for _ in 0..cd_entries {
+        if pos + 46 > data.len() { break; }
+        let sig = u32::from_le_bytes(data[pos..pos+4].try_into().ok()?);
+        if sig != 0x02014b50 { break; }
+
+        let compression = u16::from_le_bytes(data[pos+10..pos+12].try_into().ok()?);
+        let compressed_size = u32::from_le_bytes(data[pos+20..pos+24].try_into().ok()?) as usize;
+        let name_len = u16::from_le_bytes(data[pos+28..pos+30].try_into().ok()?) as usize;
+        let extra_len = u16::from_le_bytes(data[pos+30..pos+32].try_into().ok()?) as usize;
+        let comment_len = u16::from_le_bytes(data[pos+32..pos+34].try_into().ok()?) as usize;
+        let local_offset = u32::from_le_bytes(data[pos+42..pos+46].try_into().ok()?) as usize;
+
+        let name = std::str::from_utf8(&data[pos+46..pos+46+name_len]).unwrap_or("");
+
+        if !name.ends_with('/') {
+            if let Some(raw_data) = decompress_zip_entry(data, local_offset, compression, compressed_size) {
+                if !raw_data.is_empty() {
+                    results.push(ArchiveEntry {
+                        relative_path: format!("{}/{}", jar_name, name),
+                        data: raw_data,
+                    });
+                }
+            }
+        }
+
+        pos += 46 + name_len + extra_len + comment_len;
+    }
+
+    if results.is_empty() { None } else { Some(results) }
+}
+
+fn find_eocd_bench(data: &[u8]) -> Option<usize> {
+    let start = data.len().saturating_sub(65557);
+    for i in (start..data.len().saturating_sub(21)).rev() {
+        if u32::from_le_bytes(data[i..i+4].try_into().ok()?) == 0x06054b50 {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn decompress_zip_entry(data: &[u8], offset: usize, compression: u16, comp_size: usize) -> Option<Vec<u8>> {
+    if offset + 30 > data.len() { return None; }
+    let sig = u32::from_le_bytes(data[offset..offset+4].try_into().ok()?);
+    if sig != 0x04034b50 { return None; }
+
+    let name_len = u16::from_le_bytes(data[offset+26..offset+28].try_into().ok()?) as usize;
+    let extra_len = u16::from_le_bytes(data[offset+28..offset+30].try_into().ok()?) as usize;
+    let data_start = offset + 30 + name_len + extra_len;
+
+    if data_start + comp_size > data.len() { return None; }
+    let compressed = &data[data_start..data_start + comp_size];
+
+    match compression {
+        0 => Some(compressed.to_vec()),
+        8 => miniz_oxide::inflate::decompress_to_vec(compressed).ok(),
+        _ => None,
+    }
+}
+
 #[test]
 #[ignore]
 fn perf_real_java_deps() -> Result<()> {
     let java_dir = prepare_java_deps();
-    let deps_dir = java_dir.join("deps");
-    if !deps_dir.exists() {
+    if !java_dir.join(".done").exists() {
         eprintln!("Java deps not available, skipping");
         return Ok(());
     }
 
-    let entries = collect_files_recursive(&deps_dir);
-    let count = entries.len();
+    let entries = collect_files_recursive(&java_dir);
+    let entries: Vec<_> = entries.into_iter().filter(|e| e.relative_path.ends_with(".jar")).collect();
+    let jar_count = entries.len();
     if entries.is_empty() {
         eprintln!("No Java deps found, skipping");
         return Ok(());
     }
 
     let total: u64 = entries.iter().map(|e| e.data.len() as u64).sum();
-    println!("  Java deps: {} files, {:.1} MB", count, total as f64 / (1024.0 * 1024.0));
+    println!("  Java deps: {} JARs, {:.1} MB", jar_count, total as f64 / (1024.0 * 1024.0));
 
-    let result = bench_roundtrip("java_deps_real", entries)?.with_file_count(count);
+    // 1) JARs as-is — skipped (already compressed)
+    let result = bench_roundtrip("java_jars_skipped", entries)?.with_file_count(jar_count);
     print_single_result(&result);
+
+    // 2) Raw extracted contents — real compression
+    let raw_dir = prepare_java_raw(&java_dir);
+    let raw_entries = collect_files_recursive(&raw_dir);
+    let raw_count = raw_entries.len();
+    let raw_total: u64 = raw_entries.iter().map(|e| e.data.len() as u64).sum();
+    println!("  Raw Java: {} files, {:.1} MB", raw_count, raw_total as f64 / (1024.0 * 1024.0));
+
+    let result = bench_roundtrip("java_raw_compressed", raw_entries)?.with_file_count(raw_count);
+    print_single_result(&result);
+
     Ok(())
 }
 
@@ -437,7 +567,9 @@ fn perf_real_rust_deps() -> Result<()> {
     let total: u64 = entries.iter().map(|e| e.data.len() as u64).sum();
     println!("  Rust deps: {} files, {:.1} MB", count, total as f64 / (1024.0 * 1024.0));
 
+    // Rust source is mostly .rs/.toml — already compressible, not skipped
     let result = bench_roundtrip("rust_deps_real", entries)?.with_file_count(count);
     print_single_result(&result);
+
     Ok(())
 }

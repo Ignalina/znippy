@@ -5,6 +5,10 @@
 
 use std::cell::RefCell;
 
+pub mod pom;
+#[cfg(feature = "resolve")]
+pub mod resolver;
+
 // ─── Maven Metadata ──────────────────────────────────────────────────
 
 pub struct MavenMeta {
