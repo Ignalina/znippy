@@ -100,14 +100,14 @@ Writer Thread
 
 | Test | In(MB) | Out(MB) | Ratio | Comp MB/s | Dec MB/s |
 |------|--------|---------|-------|-----------|----------|
-| text_500mb | 500.00 | 0.09 | 5404x | 1805 | 1185 |
-| binary_pattern_500mb | 500.00 | 0.19 | 2609x | 2732 | 1191 |
-| random_500mb (incompressible) | 500.00 | 500.04 | 1.00x | 179 | 1244 |
-| 100k_small_files_10kb | 976.56 | 12.54 | 77.9x | 3052 | 514 |
-| mixed_repo_530mb | 530.05 | 530.01 | 1.00x | 2637 | 974 |
-| single_file_2gb | 2048.00 | 0.35 | 5868x | 3357 | 1177 |
+| text_500mb | 500.00 | 0.09 | 5404x | 1792 | 3145 |
+| binary_pattern_500mb | 500.00 | 0.19 | 2609x | 2660 | 3145 |
+| random_500mb (incompressible) | 500.00 | 500.04 | 1.00x | 176 | 3205 |
+| 100k_small_files_10kb | 976.56 | 12.54 | 77.9x | 3033 | 701 |
+| mixed_repo_530mb | 530.05 | 530.01 | 1.00x | 2850 | 2650 |
+| single_file_2gb | 2048.00 | 0.35 | 5868x | 4047 | 3413 |
 
-*Run: 2025-05-21, 32-core AMD, NVMe, release build*
+*Run: 2026-05-21, 32-core AMD, NVMe, release build, parallel verify threads*
 
 ### Real-world data
 
@@ -216,6 +216,29 @@ AFTER (v0.3):
 - Column pruning: read metadata without loading chunk data
 - Multi-repo support via `repo` column + row group partitioning
 - Streaming write: flush batch every N chunks (bounded memory)
+
+### Multi-repo / Nexus Mode
+
+One `.znippy` archive can contain files from multiple repositories or artifact groups.
+The `repo` column acts as a partition key:
+
+```sql
+-- Export from Nexus: one archive holds multiple repos
+SELECT relative_path, repo FROM 'nexus-export.znippy'
+WHERE repo = 'libs-release';
+
+-- Decompress only one repo from the archive
+znippy extract nexus-export.znippy --repo libs-release --out ./libs/
+```
+
+Use cases:
+- **Nexus/Artifactory export**: full mirror in one file, queryable by repo name
+- **Monorepo CI cache**: each sub-project is a `repo` group, extract only what changed
+- **Airgap transfer**: ship one file containing all repos, unpack selectively
+
+The `repo` column is optional (Utf8, nullable). When absent, all files belong to the
+default (unnamed) group. Checksums are still per `checksum_group` (compressor thread),
+independent of `repo`.
 
 ### Memory Model
 
