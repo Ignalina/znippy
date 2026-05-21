@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Maven/JAR metadata plugin for znippy (compiles to native + WASM)"
 license = "MIT"
+repository = "https://github.com/Ignalina/znippy"
+authors = ["Rickard Lundin <rickard@x14.se>"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
