@@ -4,7 +4,6 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::thread;
 use znippy_common::chunkrevolver::{ChunkRevolver, SendPtr, get_chunk_slice};
 use znippy_common::common_config::CONFIG;
@@ -14,6 +13,7 @@ use znippy_common::index::{
 };
 use znippy_common::meta::{BlobMeta, ChunkMeta, WriterStats};
 use znippy_common::{CompressionReport, split_into_microchunks};
+use crate::Blob;
 
 /// An entry to be compressed into the archive.
 pub struct ArchiveEntry {
@@ -69,8 +69,8 @@ fn run_compression_pipeline(
         .unzip();
 
     let (tx_compressed, rx_compressed): (
-        Sender<(Arc<[u8]>, ChunkMeta)>,
-        Receiver<(Arc<[u8]>, ChunkMeta)>,
+        Sender<(Blob, ChunkMeta)>,
+        Receiver<(Blob, ChunkMeta)>,
     ) = unbounded();
     let (tx_return, rx_return): (Sender<(u8, u64)>, Receiver<(u8, u64)>) = unbounded();
     let (paths_tx, paths_rx) = bounded::<Vec<String>>(1);
@@ -234,7 +234,9 @@ fn run_compression_pipeline(
                             hasher.update(input);
 
                             if skip {
-                                let output: Arc<[u8]> = Arc::from(input);
+                                // Zero-copy: pass a raw pointer into the revolver slot.
+                                // tx_ret is NOT called here — the writer returns the chunk
+                                // after write_all, keeping the memory valid throughout.
                                 let chunk_meta = ChunkMeta {
                                     fdata_offset,
                                     file_index,
@@ -244,7 +246,13 @@ fn run_compression_pipeline(
                                     compressed: false,
                                     uncompressed_size: input.len() as u64,
                                 };
-                                tx_compressed.send((output, chunk_meta)).unwrap();
+                                let blob = Blob::Revolver {
+                                    ptr: input.as_ptr() as usize,
+                                    len: input.len(),
+                                    ring_nr,
+                                    chunk_nr,
+                                };
+                                tx_compressed.send((blob, chunk_meta)).unwrap();
                                 chunk_seq += 1;
                             } else {
                                 let micro_chunks =
@@ -252,40 +260,36 @@ fn run_compression_pipeline(
 
                                 if micro_chunks.is_empty() {
                                     let compressed_vec = cctx.compress(&[])?;
-                                    let compressed_chunk: Arc<[u8]> =
-                                        Arc::from(compressed_vec.into_boxed_slice());
                                     let chunk_meta = ChunkMeta {
                                         fdata_offset,
                                         file_index,
                                         chunk_seq,
                                         checksum_group: compressor_group,
-                                        compressed_size: compressed_chunk.len() as u64,
+                                        compressed_size: compressed_vec.len() as u64,
                                         compressed: true,
                                         uncompressed_size: 0,
                                     };
-                                    tx_compressed.send((compressed_chunk, chunk_meta))?;
+                                    tx_compressed.send((Blob::Owned(compressed_vec), chunk_meta))?;
                                     chunk_seq += 1;
                                 } else {
                                     for micro in micro_chunks.iter() {
                                         let compressed_vec = cctx.compress(micro)?;
-                                        let compressed_chunk: Arc<[u8]> =
-                                            Arc::from(compressed_vec.into_boxed_slice());
                                         let chunk_meta = ChunkMeta {
                                             fdata_offset,
                                             file_index,
                                             chunk_seq,
                                             checksum_group: compressor_group,
-                                            compressed_size: compressed_chunk.len() as u64,
+                                            compressed_size: compressed_vec.len() as u64,
                                             compressed: true,
                                             uncompressed_size: micro.len() as u64,
                                         };
                                         fdata_offset += micro.len() as u64;
-                                        tx_compressed.send((compressed_chunk, chunk_meta))?;
+                                        tx_compressed.send((Blob::Owned(compressed_vec), chunk_meta))?;
                                         chunk_seq += 1;
                                     }
                                 }
+                                tx_ret.send((ring_nr, chunk_nr)).ok();
                             }
-                            tx_ret.send((ring_nr, chunk_nr)).ok();
                         }
                         Err(_) => break,
                     }
@@ -301,7 +305,9 @@ fn run_compression_pipeline(
         compressor_threads.push(handle);
     }
 
-    // Writer thread: streams blobs to disk immediately, writes Arrow index at end
+    // Writer thread: streams blobs to disk immediately, writes Arrow index at end.
+    // It holds a tx_return clone so it can release Revolver chunks after write_all.
+    let tx_ret_writer = tx_return.clone();
     let output_for_writer = output.clone();
     let writer_thread = thread::spawn(move || -> WriterStats {
         let output_path = output_for_writer.with_extension("znippy");
@@ -320,11 +326,14 @@ fn run_compression_pipeline(
         };
 
         // Write each blob immediately as it arrives
-        while let Ok((compressed_data, chunk_meta)) = rx_compressed.recv() {
+        while let Ok((blob, chunk_meta)) = rx_compressed.recv() {
             writerstats.total_chunks += 1;
-            let blob_size = compressed_data.len() as u64;
+            let blob_size = blob.len() as u64;
 
-            writer.write_all(&compressed_data).expect("Failed to write blob");
+            writer.write_all(blob.as_slice()).expect("Failed to write blob");
+            if let Blob::Revolver { ring_nr, chunk_nr, .. } = blob {
+                tx_ret_writer.send((ring_nr, chunk_nr)).ok();
+            }
 
             all_blobs.push(BlobMeta {
                 chunk_meta,
