@@ -17,6 +17,7 @@ struct BenchResult {
     file_count: usize,
     compressed_files: u64,
     skipped_files: u64,
+    chunks: u64,
 }
 
 impl BenchResult {
@@ -66,6 +67,7 @@ fn bench_roundtrip(label: &str, entries: Vec<ArchiveEntry>) -> Result<BenchResul
         file_count: 0,
         compressed_files: report.compressed_files,
         skipped_files: report.uncompressed_files,
+        chunks: report.chunks,
     })
 }
 
@@ -170,24 +172,29 @@ fn perf_benchmark_suite() -> Result<()> {
     )?);
 
     // Print results
-    println!("\n============================================================");
+    println!("\n=============================================================================================================");
     println!("ZNIPPY PERFORMANCE BENCHMARK (OpenZL backend)");
-    println!("============================================================");
+    println!("=============================================================================================================");
     println!(
-        "{:<25} {:>8} {:>8} {:>6} {:>10} {:>10}",
-        "Test", "In(MB)", "Out(MB)", "Ratio", "Comp MB/s", "Dec MB/s"
+        "{:<25} {:>8} {:>8} {:>6} {:>10} {:>10} {:>8} {:>8} {:>8} {:>8}",
+        "Test", "In(MB)", "Out(MB)", "Ratio", "Comp MB/s", "Dec MB/s",
+        "Comp ms", "Dec ms", "Chunks", "Skipped"
     );
-    println!("{:-<75}", "");
+    println!("{:-<109}", "");
 
     for r in &results {
         println!(
-            "{:<25} {:>8.2} {:>8.2} {:>6.2}x {:>9.1} {:>9.1}",
+            "{:<25} {:>8.2} {:>8.2} {:>6.2}x {:>9.1} {:>9.1} {:>8} {:>8} {:>8} {:>8}",
             r.label,
             r.input_size as f64 / (1024.0 * 1024.0),
             r.output_size as f64 / (1024.0 * 1024.0),
             r.ratio(),
             r.compress_speed_mbs(),
             r.decompress_speed_mbs(),
+            r.compress_ms,
+            r.decompress_ms,
+            r.chunks,
+            r.skipped_files,
         );
     }
     println!();
@@ -223,22 +230,27 @@ fn collect_files_recursive(dir: &Path) -> Vec<ArchiveEntry> {
 }
 
 fn print_single_result(r: &BenchResult) {
-    println!("\n============================================================");
+    println!("\n=============================================================================================================");
     println!("ZNIPPY REAL-WORLD BENCHMARK (OpenZL backend)");
-    println!("============================================================");
+    println!("=============================================================================================================");
     println!(
-        "{:<30} {:>8} {:>8} {:>6} {:>10} {:>10}",
-        "Test", "In(MB)", "Out(MB)", "Ratio", "Comp MB/s", "Dec MB/s"
+        "{:<25} {:>8} {:>8} {:>6} {:>10} {:>10} {:>8} {:>8} {:>8} {:>8}",
+        "Test", "In(MB)", "Out(MB)", "Ratio", "Comp MB/s", "Dec MB/s",
+        "Comp ms", "Dec ms", "Chunks", "Skipped"
     );
-    println!("{:-<80}", "");
+    println!("{:-<109}", "");
     println!(
-        "{:<30} {:>8.2} {:>8.2} {:>6.2}x {:>9.1} {:>9.1}",
+        "{:<25} {:>8.2} {:>8.2} {:>6.2}x {:>9.1} {:>9.1} {:>8} {:>8} {:>8} {:>8}",
         r.label,
         r.input_size as f64 / (1024.0 * 1024.0),
         r.output_size as f64 / (1024.0 * 1024.0),
         r.ratio(),
         r.compress_speed_mbs(),
         r.decompress_speed_mbs(),
+        r.compress_ms,
+        r.decompress_ms,
+        r.chunks,
+        r.skipped_files,
     );
     println!(
         "  Files: {} (compressed: {}, skipped: {})",

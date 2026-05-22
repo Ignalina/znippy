@@ -71,6 +71,28 @@ Arrow:   ring_buffer → Vec values → Buffer → extend_from_slice → write()
 
 ### Performance
 
+#### P4: Small-file coalescing — pack multiple small files into one chunk before compression
+
+**Problem (observed in benchmark):**
+- `rust_deps_real`: 41k `.rs`/`.toml` files averaging ~24 KB → **18 MB/s, 54 seconds**
+- Root cause: each file is ~1 chunk, so the full reader→compressor→writer→tx_ret round-trip
+  is paid per file. Channel overhead and thread synchronisation dominate useful work.
+- `100k_small_files_10kb` decompresses at only 627 MB/s vs 2000+ MB/s for large files —
+  same per-chunk overhead on the read side.
+
+**Idea:**
+Reader accumulates small files (below a threshold, e.g. `file_split_block_size / 4`) into
+a single revolver chunk, recording individual `fdata_offset` boundaries in the chunk metadata.
+A single chunk is sent to the compressor for the whole group. Decompressor splits it back
+using the stored offsets.
+
+**Trade-offs:**
+- Complicates chunk metadata (needs a sub-file offset table or sentinel records in the index)
+- Compression ratio may improve (cross-file dictionary opportunities)
+- Need to decide threshold — too large means latency spike waiting to fill a chunk
+
+**Relevant commit:** e77d9a4 (zero-copy Blob pipeline — shows current per-chunk cost baseline)
+
 #### ~~P1: mixed_repo compress regression (-68% vs v0.3)~~ ✅ FIXED
 Solved by hybrid format (v2.1): raw data section + Arrow IPC Stream for metadata.
 Write path now does zero userspace copies — chunk bytes go directly to file.
@@ -111,7 +133,7 @@ pub fn compress_dir(input: &Path, output: &Path, no_skip: bool) -> Result<Compre
 Extension DenseUnion column currently always null. Wire up plugin metadata
 injection for the first chunk of each file.
 
-## Performance Baseline (v0.5.0 Arrow IPC, 32-core AMD, NVMe, release)
+## Performance Baseline (v0.5.0 Arrow IPC, 8-core T14s laptop, release)
 
 | Test | Compress MB/s | Decompress MB/s | Ratio |
 |------|--------------|----------------|-------|
@@ -124,3 +146,21 @@ injection for the first chunk of each file.
 
 Note: mixed_repo limited by Arrow IPC serialization copy (apache/arrow-rs#9835).
 Direct NVMe write achieves 2775 MB/s for same workload.
+
+## Performance Baseline (v0.6.0, zero-copy Blob pipeline, 8-core T14s laptop, release)
+
+| Test | In MB | Out MB | Ratio | Comp MB/s | Dec MB/s | Comp ms | Dec ms | Chunks | Skipped |
+|------|-------|--------|-------|-----------|----------|---------|--------|--------|---------|
+| text_500mb | 500 | 0.12 | 4092x | 2415 | 2128 | 207 | 235 | 500 | 0 |
+| binary_pattern_500mb | 500 | 0.22 | 2245x | 1880 | 2304 | 266 | 217 | 500 | 0 |
+| random_500mb | 500 | 500 | 1.00x | 33 | 2283 | 15322 | 219 | 500 | 0 |
+| 100k_small_files_10kb | 977 | 17 | 56x | 1578 | 627 | 619 | 1557 | 100000 | 0 |
+| mixed_repo_530mb | 530 | 530 | 1.00x | 2325 | 2227 | 228 | 238 | 55 | 4 |
+| single_file_2gb | 2048 | 0.49 | 4141x | 2338 | 2698 | 876 | 759 | 2048 | 0 |
+| rust_crates (real, 215 MB) | 215 | 215 | 1.00x | 1209 | 2562 | 178 | 84 | 1219 | 1218 |
+| rust_deps_real (real, 988 MB) | 988 | 137 | 7.21x | 18 | 1642 | 54686 | 602 | 41501 | 103 |
+
+Key changes vs v0.5.0:
+- v0.6 streaming format: blobs first, Arrow index last, 8-byte footer
+- Zero-copy Blob pipeline: eliminated Arc::from memcpy on both skip and compress paths
+- random_500mb regressed vs v0.5 (was 152 MB/s) — incompressibility detection not yet implemented (P3/backlog)
