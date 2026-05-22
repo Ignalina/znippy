@@ -15,6 +15,8 @@ const SKIPPED_EXTENSIONS: &[&str] = &[
     "exe", "dll", "so", "dylib", "o", "a", "lib", // Fonts
     "ttf", "otf", "woff", "woff2", // ML/Data formats
     "npy", "npz", "onnx", "pb", "tflite", "parquet", "orc", "feather",
+    // Rust crate packages (.tar.gz internally)
+    "crate",
     // very good format
     "znippy",
 ];
@@ -96,5 +98,6 @@ fn check_suffix(name: &str) -> bool {
         || name.ends_with(".parquet")
         || name.ends_with(".orc")
         || name.ends_with(".feather")
+        || name.ends_with(".crate")
         || name.ends_with(".znippy")
 }

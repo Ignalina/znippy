@@ -547,6 +547,53 @@ fn perf_real_java_deps() -> Result<()> {
     Ok(())
 }
 
+/// Benchmark .crate files from the local cargo registry cache.
+/// These are .tar.gz internally and should be skipped by compression.
+#[test]
+#[ignore]
+fn perf_real_rust_crates() -> Result<()> {
+    let cache_dir = dirs::home_dir()
+        .expect("no home dir")
+        .join(".cargo/registry/cache");
+
+    if !cache_dir.exists() {
+        eprintln!("No cargo registry cache found at {}, skipping", cache_dir.display());
+        return Ok(());
+    }
+
+    let mut entries = Vec::new();
+    for index_dir in fs::read_dir(&cache_dir)? {
+        let index_dir = index_dir?;
+        if !index_dir.file_type()?.is_dir() { continue; }
+        for entry in walkdir::WalkDir::new(index_dir.path()).into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() { continue; }
+            let path = entry.path();
+            if !path.to_string_lossy().ends_with(".crate") { continue; }
+            if let Ok(data) = fs::read(path) {
+                let rel = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                entries.push(ArchiveEntry {
+                    relative_path: rel,
+                    data,
+                });
+            }
+        }
+    }
+
+    let count = entries.len();
+    if entries.is_empty() {
+        eprintln!("No .crate files found, skipping");
+        return Ok(());
+    }
+
+    let total: u64 = entries.iter().map(|e| e.data.len() as u64).sum();
+    println!("  Rust crates: {} files, {:.1} MB", count, total as f64 / (1024.0 * 1024.0));
+
+    let result = bench_roundtrip("rust_crates", entries)?.with_file_count(count);
+    print_single_result(&result);
+
+    Ok(())
+}
+
 #[test]
 #[ignore]
 fn perf_real_rust_deps() -> Result<()> {

@@ -218,6 +218,7 @@ pub fn is_probably_compressed(path: &Path) -> bool {
                 | "gif"
                 | "bmp"
                 | "png"
+                | "crate"
                 | "znippy"
                 | "zdata"
                 | "parquet"

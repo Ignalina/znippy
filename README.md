@@ -10,12 +10,13 @@ Built on **Apache Arrow IPC** + **OpenZL** (zstd+lz4 under the hood).
 
 | Test | In | Out | Ratio | Compress | Decompress |
 |------|-----|-----|-------|----------|------------|
-| text 500MB | 500 MB | 0.11 MB | 4668x | 1,493 MB/s | 2,941 MB/s |
-| single file 2GB | 2,048 MB | 0.40 MB | 5095x | 3,483 MB/s | 3,127 MB/s |
-| 100k small files | 977 MB | 16.9 MB | 57.8x | 3,071 MB/s | 769 MB/s |
-| Rust deps (41k files) | 988 MB | 137 MB | 7.2x | 67.6 MB/s | 1,337 MB/s |
-| Java raw (191k files) | 1,236 MB | 444 MB | 2.8x | 83.0 MB/s | 526 MB/s |
-| rust crates (53k files) | 1,298 MB | 174 MB | 7.5x | 41 MB/s | 1,417 MB/s |
+| text 500MB | 500 MB | 0.11 MB | 4471x | 1,724 MB/s | 3,030 MB/s |
+| binary pattern 500MB | 500 MB | 0.21 MB | 2354x | 2,242 MB/s | 2,941 MB/s |
+| single file 2GB | 2,048 MB | 0.44 MB | 4673x | 3,684 MB/s | 3,374 MB/s |
+| 100k small files (10KB) | 977 MB | 14.5 MB | 67.3x | 3,277 MB/s | 759 MB/s |
+| mixed repo 530MB | 530 MB | 530 MB | 1.0x | 757 MB/s | 1,233 MB/s |
+| Rust deps (41k files) | 988 MB | 136 MB | 7.3x | 66.9 MB/s | 1,259 MB/s |
+| Rust crates (1.2k .crate) | 188 MB | 188 MB | 1.0x | 595 MB/s | 1,150 MB/s |
 
 ## Architecture — Dual-Pipeline (v0.5)
 
