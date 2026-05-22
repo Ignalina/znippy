@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// Metadata för en enskild chunk i arkivet
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkMeta {
     pub fdata_offset: u64,
@@ -10,6 +9,14 @@ pub struct ChunkMeta {
     pub compressed: bool,
     pub uncompressed_size: u64,
     pub compressed_size: u64,
+}
+
+/// Blob position written to the .znippy file; paired with ChunkMeta for the Arrow index.
+#[derive(Debug, Clone)]
+pub struct BlobMeta {
+    pub chunk_meta: ChunkMeta,
+    pub blob_offset: u64,
+    pub blob_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

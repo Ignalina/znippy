@@ -3239,14 +3239,37 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger",
- "znippy-common",
- "znippy-compress",
+ "znippy-common 0.5.4",
+ "znippy-compress 0.5.2",
  "znippy-decompress",
 ]
 
 [[package]]
 name = "znippy-common"
-version = "0.5.3"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "915a6a47d876c6d3636c431c4511bded0bbbdba9d7a7232cbbf97bedfff79a70"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "arrow-array",
+ "blake3",
+ "crossbeam-channel",
+ "hex",
+ "lbzip2",
+ "lgz",
+ "ljar",
+ "log",
+ "once_cell",
+ "openzl-sys-rs",
+ "serde",
+ "sysinfo",
+ "tar",
+]
+
+[[package]]
+name = "znippy-common"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -3271,6 +3294,8 @@ dependencies = [
 [[package]]
 name = "znippy-compress"
 version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e72f8a9ff42328f610fde38280222dca6f4ede4728d8988f2e22e31ed3b6086"
 dependencies = [
  "anyhow",
  "arrow",
@@ -3278,7 +3303,20 @@ dependencies = [
  "crossbeam-channel",
  "log",
  "walkdir",
- "znippy-common",
+ "znippy-common 0.5.4",
+]
+
+[[package]]
+name = "znippy-compress"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "blake3",
+ "crossbeam-channel",
+ "log",
+ "walkdir",
+ "znippy-common 0.6.0",
 ]
 
 [[package]]
@@ -3286,7 +3324,7 @@ name = "znippy-decompress"
 version = "0.5.2"
 dependencies = [
  "anyhow",
- "znippy-common",
+ "znippy-common 0.5.4",
 ]
 
 [[package]]
@@ -3308,8 +3346,8 @@ dependencies = [
  "miniz_oxide",
  "tempfile",
  "walkdir",
- "znippy-common",
- "znippy-compress",
+ "znippy-common 0.6.0",
+ "znippy-compress 0.6.0",
  "znippy-plugin-maven",
 ]
 

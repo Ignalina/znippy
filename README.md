@@ -6,7 +6,19 @@
 High-performance archive format with per-file compression, parallel processing, and random access.
 Built on **Apache Arrow IPC** + **OpenZL** (zstd+lz4 under the hood).
 
-## Benchmarks (32-core, OpenZL)
+## Benchmarks (8-core, OpenZL, v0.6)
+
+| Test | In | Out | Ratio | Compress | Decompress |
+|------|-----|-----|-------|----------|------------|
+| text 500MB | 500 MB | 0.12 MB | 4092x | 1,724 MB/s | 3,311 MB/s |
+| binary pattern 500MB | 500 MB | 0.22 MB | 2245x | 2,645 MB/s | 3,378 MB/s |
+| random (incompressible) 500MB | 500 MB | 500 MB | 1.0x | 55 MB/s | 3,205 MB/s |
+| single file 2GB | 2,048 MB | 0.49 MB | 4141x | 3,034 MB/s | 3,556 MB/s |
+| 100k small files (10KB) | 977 MB | 17.5 MB | 55.9x | 2,668 MB/s | 969 MB/s |
+| mixed repo 530MB | 530 MB | 530 MB | 1.0x | 2,208 MB/s | 2,420 MB/s |
+
+<details>
+<summary>Previous results (32-core, v0.5)</summary>
 
 | Test | In | Out | Ratio | Compress | Decompress |
 |------|-----|-----|-------|----------|------------|
@@ -18,15 +30,19 @@ Built on **Apache Arrow IPC** + **OpenZL** (zstd+lz4 under the hood).
 | Rust deps (41k files) | 988 MB | 136 MB | 7.3x | 66.9 MB/s | 1,259 MB/s |
 | Rust crates (1.2k .crate) | 188 MB | 188 MB | 1.0x | 595 MB/s | 1,150 MB/s |
 
-## Architecture — Dual-Pipeline (v0.5)
+</details>
 
-Single `.znippy` file = valid Arrow IPC Stream. Queryable by DuckDB/Polars/pyarrow directly:
+**v0.6 highlights vs v0.5 on comparable workloads:** mixed repo (skip-heavy) improved 3× (757 → 2,208 MB/s) due to true streaming writes. Decompression throughput up across the board. Random/incompressible data correctly measured at zstd encoding cost (~55 MB/s at level 19).
 
-```sql
-SELECT relative_path, uncompressed_size FROM 'archive.znippy';
+## Architecture — Dual-Pipeline (v0.6)
+
+### File format
+
+```
+[ blob_0 ][ blob_1 ] ... [ blob_N ] [ Arrow IPC index ] [ 8-byte LE u64: Arrow offset ]
 ```
 
-Two pipelines based on whether compression is needed:
+Blobs are written as produced (true streaming, no buffering). The Arrow IPC metadata index — containing paths, chunk sequences, offsets, sizes, and BLAKE3 checksums — is appended at the end. The 8-byte footer allows a reader to seek directly to the index without scanning the file.
 
 ### Pipeline A: Compress (compressible files)
 
@@ -45,70 +61,67 @@ Two pipelines based on whether compression is needed:
   │  +  ││  +  ││  +  │
   │blake3││blake3││blake3│  hash original data
   └──┬───┘└──┬───┘└──┬───┘
-     │     │     │
-     ▼     ▼     ▼
+     │       │       │
+     ▼       ▼       ▼
   ┌─────────────────────────────┐
-  │ Arrow IPC writer            │  Buffer::from(compressed_vec)
-  │ (zdata = compressed bytes)  │  ownership transfer
+  │  Writer: blob_0, blob_1...  │  written immediately to disk
+  │  Arrow IPC index at end     │  checksums now a column, not metadata
   └─────────────────────────────┘
 ```
 
-### Pipeline B: Store as-is (pre-compressed: .jpg, .mp4, .gz, .jar, .png)
+### Pipeline B: Store as-is (pre-compressed: .jpg, .mp4, .gz, .jar, .png…)
 
 ```
-  File bytes (size known upfront!)
+  File bytes
       │
       ├──────────────────────────────────┐
       │                                  │
       ▼                                  ▼
   ┌─────────────────┐     ┌───────────────────────────────┐
-  │  Split chunks   │     │  Arrow IPC writer             │
-  └────────┬────────┘     │  (zdata = raw bytes)          │  ZERO COPY
-           │              │  Buffer::from(vec)            │  (parallel!)
-     ┌─────┼─────┐       └───────────────────────────────┘
+  │  Split chunks   │     │  Writer: blob written as-is   │  ZERO COPY
+  └────────┬────────┘     └───────────────────────────────┘
+           │
+     ┌─────┼─────┐
      ▼     ▼     ▼
   ┌─────┐┌─────┐┌─────┐
   │blake3││blake3││blake3│  hash only (parallel across cores)
-  └──┬───┘└──┬───┘└──┬───┘
-     │     │     │
-     ▼     ▼     ▼
-  ┌─────────────────────┐
-  │ Checksum complete   │  (data already written!)
-  └─────────────────────┘
+  └──────┘└──────┘└──────┘
 ```
 
 ### Decompression
 
 ```
-  archive.znippy (Arrow IPC Stream)
+  archive.znippy
+      │
+      └── read 8-byte footer → seek to Arrow IPC index
       │
       ▼
-  ┌──────────────────────┐
-  │ Reader Thread        │  read zdata column from Arrow batches
-  │ (Arrow IPC reader)   │
-  └──────────┬───────────┘
+  ┌──────────────────────────┐
+  │ Reader Thread            │  seeks to blob_offset for each chunk
+  │ (blob_offset, blob_size) │  reads directly from archive file
+  └──────────┬───────────────┘
              │
        ┌─────┼─────┐        parallel across all cores
        ▼     ▼     ▼
     ┌─────┐┌─────┐┌─────┐
     │OpenZL││OpenZL││OpenZL│  decompress (or passthrough if stored raw)
-    │  +  ││  +  ││  +  │
-    │blake3││blake3││blake3│  verify checksum
     └──┬───┘└──┬───┘└──┬───┘
-       │     │     │
-       ▼     ▼     ▼
-    ┌─────────────────────┐
-    │ Writer Thread       │  write restored files to disk
-    └─────────────────────┘
+       │       │       │
+       ▼       ▼       ▼
+    ┌────────────────────────┐
+    │ Writer Thread          │  write restored files to disk
+    │ + Verify threads       │  BLAKE3 per checksum group
+    └────────────────────────┘
 ```
 
 ## Features
 
-- **Parallel compression**: fan-out to all cores via ChunkRevolver
-- **Blake3 checksums**: per-group integrity verification (machine-independent)
-- **Arrow IPC index**: queryable by DuckDB, Polars, DataFusion
-- **Skip detection**: already-compressed files (.zip, .gz, .png, etc.) stored as-is
-- **Random access**: seek directly to any file's chunks via index
+- **Parallel compression**: fan-out to all physical cores via ChunkRevolver ring buffer
+- **True streaming writes**: blobs written to disk as produced, no in-memory buffering
+- **Blake3 checksums**: per-group integrity verification stored as Arrow column
+- **Random access**: `ZnippyArchive::extract_file` seeks directly to each chunk's blob offset
+- **Skip detection**: already-compressed files stored as-is at full write speed
+- **Arrow IPC index**: metadata queryable by any Arrow reader after parsing the footer
 
 ## Usage
 
@@ -130,8 +143,8 @@ znippy list --input archive.znippy
 
 - **v0.3.0**: OpenZL backend, plugin system (WASM + native), ZnippyArchive API
 - **v0.4.0**: Single-file format (Arrow IPC with inline zdata column)
-- **v0.5.0** (current): Dual-pipeline architecture, DuckDB/Polars queryable, zero-copy for uncompressed
-- **next**: Upstream Arrow IPC scatter-gather fix → auto-recover full NVMe throughput
+- **v0.5.0**: Dual-pipeline architecture, DuckDB/Polars queryable, zero-copy for uncompressed
+- **v0.6.0** (current): Streaming format — blobs first, Arrow index last, 8-byte footer; checksums in column; true zero-buffer writes; `ZnippyArchive` seeks to blob offsets on demand
 
 ## Fan arts
 

@@ -1,15 +1,14 @@
 //! ZnippyArchive — trait and implementation for reading znippy archives.
 //!
-//! Provides selective file extraction by path (Holger's primary use case:
-//! serve individual artifacts on demand from a single .znippy archive).
+//! Provides selective file extraction by path (serve individual artifacts
+//! on demand from a single .znippy archive).
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use arrow::array::Array;
-use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use arrow_array::{BooleanArray, StringArray, UInt64Array};
 
@@ -17,54 +16,42 @@ use crate::codec;
 use crate::index::read_znippy_index;
 
 /// Trait for reading from a znippy archive.
-/// Implementors can provide caching, mmap, or network-backed storage.
 pub trait ZnippyReader: Send + Sync {
-    /// List all file paths in the archive
     fn list_files(&self) -> Result<Vec<String>>;
-
-    /// Extract a single file by its relative path. Returns decompressed bytes.
     fn extract_file(&self, relative_path: &str) -> Result<Vec<u8>>;
-
-    /// Check if a file exists in the archive
     fn contains(&self, relative_path: &str) -> bool;
-
-    /// Get uncompressed size of a file (without extracting)
     fn file_size(&self, relative_path: &str) -> Option<u64>;
 }
 
-/// A znippy archive opened for random-access reads (v0.5 Arrow IPC format).
-/// Loads entire archive into memory on open, extracts chunks from zdata column.
-pub struct ZnippyArchive {
-    index_path: PathBuf,
-    schema: Arc<Schema>,
-    /// path → file entry with row indices for its chunks
-    file_index: HashMap<String, FileEntry>,
-    /// The Arrow batches (with zdata column containing chunk bytes)
-    batches: Vec<RecordBatch>,
+struct ChunkInfo {
+    blob_offset: u64,
+    blob_size: u64,
+    fdata_offset: u64,
+    compressed: bool,
 }
 
 struct FileEntry {
-    compressed: bool,
     uncompressed_size: u64,
-    /// Row indices in the batch for this file's chunks, sorted by chunk_seq
-    chunk_rows: Vec<usize>,
+    chunks: Vec<ChunkInfo>,
+}
+
+/// A znippy archive opened for random-access reads (v0.6 format).
+/// Loads only the Arrow IPC index on open; blobs are read on demand by seeking.
+pub struct ZnippyArchive {
+    archive_path: PathBuf,
+    file_index: HashMap<String, FileEntry>,
 }
 
 impl ZnippyArchive {
-    /// Open an archive. Reads entire Arrow IPC into memory.
-    pub fn open(index_path: &Path) -> Result<Self> {
-        let (schema, batches) = read_znippy_index(index_path)?;
+    pub fn open(path: &Path) -> Result<Self> {
+        let (_, batches) = read_znippy_index(path)?;
         let file_index = Self::build_file_index(&batches)?;
-
         Ok(Self {
-            index_path: index_path.to_path_buf(),
-            schema,
+            archive_path: path.to_path_buf(),
             file_index,
-            batches,
         })
     }
 
-    /// Number of files in the archive
     pub fn file_count(&self) -> usize {
         self.file_index.len()
     }
@@ -73,45 +60,67 @@ impl ZnippyArchive {
         let mut index: HashMap<String, FileEntry> = HashMap::new();
 
         for batch in batches {
-            let paths = batch.column_by_name("relative_path")
+            let paths = batch
+                .column_by_name("relative_path")
                 .ok_or_else(|| anyhow!("missing relative_path column"))?
-                .as_any().downcast_ref::<StringArray>()
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| anyhow!("relative_path not StringArray"))?;
-            let compressed_col = batch.column_by_name("compressed")
+            let compressed_col = batch
+                .column_by_name("compressed")
                 .ok_or_else(|| anyhow!("missing compressed column"))?
-                .as_any().downcast_ref::<BooleanArray>()
+                .as_any()
+                .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| anyhow!("compressed not BooleanArray"))?;
-            let sizes = batch.column_by_name("uncompressed_size")
+            let sizes = batch
+                .column_by_name("uncompressed_size")
                 .ok_or_else(|| anyhow!("missing uncompressed_size column"))?
-                .as_any().downcast_ref::<UInt64Array>()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
                 .ok_or_else(|| anyhow!("uncompressed_size not UInt64Array"))?;
+            let blob_offset_col = batch
+                .column_by_name("blob_offset")
+                .ok_or_else(|| anyhow!("missing blob_offset column"))?
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| anyhow!("blob_offset not UInt64Array"))?;
+            let blob_size_col = batch
+                .column_by_name("blob_size")
+                .ok_or_else(|| anyhow!("missing blob_size column"))?
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| anyhow!("blob_size not UInt64Array"))?;
+            let fdata_offset_col = batch
+                .column_by_name("fdata_offset")
+                .ok_or_else(|| anyhow!("missing fdata_offset column"))?
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| anyhow!("fdata_offset not UInt64Array"))?;
+
             for row in 0..batch.num_rows() {
                 let path = paths.value(row).to_string();
                 let compressed = compressed_col.value(row);
                 let uncompressed_size = sizes.value(row);
+                let blob_offset = blob_offset_col.value(row);
+                let blob_size = blob_size_col.value(row);
+                let fdata_offset = fdata_offset_col.value(row);
 
                 let entry = index.entry(path).or_insert_with(|| FileEntry {
-                    compressed,
                     uncompressed_size: 0,
-                    chunk_rows: Vec::new(),
+                    chunks: Vec::new(),
                 });
                 entry.uncompressed_size += uncompressed_size;
-                entry.chunk_rows.push(row);
+                entry.chunks.push(ChunkInfo {
+                    blob_offset,
+                    blob_size,
+                    fdata_offset,
+                    compressed,
+                });
             }
         }
 
-        // Sort chunk_rows by fdata_offset for each file.
-        // chunk_seq is a per-compressor-group counter and is not comparable across groups;
-        // fdata_offset is the byte position within the original file and is always correct.
-        for batch in batches {
-            let fdata_offset_col = batch.column_by_name("fdata_offset")
-                .unwrap()
-                .as_any().downcast_ref::<UInt64Array>()
-                .unwrap();
-
-            for entry in index.values_mut() {
-                entry.chunk_rows.sort_by_key(|&row| fdata_offset_col.value(row));
-            }
+        for entry in index.values_mut() {
+            entry.chunks.sort_by_key(|c| c.fdata_offset);
         }
 
         Ok(index)
@@ -124,27 +133,24 @@ impl ZnippyReader for ZnippyArchive {
     }
 
     fn extract_file(&self, relative_path: &str) -> Result<Vec<u8>> {
-        use arrow::array::LargeBinaryArray;
-
-        let entry = self.file_index.get(relative_path)
+        let entry = self
+            .file_index
+            .get(relative_path)
             .ok_or_else(|| anyhow!("file not found in archive: {}", relative_path))?;
 
-        let batch = &self.batches[0]; // TODO: multi-batch support
-        let zdata_col = batch.column_by_name("zdata")
-            .ok_or_else(|| anyhow!("missing zdata column"))?
-            .as_any().downcast_ref::<LargeBinaryArray>()
-            .ok_or_else(|| anyhow!("zdata not LargeBinaryArray"))?;
-
+        let mut file = File::open(&self.archive_path)?;
         let mut result = Vec::with_capacity(entry.uncompressed_size as usize);
 
-        for &row in &entry.chunk_rows {
-            let chunk_bytes = zdata_col.value(row);
+        for chunk in &entry.chunks {
+            file.seek(SeekFrom::Start(chunk.blob_offset))?;
+            let mut blob = vec![0u8; chunk.blob_size as usize];
+            file.read_exact(&mut blob)?;
 
-            if entry.compressed {
-                let decompressed = codec::decompress_frame(chunk_bytes)?;
+            if chunk.compressed {
+                let decompressed = codec::decompress_frame(&blob)?;
                 result.extend_from_slice(&decompressed);
             } else {
-                result.extend_from_slice(chunk_bytes);
+                result.extend_from_slice(&blob);
             }
         }
 

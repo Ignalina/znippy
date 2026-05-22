@@ -2,46 +2,37 @@ use anyhow::{Result, anyhow};
 use blake3::Hasher;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use znippy_common::chunkrevolver::{ChunkRevolver, SendPtr, get_chunk_slice};
 use znippy_common::common_config::CONFIG;
 use znippy_common::index::{
-    build_arrow_metadata_for_checksums_and_config, should_skip_compression,
-    build_metadata_batch,
+    ZNIPPY_INDEX_SCHEMA, build_arrow_metadata_for_config, build_metadata_batch,
+    should_skip_compression,
 };
-use znippy_common::meta::{ChunkMeta, WriterStats};
-use znippy_common::{
-    CompressionReport,
-    split_into_microchunks,
-};
+use znippy_common::meta::{BlobMeta, ChunkMeta, WriterStats};
+use znippy_common::{CompressionReport, split_into_microchunks};
 
 /// An entry to be compressed into the archive.
-/// Contains the relative path within the archive and the raw file bytes.
 pub struct ArchiveEntry {
     pub relative_path: String,
     pub data: Vec<u8>,
 }
 
 /// A handle to the streaming compressor.
-/// Send `ArchiveEntry` items through the sender, then call `finish()` to finalize the archive.
 pub struct StreamCompressor {
     tx: Option<Sender<ArchiveEntry>>,
     join_handle: Option<thread::JoinHandle<Result<CompressionReport>>>,
 }
 
 impl StreamCompressor {
-    /// Returns the sender channel for feeding entries into the compressor.
     pub fn sender(&self) -> &Sender<ArchiveEntry> {
         self.tx.as_ref().expect("sender already consumed")
     }
 
-    /// Signal that no more entries will be sent and wait for compression to complete.
-    /// Returns the compression report.
     pub fn finish(mut self) -> Result<CompressionReport> {
-        // Drop sender to signal EOF to the pipeline
         drop(self.tx.take());
         self.join_handle
             .take()
@@ -51,14 +42,6 @@ impl StreamCompressor {
     }
 }
 
-/// Start a streaming compression pipeline.
-///
-/// Returns a `StreamCompressor` handle. Feed `ArchiveEntry` items via `handle.sender().send(entry)`,
-/// then call `handle.finish()` to finalize the single-file .znippy archive.
-///
-/// # Arguments
-/// * `output` - Base path for output file (produces output.znippy)
-/// * `no_skip` - If true, compress all files regardless of extension
 pub fn compress_stream(output: &PathBuf, no_skip: bool) -> Result<StreamCompressor> {
     let (tx_entry, rx_entry): (Sender<ArchiveEntry>, Receiver<ArchiveEntry>) = unbounded();
     let output = output.clone();
@@ -78,50 +61,6 @@ fn run_compression_pipeline(
     output: &PathBuf,
     no_skip: bool,
 ) -> Result<CompressionReport> {
-    // Collect all entries first (we need the full list for the writer thread)
-    let entries: Vec<ArchiveEntry> = rx_entry.into_iter().collect();
-    let total_files = entries.len() as u64;
-
-    if entries.is_empty() {
-        return Ok(CompressionReport {
-            total_files: 0,
-            compressed_files: 0,
-            uncompressed_files: 0,
-            total_dirs: 0,
-            total_bytes_in: 0,
-            total_bytes_out: 0,
-            compressed_bytes: 0,
-            uncompressed_bytes: 0,
-            compression_ratio: 0.0,
-            chunks: 0,
-        });
-    }
-
-    let mut files_to_skip = 0u64;
-    let mut files_to_compress = 0u64;
-
-    // Determine skip status per entry
-    let skip_flags: Vec<bool> = entries
-        .iter()
-        .map(|e| {
-            let skip = !no_skip && should_skip_compression(std::path::Path::new(&e.relative_path));
-            if skip {
-                files_to_skip += 1;
-            } else {
-                files_to_compress += 1;
-            }
-            skip
-        })
-        .collect();
-
-    log::debug!(
-        "Stream compressor: {} entries, {} to compress, {} to skip",
-        entries.len(),
-        files_to_compress,
-        files_to_skip
-    );
-
-    // Set up channels (same as compress_dir)
     let (tx_chunk_array, rx_chunk_array): (
         Vec<Sender<(u64, u64, u8, u64, u64, bool)>>,
         Vec<Receiver<(u64, u64, u8, u64, u64, bool)>>,
@@ -134,33 +73,31 @@ fn run_compression_pipeline(
         Receiver<(Arc<[u8]>, ChunkMeta)>,
     ) = unbounded();
     let (tx_return, rx_return): (Sender<(u8, u64)>, Receiver<(u8, u64)>) = unbounded();
+    let (paths_tx, paths_rx) = bounded::<Vec<String>>(1);
+    let (checksum_tx, checksum_rx) = bounded::<Vec<[u8; 32]>>(1);
 
     let mut revolver = ChunkRevolver::new(&CONFIG);
     let base_ptrs = revolver.base_ptrs();
     let chunk_size = revolver.chunk_size();
 
-    // Shared data for writer thread
-    let relative_paths: Arc<Vec<String>> = Arc::new(
-        entries.iter().map(|e| e.relative_path.clone()).collect(),
-    );
-    let relative_paths_for_writer = Arc::clone(&relative_paths);
-
-    // Reader thread: reads from in-memory entries instead of disk
+    // Reader thread: streams entries from rx_entry, no collect()
     let reader_thread = {
         let tx_chunk_array = tx_chunk_array.clone();
         let rx_done = rx_return.clone();
 
         thread::spawn(move || {
+            let mut paths: Vec<String> = Vec::new();
             let mut inflight_chunks = 0usize;
             let mut uncompressed_files: u64 = 0;
             let mut uncompressed_bytes: u64 = 0;
             let mut compressed_files: u64 = 0;
             let mut compressed_bytes: u64 = 0;
 
-            for (file_index, entry) in entries.into_iter().enumerate() {
-                let skip = skip_flags[file_index];
-                let data = entry.data;
-                let data_len = data.len() as u64;
+            for entry in rx_entry {
+                let file_index = paths.len() as u64;
+                let skip = !no_skip
+                    && should_skip_compression(std::path::Path::new(&entry.relative_path));
+                let data_len = entry.data.len() as u64;
 
                 if skip {
                     uncompressed_files += 1;
@@ -170,7 +107,9 @@ fn run_compression_pipeline(
                     compressed_bytes += data_len;
                 }
 
-                let mut cursor = std::io::Cursor::new(data);
+                paths.push(entry.relative_path);
+
+                let mut cursor = std::io::Cursor::new(entry.data);
                 let mut has_read_any_data = false;
                 let mut fdata_offset: u64 = 0;
 
@@ -184,7 +123,7 @@ fn run_compression_pipeline(
                                     if !has_read_any_data {
                                         tx_chunk_array[ring_nr]
                                             .send((
-                                                file_index as u64,
+                                                file_index,
                                                 fdata_offset,
                                                 chunk.ring_nr,
                                                 chunk.index,
@@ -205,7 +144,7 @@ fn run_compression_pipeline(
                                     has_read_any_data = true;
                                     tx_chunk_array[ring_nr]
                                         .send((
-                                            file_index as u64,
+                                            file_index,
                                             fdata_offset,
                                             chunk.ring_nr,
                                             chunk.index,
@@ -234,16 +173,13 @@ fn run_compression_pipeline(
                             let (ring_nr, returned) =
                                 rx_done.recv().expect("rx_done channel closed unexpectedly");
                             revolver.return_chunk(ring_nr, returned);
-                            inflight_chunks = inflight_chunks
-                                .checked_sub(1)
-                                .expect("inflight_chunks underflow");
-                            continue;
+                            inflight_chunks =
+                                inflight_chunks.checked_sub(1).expect("inflight_chunks underflow");
                         }
                     }
                 }
             }
 
-            // Drain inflight chunks
             while inflight_chunks > 0 {
                 match rx_done.recv() {
                     Ok((ring_nr, returned)) => {
@@ -263,18 +199,18 @@ fn run_compression_pipeline(
                 uncompressed_bytes,
                 compressed_files,
                 compressed_bytes,
+                paths,
             )
         })
     };
 
-    // Compressor threads (identical to compress_dir)
-    let mut compressor_threads = Vec::with_capacity(CONFIG.max_core_in_flight as u8 as usize);
+    // Compressor threads
+    let mut compressor_threads = Vec::with_capacity(CONFIG.max_core_in_flight as usize);
     for compressor_group in 0..CONFIG.max_core_in_flight as u8 {
         let rx_chunk = rx_chunk_array[compressor_group as usize].clone();
         let tx_compressed = tx_compressed.clone();
         let tx_ret = tx_return.clone();
         let base_ptr: SendPtr = base_ptrs[compressor_group as usize];
-        let chunk_size = chunk_size;
 
         let handle = thread::spawn(move || {
             let raw_ptr = base_ptr.as_ptr();
@@ -349,7 +285,7 @@ fn run_compression_pipeline(
                                     }
                                 }
                             }
-                            tx_ret.send((ring_nr, chunk_nr));
+                            tx_ret.send((ring_nr, chunk_nr)).ok();
                         }
                         Err(_) => break,
                     }
@@ -365,21 +301,15 @@ fn run_compression_pipeline(
         compressor_threads.push(handle);
     }
 
-    // Channel for checksums: sent after compressor threads finish
-    let (checksum_tx, checksum_rx) = bounded::<Vec<[u8; 32]>>(1);
-
-    // Writer thread — Arrow IPC Stream format (valid Arrow file, DuckDB-readable)
+    // Writer thread: streams blobs to disk immediately, writes Arrow index at end
     let output_for_writer = output.clone();
     let writer_thread = thread::spawn(move || -> WriterStats {
-        use std::io::Write;
-        use znippy_common::index::{ZNIPPY_INDEX_SCHEMA};
-        use znippy_common::index::build_metadata_batch;
-
         let output_path = output_for_writer.with_extension("znippy");
         let file = File::create(&output_path).expect("Failed to create output file");
         let mut writer = std::io::BufWriter::new(file);
 
-        let mut all_meta: Vec<(ChunkMeta, Arc<[u8]>)> = Vec::new();
+        let mut all_blobs: Vec<BlobMeta> = Vec::new();
+        let mut current_offset: u64 = 0;
         let mut writerstats = WriterStats {
             total_chunks: 0,
             total_written_bytes: 0,
@@ -389,68 +319,95 @@ fn run_compression_pipeline(
             corrupt_bytes: 0,
         };
 
+        // Write each blob immediately as it arrives
         while let Ok((compressed_data, chunk_meta)) = rx_compressed.recv() {
             writerstats.total_chunks += 1;
-            let data_len = compressed_data.len() as u64;
-            writerstats.total_written_bytes += data_len;
+            let blob_size = compressed_data.len() as u64;
 
-            all_meta.push((chunk_meta, compressed_data));
+            writer.write_all(&compressed_data).expect("Failed to write blob");
+
+            all_blobs.push(BlobMeta {
+                chunk_meta,
+                blob_offset: current_offset,
+                blob_size,
+            });
+
+            current_offset += blob_size;
+            writerstats.total_written_bytes += blob_size;
         }
 
-        // Wait for checksums from main thread
+        // Receive paths and checksums from main thread
+        let paths = paths_rx.recv().expect("Failed to receive paths");
         let checksums = checksum_rx.recv().expect("Failed to receive checksums");
 
-        let meta_map = build_arrow_metadata_for_checksums_and_config(&checksums, &CONFIG);
+        // Record where Arrow IPC starts
+        let index_offset = current_offset;
+
+        // Build and write Arrow IPC index
+        let batch = build_metadata_batch(&all_blobs, &checksums, |file_index| {
+            paths[file_index as usize].clone()
+        })
+        .expect("Failed to build metadata batch");
+
+        let meta_map = build_arrow_metadata_for_config(&CONFIG);
         let schema_with_meta = arrow::datatypes::Schema::new_with_metadata(
             ZNIPPY_INDEX_SCHEMA.fields().to_vec(),
             meta_map,
         );
-
-        let paths = &relative_paths_for_writer;
-        let batch = build_metadata_batch(&all_meta, |file_index| {
-            paths[file_index as usize].clone()
-        }).expect("Failed to build metadata batch");
 
         use arrow::ipc::writer::StreamWriter;
         let mut stream_writer = StreamWriter::try_new(&mut writer, &schema_with_meta)
             .expect("Failed to create Arrow stream writer");
         stream_writer.write(&batch).expect("Failed to write batch");
         stream_writer.finish().expect("Failed to finish Arrow stream");
+
+        // 8-byte LE footer: byte offset where Arrow IPC starts
+        writer
+            .write_all(&index_offset.to_le_bytes())
+            .expect("Failed to write footer");
         writer.flush().expect("Failed to flush");
 
         log::info!(
-            "[writer] Done {} chunks, total {} bytes",
+            "[writer] Done: {} chunks, {} blob bytes, Arrow index at offset {}",
             writerstats.total_chunks,
             writerstats.total_written_bytes,
+            index_offset,
         );
 
         writerstats
     });
 
-    // Wait for reader
-    let (uncompressed_files, uncompressed_bytes, compressed_files, compressed_bytes) =
+    // Wait for reader to finish; it returns collected paths
+    let (uncompressed_files, uncompressed_bytes, compressed_files, compressed_bytes, paths) =
         reader_thread.join().unwrap();
+
+    let total_files = (uncompressed_files + compressed_files) as u64;
+
+    // Send paths to writer before compressors finish (writer is still consuming rx_compressed)
+    paths_tx.send(paths).expect("Failed to send paths to writer");
 
     tx_chunk_array.into_iter().for_each(drop);
 
     // Collect checksums from compressor threads
-    let mut checksums: Vec<[u8; 32]> = Vec::with_capacity(CONFIG.max_core_in_compress as usize);
+    let mut checksums: Vec<[u8; 32]> =
+        vec![[0u8; 32]; CONFIG.max_core_in_flight as usize];
     for handle in compressor_threads {
         let Ok((compressor_group, checksum)): Result<(u8, [u8; 32]), anyhow::Error> =
             handle.join().unwrap()
         else {
             return Err(anyhow!("Compressor thread returned error"));
         };
-        checksums.insert(compressor_group as usize, checksum);
+        checksums[compressor_group as usize] = checksum;
     }
 
-    // Signal writer: no more chunks, here are the checksums
     drop(tx_compressed);
-    checksum_tx.send(checksums).expect("Failed to send checksums to writer");
+    checksum_tx
+        .send(checksums)
+        .expect("Failed to send checksums to writer");
 
     let writerstats = writer_thread.join().unwrap();
 
-    log::info!("[stream] Arrow IPC archive written");
+    log::info!("[stream] v0.6 archive written");
 
     let report = CompressionReport {
         total_files,

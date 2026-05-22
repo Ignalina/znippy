@@ -295,9 +295,9 @@ fn test_index_schema_fields() {
             "checksum_group",
             "compressed",
             "uncompressed_size",
-            "repo",
-            "extension",
-            "zdata",
+            "blob_offset",
+            "blob_size",
+            "checksum",
         ]
     );
 }
@@ -318,15 +318,16 @@ fn test_read_znippy_index_after_compress() -> Result<()> {
     assert!(!batches.is_empty());
     assert_eq!(batches[0].num_rows(), 1);
 
-    // Verify schema has metadata (checksums, config)
+    // Verify schema has config metadata (v0.6: checksums are in a column, not metadata)
     let metadata = schema.metadata();
-    assert!(
-        metadata.contains_key("checksum_group_0"),
-        "Expected checksum in metadata"
-    );
     assert!(
         metadata.contains_key("compression_level"),
         "Expected compression_level in metadata"
+    );
+    // Checksums live in the 'checksum' column, not in schema metadata
+    assert!(
+        !metadata.contains_key("checksum_group_0"),
+        "v0.6 format must not store checksums in schema metadata"
     );
 
     Ok(())
