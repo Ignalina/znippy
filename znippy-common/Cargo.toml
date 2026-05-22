@@ -1,6 +1,6 @@
 [package]
 name = "znippy-common"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 authors = ["Rickard Lundin <rickard@x14.se>"]
 description = "Core logic and data structures for Znippy, a parallel chunked compression system."
@@ -17,7 +17,7 @@ wasm-plugins = ["dep:wasmtime", "dep:miniz_oxide"]
 host-decompressors = ["dep:ljar", "dep:lbzip2", "dep:lgz", "dep:tar"]
 
 [dependencies]
-openzl-sys-rs = "0.1.0"
+openzl-sys-rs = "0.2.0"
 flate2 = { version = "1.1", optional = true }
 tar = { version = "0.4", optional = true }
 wasmtime = { version = "33", optional = true }
