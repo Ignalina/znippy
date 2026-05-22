@@ -1,6 +1,6 @@
 [package]
 name = "znippy-decompress"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 authors = ["Rickard Lundin <rickard@x14>"]
 description = "Decompress logic for Znippy, a parallel chunked compression system."
@@ -15,5 +15,5 @@ default = []
 
 [dependencies]
 anyhow = "1.0.100"
-znippy-common = { version = "0.5.1" }
+znippy-common = { version = "0.5.2" }
 #znippy-common = { path = "../znippy-common" }

@@ -3319,14 +3319,14 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "znippy"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "znippy-cli",
 ]
 
 [[package]]
 name = "znippy-cli"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3338,7 +3338,7 @@ dependencies = [
 
 [[package]]
 name = "znippy-common"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -3362,7 +3362,7 @@ dependencies = [
 
 [[package]]
 name = "znippy-compress"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -3375,7 +3375,7 @@ dependencies = [
 
 [[package]]
 name = "znippy-decompress"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "znippy-common",
