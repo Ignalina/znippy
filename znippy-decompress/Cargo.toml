@@ -1,13 +1,13 @@
 [package]
 name = "znippy-decompress"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 authors = ["Rickard Lundin <rickard@x14>"]
 description = "Decompress logic for Znippy, a parallel chunked compression system."
 license = "MIT"
 repository = "https://github.com/Ignalina/znippy"
 readme = "../README.md"
-categories = ["compression", "filesystem", "data-structures"]    
+categories = ["compression", "filesystem", "data-structures"]
 keywords = ["compression", "openzl", "parallel", "arrow", "blake3"]
 
 [features]
@@ -15,5 +15,5 @@ default = []
 
 [dependencies]
 anyhow = "1.0.100"
-znippy-common = { version = "0.5.2" }
+znippy-common = { version = "0.6.0" }
 #znippy-common = { path = "../znippy-common" }
