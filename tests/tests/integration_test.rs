@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
+use znippy_common::{ZnippyArchive, ZnippyReader};
 use znippy_compress::{ArchiveEntry, compress_dir, compress_stream};
 
 /// Helper: decompress an archive and return map of relative_path → file contents
@@ -380,6 +381,32 @@ fn test_list_archive_contents() -> Result<()> {
 
     // list_archive_contents prints to stdout - just verify it doesn't error
     znippy_common::list_archive_contents(&archive_path)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_znippy_archive_extract_file_multi_chunk() -> Result<()> {
+    let out_dir = TempDir::new()?;
+    let archive_path = out_dir.path().join("extract.znippy");
+
+    // 12 MB forces multiple chunks; use a non-repeating pattern so any byte-order
+    // swap would produce bytes that mismatch from position 0.
+    let size = 12 * 1024 * 1024;
+    let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+
+    let compressor = compress_stream(&archive_path.to_path_buf(), false)?;
+    compressor.sender().send(ArchiveEntry {
+        relative_path: "big.bin".to_string(),
+        data: data.clone(),
+    })?;
+    let report = compressor.finish()?;
+    assert!(report.chunks >= 2, "Expected multiple chunks, got {}", report.chunks);
+
+    let archive = ZnippyArchive::open(&archive_path)?;
+    let extracted = archive.extract_file("big.bin")?;
+    assert_eq!(extracted.len(), data.len(), "length mismatch");
+    assert_eq!(extracted, data, "content mismatch — chunks were assembled in wrong order");
 
     Ok(())
 }

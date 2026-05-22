@@ -11,7 +11,7 @@ use anyhow::{anyhow, Result};
 use arrow::array::Array;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
-use arrow_array::{BooleanArray, StringArray, UInt32Array, UInt64Array};
+use arrow_array::{BooleanArray, StringArray, UInt64Array};
 
 use crate::codec;
 use crate::index::read_znippy_index;
@@ -85,11 +85,6 @@ impl ZnippyArchive {
                 .ok_or_else(|| anyhow!("missing uncompressed_size column"))?
                 .as_any().downcast_ref::<UInt64Array>()
                 .ok_or_else(|| anyhow!("uncompressed_size not UInt64Array"))?;
-            let chunk_seq_col = batch.column_by_name("chunk_seq")
-                .ok_or_else(|| anyhow!("missing chunk_seq column"))?
-                .as_any().downcast_ref::<UInt32Array>()
-                .ok_or_else(|| anyhow!("chunk_seq not UInt32Array"))?;
-
             for row in 0..batch.num_rows() {
                 let path = paths.value(row).to_string();
                 let compressed = compressed_col.value(row);
@@ -105,15 +100,17 @@ impl ZnippyArchive {
             }
         }
 
-        // Sort chunk_rows by chunk_seq for each file
+        // Sort chunk_rows by fdata_offset for each file.
+        // chunk_seq is a per-compressor-group counter and is not comparable across groups;
+        // fdata_offset is the byte position within the original file and is always correct.
         for batch in batches {
-            let chunk_seq_col = batch.column_by_name("chunk_seq")
+            let fdata_offset_col = batch.column_by_name("fdata_offset")
                 .unwrap()
-                .as_any().downcast_ref::<UInt32Array>()
+                .as_any().downcast_ref::<UInt64Array>()
                 .unwrap();
 
             for entry in index.values_mut() {
-                entry.chunk_rows.sort_by_key(|&row| chunk_seq_col.value(row));
+                entry.chunk_rows.sort_by_key(|&row| fdata_offset_col.value(row));
             }
         }
 

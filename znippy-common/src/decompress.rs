@@ -71,8 +71,11 @@ pub fn decompress_archive(
         .unzip();
 
     let (tx_return, rx_return): (Sender<(u8, u64)>, Receiver<(u8, u64)>) = unbounded();
+    // Use max_chunks as the bound so decompressor threads never stall waiting for
+    // the writer — mirrors the unbounded channel used on the compression side.
+    // Peak extra memory is at most max_chunks * chunk_size of decompressed data.
     let (chunk_tx, chunk_rx): (Sender<(ChunkMeta, Vec<u8>)>, Receiver<_>) =
-        bounded(config.max_core_in_flight);
+        bounded(config.max_chunks as usize);
 
     let out_dir = Arc::new(out_dir.to_path_buf());
     let out_dir_cloned = Arc::clone(&out_dir);
