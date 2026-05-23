@@ -24,8 +24,8 @@ use crate::meta::{ReaderStats, WriterStats};
 ///
 /// `Owned` — decompressed output (already a fresh allocation; no further copy needed).
 /// `Revolver` — uncompressed (skip-path) chunk: raw pointer into the ring buffer slot.
-/// The slot must not be returned to the reader until AFTER the writer has called
-/// `write_all` and made a copy for the verify thread.
+/// The writer uses the slice directly for `write_all` (zero copies), then makes one
+/// copy for the verify thread, then returns the slot.
 enum DecompBlob {
     Owned(Vec<u8>),
     Revolver { ptr: usize, len: usize, ring_nr: u8, chunk_nr: u32 },
@@ -291,8 +291,9 @@ pub fn decompress_archive(
                             done_tx.send((decompressor_nr, chunk_nr as u64)).ok();
                         } else {
                             // Zero-copy skip path: pass raw pointer into ring slot.
-                            // done_tx is NOT sent here — the writer returns the slot after
-                            // write_all and the verify copy, keeping the slot valid throughout.
+                            // done_tx is NOT sent here — writer owns the slot through write +
+                            // verify copy, then returns it. Extra slot per thread (chunks_per_thread
+                            // = max_chunks/threads + 1) ensures the reader is never starved.
                             tx.send((chunk_meta, DecompBlob::Revolver {
                                 ptr: data.as_ptr() as usize,
                                 len: data.len(),
@@ -412,25 +413,24 @@ pub fn decompress_archive(
                     });
 
                 file.seek(SeekFrom::Start(chunk_meta.fdata_offset)).unwrap();
-                // Zero-copy for Revolver: writes directly from the ring buffer pointer.
+                // Zero-copy: write directly from the ring slot (skip path) or decompressed Vec.
                 file.write_all(blob.as_slice()).unwrap();
             }
 
-            // For Revolver blobs: make one copy for the verify thread, then return the ring slot.
-            // For Owned blobs: the decompressor already returned the slot; move the Vec.
-            let data_for_verify = match blob {
+            // Copy once for the verify thread, then immediately return the ring slot.
+            let data = match blob {
                 DecompBlob::Revolver { ptr, len, ring_nr, chunk_nr } => {
-                    let copy = unsafe {
+                    let v = unsafe {
                         std::slice::from_raw_parts(ptr as *const u8, len).to_vec()
                     };
                     tx_return_writer.send((ring_nr, chunk_nr as u64)).ok();
-                    copy
+                    v
                 }
                 DecompBlob::Owned(v) => v,
             };
 
             if let Some(&idx) = group_to_idx.get(&chunk_meta.checksum_group) {
-                let _ = verify_txs[idx].send((chunk_meta.chunk_seq, data_for_verify));
+                let _ = verify_txs[idx].send((chunk_meta.chunk_seq, data));
             }
         }
 

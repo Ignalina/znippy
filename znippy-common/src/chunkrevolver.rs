@@ -52,7 +52,7 @@ impl ChunkRevolver {
         let thread_count = config.max_core_in_flight as usize;
 
         let safe_thread_count = thread_count.min(num_chunks);
-        let chunks_per_thread = num_chunks / safe_thread_count;
+        let chunks_per_thread = num_chunks / safe_thread_count + 1;
 
         let mut rings = Vec::with_capacity(safe_thread_count);
         let mut memory_blocks = Vec::with_capacity(safe_thread_count);
@@ -113,6 +113,10 @@ impl ChunkRevolver {
 
     pub fn chunk_size(&self) -> usize {
         self.chunk_size as usize
+    }
+
+    pub fn total_capacity(&self) -> usize {
+        self.rings.len() * (self.memory_blocks[0].len() / self.chunk_size as usize)
     }
 }
 

@@ -9,12 +9,13 @@ fn test_chunk_revolver_basic_usage() {
     config.file_split_block_size = 1024 * 1024; // 1 MB
 
     let mut revolver = ChunkRevolver::new(&config);
+    let total = revolver.total_capacity();
 
     let mut seen = std::collections::HashSet::new();
     let mut all_chunks = Vec::new();
 
     // 1. Hämta alla chunkar
-    for _ in 0..config.max_chunks {
+    for _ in 0..total {
         let chunk = revolver.try_get_chunk().expect("Expected available chunk");
 
         // Kontrollera unikhet
@@ -29,7 +30,7 @@ fn test_chunk_revolver_basic_usage() {
     assert!(
         revolver.try_get_chunk().is_none(),
         "Should be exhausted after {} chunks",
-        config.max_chunks
+        total
     );
 
     // 3. Returnera chunkar
@@ -39,7 +40,7 @@ fn test_chunk_revolver_basic_usage() {
 
     // 4. Kontrollera att alla kan hämtas igen
     let mut second_seen = std::collections::HashSet::new();
-    for _ in 0..config.max_chunks {
+    for _ in 0..total {
         let chunk = revolver
             .try_get_chunk()
             .expect("Expected chunk after return");
@@ -61,6 +62,7 @@ fn test_chunk_revolver_two_passes() {
     config.file_split_block_size = 1024 * 1024; // 1MB
 
     let mut revolver = ChunkRevolver::new(&config);
+    let expected = revolver.total_capacity();
 
     let mut all_chunks = Vec::new();
 
@@ -71,7 +73,7 @@ fn test_chunk_revolver_two_passes() {
 
     let total = all_chunks.len();
     assert_eq!(
-        total, config.max_chunks as usize,
+        total, expected,
         "Första varvet borde hämta alla chunkar"
     );
 
@@ -114,6 +116,7 @@ fn test_no_duplicate_without_return() {
     config.file_split_block_size = 1024 * 1024;
 
     let mut revolver = ChunkRevolver::new(&config);
+    let expected = revolver.total_capacity();
 
     let mut seen = HashSet::new();
     let mut count = 0;
@@ -130,8 +133,8 @@ fn test_no_duplicate_without_return() {
     }
 
     assert_eq!(
-        count, config.max_chunks as usize,
-        "Should get exactly max_chunks before exhaustion"
+        count, expected,
+        "Should get exactly total_capacity() chunks before exhaustion"
     );
 
     let chunk = revolver.try_get_chunk();
@@ -195,10 +198,11 @@ fn test_chunk_does_not_overlap_without_return() {
     config.file_split_block_size = 1024 * 1024;
 
     let mut revolver = ChunkRevolver::new(&config);
+    let total = revolver.total_capacity();
 
     let mut seen = HashSet::new();
 
-    for i in 0..config.max_chunks {
+    for i in 0..total {
         let chunk = revolver
             .try_get_chunk()
             .expect("Expected unique chunk before exhaustion");
@@ -212,7 +216,7 @@ fn test_chunk_does_not_overlap_without_return() {
         );
     }
 
-    // Efter max_chunks ska det vara slut – ingen ny chunk utan återanvändning
+    // After total_capacity chunks the revolver must be empty
     let chunk = revolver.try_get_chunk();
     assert!(
         chunk.is_none(),
@@ -232,6 +236,7 @@ fn test_no_duplicate_chunks_without_return() {
     config.file_split_block_size = 1024 * 1024;
 
     let mut revolver = ChunkRevolver::new(&config);
+    let expected = revolver.total_capacity();
 
     let mut seen = HashSet::new();
     let mut count = 0;
@@ -248,8 +253,8 @@ fn test_no_duplicate_chunks_without_return() {
     }
 
     assert_eq!(
-        count, config.max_chunks,
+        count, expected,
         "Expected to get exactly {} unique chunks",
-        config.max_chunks
+        expected
     );
 }
