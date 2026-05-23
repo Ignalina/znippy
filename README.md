@@ -19,7 +19,7 @@ Built on **Apache Arrow IPC** + **OpenZL** (zstd+lz4 under the hood).
 | **Rust crates (1.3k .crate)** | **197 MB** | **197 MB** | **1.0x** | **1,376 MB/s** | **2,370 MB/s** |
 | **Rust deps (41k files)** | **988 MB** | **137 MB** | **7.2x** | **67 MB/s** | **1,377 MB/s** |
 
-Already-compressed files (.crate, .jar, .gz, etc.) are stored as-is at full write speed (skip path). Random/incompressible data is measured at zstd encoding cost. Small-file throughput is bottlenecked by per-chunk channel overhead — see backlog P4.
+Already-compressed files (.crate, .jar, .gz, etc.) are stored as-is at full write speed (skip path). Random/incompressible data is measured at openzl encoding cost. Small-file throughput is bottlenecked by per-chunk channel overhead — see backlog P4.
 
 ## Architecture — v0.7 Multi-Index Format
 
@@ -27,14 +27,14 @@ Already-compressed files (.crate, .jar, .gz, etc.) are stored as-is at full writ
 
 ```
 [ blob_0 ][ blob_1 ] ... [ blob_N ]
-[ Arrow IPC sub-index (pkg_type=0, repo="libs") ]
-[ Arrow IPC sub-index (pkg_type=1, repo="release") ]
+[ Arrow IPC sub-index ]   ← rows: relative_path, pkg_type, repo, chunk_seq,
+[ Arrow IPC sub-index ]       blob_offset, blob_size, uncompressed_size, checksum, …
 ...
-[ Arrow IPC manifest ]
+[ Arrow IPC manifest  ]   ← rows: pkg_type, repo, sub_index_offset, sub_index_size
 [ 8 bytes "ZNPYMIDX" ][ 8 bytes LE u64: manifest_offset ]
 ```
 
-Blobs are written as produced (true streaming, no buffering). Each `(pkg_type, repo)` group gets its own Arrow IPC sub-index written after all blobs finish. A manifest Arrow IPC table records the offset and size of each sub-index. The 16-byte footer lets readers seek directly to the manifest without scanning.
+Blobs are written as produced (true streaming, no buffering). After all blobs finish, one Arrow IPC sub-index is written per `(pkg_type, repo)` group — each is a standard Arrow IPC stream where `pkg_type` and `repo` are ordinary columns alongside the path and offset data. The manifest Arrow IPC table records the byte offset and size of each sub-index so the reader can seek directly to the right group. The 16-byte footer gives the manifest's offset.
 
 ### Compression pipeline
 
@@ -209,7 +209,10 @@ cargo test --release -p znippy-tests --test maven_bench -- --ignored --nocapture
 - **v0.5.0**: Dual-pipeline architecture, DuckDB/Polars queryable, zero-copy skip path
 - **v0.6.0**: Streaming format — blobs first, Arrow index last, 8-byte footer; true zero-buffer writes
 - **v0.7.0** (current): Multi-index container — one Arrow IPC sub-index per `(pkg_type, repo)` group; Arrow IPC manifest; 16-byte footer; module-owned schema; WASM plugin `plugin_schema` export
+- **v0.8.0** Iceberg support
 
+🧙 May Odin watch over every bit. 🧙
 ## Fan arts
 
+Iceberg 
 ![znippy](https://github.com/user-attachments/assets/b068d559-4339-4f9f-9623-7c6b5efe2771)
