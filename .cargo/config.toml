@@ -1,0 +1,5 @@
+[build]
+target-dir = "/home/rickard/.cache/znippy-target"
+
+[alias]
+xtask = "run --package xtask --"
