@@ -1,6 +1,6 @@
 [package]
 name = "znippy-plugin-maven"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 description = "Maven/JAR metadata plugin for znippy (compiles to native + WASM)"
 license = "MIT"
@@ -15,7 +15,7 @@ miniz_oxide = "0.8"
 quick-xml = "0.36"
 ureq = { version = "2", optional = true }
 ljar = { version = "0.1.0", optional = true }
-znippy-common = { version = "0.7.0", path = "../znippy-common", optional = true }
+znippy-common = { version = "0.7.1", path = "../znippy-common", optional = true }
 
 [features]
 default = []

@@ -1,6 +1,6 @@
 [package]
 name = "znippy-compress"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 authors = ["Rickard Lundin <rickard@ignalina.dk>"]
 description = "Compression logic for Znippy, a parallel chunked compression system."
@@ -19,6 +19,6 @@ blake3 = "1.8.2"
 anyhow = "1.0.100"
 crossbeam-channel = "0.5.15"
 arrow = "58.3.0"
-znippy-common = { version = "0.7.0" }
+znippy-common = { version = "0.7.1" }
 #znippy-common = { path = "../znippy-common" }
 log = "0.4.28"
