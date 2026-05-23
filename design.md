@@ -444,3 +444,82 @@ compressor.finish()?;
 | 5 | docker |
 | 6 | helm |
 | 7 | raw (named) |
+
+---
+
+## Zero-Copy Contract
+
+Every byte of payload data crosses exactly **one** copy boundary on each path.
+Any additional copy is a bug.
+
+### Where the single copy happens
+
+**Compress ingest** — `entry.data` (Vec<u8> from caller) or disk bytes are copied
+into a ChunkRevolver ring slot via `Cursor::read` / `BufReader::read`.
+This is unavoidable: the ring buffer is pre-allocated fixed-size memory;
+callers supply variably-sized data.
+
+**Decompress ingest** — archive bytes are read from disk into a ring slot via
+`File::read_exact`. Same rationale.
+
+Everything downstream of the ring slot is zero-copy for the skip (already-compressed) path,
+and one-allocation (the compressor/decompressor output) for the compress path.
+
+### Compress skip path (`Blob::Revolver`)
+
+Pre-compressed files (`.crate`, `.jar`, `.gz`, …) bypass the compressor entirely.
+The compressor thread builds a `Blob::Revolver { ptr, len, ring_nr, chunk_nr }` —
+a raw pointer **into** the ring slot — and sends it to the writer.
+The writer calls `write_all(blob.as_slice())` directly from that pointer.
+The ring slot is returned to the reader **only after** `write_all` returns.
+
+```
+ring slot  ──raw ptr──▶  write_all(ptr)  ──▶  disk
+                         ↑ zero extra copy
+```
+
+`tx_ret` is NOT called by the compressor for Revolver blobs; the writer calls it.
+
+### Compress path (`Blob::Owned`)
+
+The compressor reads from the ring slot, produces a fresh `Vec<u8>` (compressed output),
+wraps it in `Blob::Owned`, and sends it. The ring slot is returned immediately.
+The writer calls `write_all` from the Vec. One allocation, zero copies.
+
+### Decompress skip path (`DecompBlob::Revolver`)
+
+Symmetric with the compress skip path. The decompressor thread builds a
+`DecompBlob::Revolver { ptr, len, ring_nr, chunk_nr }` and sends it to the writer
+**without** sending `done_tx`. The writer:
+
+1. Calls `write_all(blob.as_slice())` — zero-copy disk write from raw ring pointer.
+2. Copies to `Vec<u8>` for the verify thread (one copy, only for hashing).
+3. Calls `tx_return_writer.send((ring_nr, chunk_nr))` — returns the slot.
+
+```
+ring slot  ──raw ptr──▶  write_all(ptr)  ──▶  disk       (zero copy)
+           ──to_vec()──▶  verify thread        (one copy, only for hashing)
+```
+
+### Decompress path (`DecompBlob::Owned`)
+
+The decompressor inflates the ring slot data into a fresh `Vec<u8>`, returns the ring slot
+immediately via `done_tx`, and sends the Vec to the writer. Writer writes and moves
+Vec into the verify thread. One allocation, zero copies.
+
+### Verify thread
+
+Receives `Vec<u8>` ownership, hashes in arrival order (reorders out-of-order chunks via
+a `BTreeMap` pending buffer). Cannot avoid holding data in memory during reordering —
+the copy from the skip path above is the minimum necessary for correctness.
+
+### Invariants
+
+| Path | Ring slot copies | Heap allocations | disk write copies |
+|------|-----------------|-----------------|------------------|
+| Compress skip | 1 (ingest) | 0 | 0 |
+| Compress data | 1 (ingest) | 1 (compressed output) | 0 |
+| Decompress skip | 1 (ingest) | 1 (verify copy) | 0 |
+| Decompress data | 1 (ingest) | 1 (decompressed output) | 0 |
+
+Any path showing more than the above numbers is a regression.

@@ -20,6 +20,38 @@ use blake3::Hasher;
 use crate::chunkrevolver::{SendPtr, get_chunk_slice};
 use crate::meta::{ReaderStats, WriterStats};
 
+/// Mirrors `Blob` on the compress side.
+///
+/// `Owned` — decompressed output (already a fresh allocation; no further copy needed).
+/// `Revolver` — uncompressed (skip-path) chunk: raw pointer into the ring buffer slot.
+/// The slot must not be returned to the reader until AFTER the writer has called
+/// `write_all` and made a copy for the verify thread.
+enum DecompBlob {
+    Owned(Vec<u8>),
+    Revolver { ptr: usize, len: usize, ring_nr: u8, chunk_nr: u32 },
+}
+
+// Safety: raw pointer into ChunkRevolver's pre-allocated region, kept alive by the
+// protocol: slot is returned only after write_all + verify copy in the writer thread.
+unsafe impl Send for DecompBlob {}
+
+impl DecompBlob {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            DecompBlob::Owned(v) => v,
+            DecompBlob::Revolver { ptr, len, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr as *const u8, *len)
+            },
+        }
+    }
+    fn len(&self) -> usize {
+        match self {
+            DecompBlob::Owned(v) => v.len(),
+            DecompBlob::Revolver { len, .. } => *len,
+        }
+    }
+}
+
 use std::thread::JoinHandle;
 
 pub fn decompress_archive(
@@ -112,7 +144,7 @@ pub fn decompress_archive(
         crossbeam_channel::Receiver<(u8, u64)>,
     ) = crossbeam_channel::unbounded();
     let (chunk_tx, chunk_rx): (
-        crossbeam_channel::Sender<(ChunkMeta, Vec<u8>)>,
+        crossbeam_channel::Sender<(ChunkMeta, DecompBlob)>,
         crossbeam_channel::Receiver<_>,
     ) = crossbeam_channel::bounded(config.max_chunks as usize);
 
@@ -242,30 +274,31 @@ pub fn decompress_archive(
                             chunk_meta.compressed_size as usize,
                         );
 
-                        let decompress_result = std::panic::catch_unwind(|| {
-                            if chunk_meta.compressed {
-                                decompress_microchunk(data)
-                            } else {
-                                Ok(data.to_vec())
-                            }
-                        });
-
-                        match decompress_result {
-                            Ok(Ok(decompressed)) => {
-                                if let Err(e) = tx.send((chunk_meta, decompressed)) {
-                                    log::error!("[Decompressor {}] tx.send failed: {}", decompressor_nr, e);
+                        if chunk_meta.compressed {
+                            let result = std::panic::catch_unwind(|| decompress_microchunk(data));
+                            match result {
+                                Ok(Ok(decompressed)) => {
+                                    tx.send((chunk_meta, DecompBlob::Owned(decompressed))).ok();
+                                }
+                                Ok(Err(e)) => {
+                                    log::error!("Decompression failed: row {} chunk_seq={} error={}", chunk_meta.file_index, chunk_meta.chunk_seq, e);
+                                }
+                                Err(_) => {
+                                    log::error!("PANIC: decompress panicked! row {} chunk_seq={}", chunk_meta.file_index, chunk_meta.chunk_seq);
                                 }
                             }
-                            Ok(Err(e)) => {
-                                log::error!("Decompression failed: row {} chunk_seq={} error={}", chunk_meta.file_index, chunk_meta.chunk_seq, e);
-                            }
-                            Err(_) => {
-                                log::error!("PANIC: decompress panicked! row {} chunk_seq={}", chunk_meta.file_index, chunk_meta.chunk_seq);
-                            }
-                        }
-
-                        if let Err(e) = done_tx.send((decompressor_nr, chunk_nr as u64)) {
-                            log::warn!("[Decompressor {}] done_tx failed: {}", decompressor_nr, e);
+                            // Ring slot returned immediately — compressed output lives in the Owned Vec.
+                            done_tx.send((decompressor_nr, chunk_nr as u64)).ok();
+                        } else {
+                            // Zero-copy skip path: pass raw pointer into ring slot.
+                            // done_tx is NOT sent here — the writer returns the slot after
+                            // write_all and the verify copy, keeping the slot valid throughout.
+                            tx.send((chunk_meta, DecompBlob::Revolver {
+                                ptr: data.as_ptr() as usize,
+                                len: data.len(),
+                                ring_nr: decompressor_nr,
+                                chunk_nr,
+                            })).ok();
                         }
                     }
                     Err(_) => break,
@@ -337,7 +370,8 @@ pub fn decompress_archive(
         })
         .unzip();
 
-    // WRITER thread
+    // WRITER thread — holds a tx_return clone to release Revolver ring slots after write_all.
+    let tx_return_writer = tx_return.clone();
     let writer_thread = thread::spawn(move || -> WriterStats {
         let mut total_chunks = 0u64;
         let mut total_written_bytes = 0u64;
@@ -352,9 +386,9 @@ pub fn decompress_archive(
         let mut open_files: HashMap<String, File> = HashMap::new();
         let mut created_dirs: HashSet<PathBuf> = HashSet::new();
 
-        while let Ok((chunk_meta, data)) = chunk_rx.recv() {
+        while let Ok((chunk_meta, blob)) = chunk_rx.recv() {
             total_chunks += 1;
-            total_written_bytes += data.len() as u64;
+            total_written_bytes += blob.len() as u64;
 
             if save_data {
                 let rel_path = paths_col.value(chunk_meta.file_index as usize);
@@ -378,11 +412,25 @@ pub fn decompress_archive(
                     });
 
                 file.seek(SeekFrom::Start(chunk_meta.fdata_offset)).unwrap();
-                file.write_all(&data).unwrap();
+                // Zero-copy for Revolver: writes directly from the ring buffer pointer.
+                file.write_all(blob.as_slice()).unwrap();
             }
 
+            // For Revolver blobs: make one copy for the verify thread, then return the ring slot.
+            // For Owned blobs: the decompressor already returned the slot; move the Vec.
+            let data_for_verify = match blob {
+                DecompBlob::Revolver { ptr, len, ring_nr, chunk_nr } => {
+                    let copy = unsafe {
+                        std::slice::from_raw_parts(ptr as *const u8, len).to_vec()
+                    };
+                    tx_return_writer.send((ring_nr, chunk_nr as u64)).ok();
+                    copy
+                }
+                DecompBlob::Owned(v) => v,
+            };
+
             if let Some(&idx) = group_to_idx.get(&chunk_meta.checksum_group) {
-                let _ = verify_txs[idx].send((chunk_meta.chunk_seq, data));
+                let _ = verify_txs[idx].send((chunk_meta.chunk_seq, data_for_verify));
             }
         }
 
