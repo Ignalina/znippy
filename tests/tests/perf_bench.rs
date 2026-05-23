@@ -221,6 +221,13 @@ fn perf_benchmark_suite() -> Result<()> {
     }
     println!();
 
+    // Dump for xtask regression tracking
+    let entries: Vec<String> = results.iter().map(|r| {
+        format!(r#"{{"name":"{}","compress_mbs":{:.1},"decompress_mbs":{:.1}}}"#,
+            r.label, r.compress_speed_mbs(), r.decompress_speed_mbs())
+    }).collect();
+    let _ = std::fs::write("/tmp/znippy_bench_last.json", format!("[{}]", entries.join(",")));
+
     Ok(())
 }
 
