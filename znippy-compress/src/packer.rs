@@ -11,8 +11,8 @@ use walkdir::WalkDir;
 use znippy_common::chunkrevolver::{ChunkRevolver, SendPtr, get_chunk_slice};
 use znippy_common::common_config::CONFIG;
 use znippy_common::index::{
-    ZNIPPY_INDEX_SCHEMA, build_arrow_metadata_for_config, build_metadata_batch,
-    should_skip_compression,
+    FileExtMeta, build_arrow_metadata_for_config, build_metadata_batch, compose_index_schema,
+    should_skip_compression, write_manifest_bytes, ManifestEntry, MULTI_INDEX_MAGIC,
 };
 use znippy_common::meta::{BlobMeta, ChunkMeta, WriterStats};
 use znippy_common::{CompressionReport, split_into_microchunks};
@@ -22,6 +22,8 @@ pub fn compress_dir(
     input_dir: &PathBuf,
     output: &PathBuf,
     no_skip: bool,
+    plugin: Option<&znippy_common::plugin::PluginRegistry>,
+    repo: Option<&str>,
 ) -> anyhow::Result<CompressionReport> {
     log::debug!("Reading directory: {:?}", input_dir);
     let mut total_dirs = 0;
@@ -52,6 +54,25 @@ pub fn compress_dir(
     );
 
     let total_files = all_files.len() as u64;
+
+    // Pre-extraction pass: read files matching plugin and extract metadata.
+    let ext_meta: Vec<FileExtMeta> = if let Some(reg) = plugin {
+        let type_id = reg.type_id().unwrap_or(0);
+        all_files.iter().map(|path| {
+            let rel = path.strip_prefix(input_dir)
+                .unwrap_or(path)
+                .to_string_lossy();
+            if !reg.matches(&rel) { return None; }
+            let data = std::fs::read(path).ok()?;
+            reg.extract(&rel, &data).map(|row| (type_id, row))
+        }).collect()
+    } else {
+        vec![None; all_files.len()]
+    };
+
+    // Columns the active module contributes to the index (empty if no plugin).
+    let ext_fields: Vec<znippy_common::arrow::datatypes::Field> =
+        plugin.map(|r| r.schema_fields()).unwrap_or_default();
 
     let (tx_chunk_array, rx_chunk_array): (
         Vec<Sender<(u64, u64, u8, u64, u64, bool)>>,
@@ -291,9 +312,12 @@ pub fn compress_dir(
         compressor_threads.push(handle);
     }
 
-    // Writer thread: streams blobs to disk immediately, writes Arrow index at end.
-    // It holds a tx_return clone so it can release Revolver chunks after write_all.
+    // Writer thread: streams blobs to disk immediately, writes v0.7 archive at end.
     let tx_ret_writer = tx_return.clone();
+    let ext_meta_for_writer = ext_meta;
+    let ext_fields_for_writer = ext_fields;
+    let pkg_type_val: i8 = plugin.and_then(|r| r.type_id()).unwrap_or(0);
+    let repo_val: String = repo.unwrap_or("").to_string();
     let writer_thread = thread::spawn(move || -> WriterStats {
         let file = File::create(&output_path).expect("Failed to create output file");
         let mut writer = BufWriter::new(file);
@@ -330,40 +354,62 @@ pub fn compress_dir(
 
         let checksums = checksum_rx.recv().expect("Failed to receive checksums");
 
-        let index_offset = current_offset;
-
-        let batch = build_metadata_batch(&all_blobs, &checksums, |file_index| {
+        let path_resolver = |file_index: u64| {
             let idx = file_index as usize;
             all_files_for_writer[idx]
                 .strip_prefix(&input_dir_cloned)
                 .unwrap_or(&all_files_for_writer[idx])
                 .to_string_lossy()
                 .to_string()
-        })
-        .expect("Failed to build metadata batch");
-
-        let meta_map = build_arrow_metadata_for_config(&CONFIG);
-        let schema_with_meta = arrow::datatypes::Schema::new_with_metadata(
-            ZNIPPY_INDEX_SCHEMA.fields().to_vec(),
-            meta_map,
-        );
+        };
 
         use arrow::ipc::writer::StreamWriter;
-        let mut stream_writer = StreamWriter::try_new(&mut writer, &schema_with_meta)
-            .expect("Failed to create Arrow stream writer");
-        stream_writer.write(&batch).expect("Failed to write batch");
-        stream_writer.finish().expect("Failed to finish Arrow stream");
 
-        writer
-            .write_all(&index_offset.to_le_bytes())
-            .expect("Failed to write footer");
+        // v0.7: single sub-index (all files share one pkg_type + repo for compress_dir)
+        let sub_start = current_offset;
+        let row_count = all_blobs.len() as u64;
+
+        let batch = build_metadata_batch(
+            &all_blobs, &checksums, path_resolver,
+            &ext_meta_for_writer, &ext_fields_for_writer,
+        ).expect("Failed to build metadata batch");
+
+        let meta_map = build_arrow_metadata_for_config(&CONFIG);
+        let composed = compose_index_schema(&ext_fields_for_writer);
+        let schema_with_meta = arrow::datatypes::Schema::new_with_metadata(
+            composed.fields().to_vec(), meta_map,
+        );
+        let mut sub_bytes: Vec<u8> = Vec::new();
+        let mut sw = StreamWriter::try_new(&mut sub_bytes, &schema_with_meta)
+            .expect("Failed to create sub-index writer");
+        sw.write(&batch).expect("Failed to write sub-index batch");
+        sw.finish().expect("Failed to finish sub-index stream");
+
+        let sub_len = sub_bytes.len() as u64;
+        writer.write_all(&sub_bytes).expect("Failed to write sub-index");
+        current_offset += sub_len;
+        writerstats.total_written_bytes += sub_len;
+
+        let manifest_entries = vec![ManifestEntry {
+            pkg_type: pkg_type_val,
+            repo: repo_val,
+            module_name: String::new(),
+            index_offset: sub_start,
+            index_len: sub_len,
+            row_count,
+        }];
+
+        let manifest_offset = current_offset;
+        let manifest_bytes = write_manifest_bytes(&manifest_entries)
+            .expect("Failed to serialize manifest");
+        writer.write_all(&manifest_bytes).expect("Failed to write manifest");
+        writer.write_all(&MULTI_INDEX_MAGIC).expect("Failed to write magic");
+        writer.write_all(&manifest_offset.to_le_bytes()).expect("Failed to write manifest offset");
         writer.flush().expect("Failed to flush");
 
         log::info!(
-            "[writer] Done: {} chunks, {} blob bytes, Arrow index at offset {}",
-            writerstats.total_chunks,
-            writerstats.total_written_bytes,
-            index_offset,
+            "[writer] v0.7 archive: {} chunks, {} blob bytes, manifest at {}",
+            writerstats.total_chunks, writerstats.total_written_bytes, manifest_offset,
         );
 
         writerstats
@@ -391,7 +437,7 @@ pub fn compress_dir(
 
     let writerstats = writer_thread.join().unwrap();
 
-    log::info!("[main] v0.6 archive written");
+    log::info!("[main] v0.7 archive written");
 
     let report = CompressionReport {
         total_files,

@@ -5,8 +5,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use znippy_common::{VerifyReport, list_archive_contents, verify_archive_integrity};
+use znippy_common::plugin::PluginRegistry;
+use znippy_common::plugins::wasm_loader::WasmPlugin;
 use znippy_compress::compress_dir;
 use znippy_decompress::decompress_archive;
+use znippy_plugin_maven::NativeMavenPlugin;
 
 #[derive(Parser)]
 #[command(name = "znippy")]
@@ -28,6 +31,14 @@ enum Commands {
 
         #[arg(long)]
         no_skip: bool,
+
+        /// Path to a .wasm plugin for metadata extraction (replaces native maven plugin)
+        #[arg(long)]
+        plugin: Option<PathBuf>,
+
+        /// DenseUnion type_id for the WASM plugin (default: 1 = maven)
+        #[arg(long, default_value_t = 1)]
+        plugin_type_id: i8,
     },
 
     /// Decompress a .znippy archive
@@ -61,8 +72,17 @@ pub fn run() -> Result<()> {
             input,
             output,
             no_skip,
+            plugin,
+            plugin_type_id,
         } => {
-            let report = compress_dir(&input, &output, no_skip)?;
+            let registry = match plugin {
+                Some(wasm_path) => {
+                    let wp = WasmPlugin::load(&wasm_path.to_string_lossy(), "wasm-plugin", plugin_type_id)?;
+                    PluginRegistry::with_plugin(Box::new(wp))
+                }
+                None => PluginRegistry::with_plugin(Box::new(NativeMavenPlugin)),
+            };
+            let report = compress_dir(&input, &output, no_skip, Some(&registry), None)?;
             println!("\n✅ Komprimering klar:");
             println!("📁 Totalt antal filer:         {}", report.total_files);
             println!("📁 Totalt antal chunks:         {}", report.chunks);

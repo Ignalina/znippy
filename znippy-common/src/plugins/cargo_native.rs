@@ -102,6 +102,10 @@ impl ArchiveTypePlugin for CargoPlugin {
         2
     }
 
+    fn matches_path(&self, path: &str) -> bool {
+        path.ends_with(".crate")
+    }
+
     fn extract_metadata(&self, path: &str, data: &[u8]) -> Option<ExtensionRow> {
         let (crate_name, version) = Self::parse_filename(path)?;
 

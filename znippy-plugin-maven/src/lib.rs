@@ -4,6 +4,10 @@
 //! Uses minimal JAR central directory parsing + DEFLATE (no native deps, WASM-safe).
 
 use std::cell::RefCell;
+#[cfg(feature = "host-decompressors")]
+use std::collections::HashMap;
+#[cfg(feature = "host-decompressors")]
+use znippy_common::plugin::{ArchiveTypePlugin, ExtensionRow, ExtensionValue};
 
 pub mod pom;
 #[cfg(feature = "resolve")]
@@ -17,6 +21,27 @@ pub struct MavenMeta {
     pub version: String,
     pub packaging: String,
 }
+
+/// File extensions handled by the maven plugin.
+/// Shared by the native `matches_path` and the WASM `plugin_extensions` export
+/// so the two implementations never diverge.
+pub const MAVEN_EXTENSIONS: &[&str] = &[".jar", ".war", ".ear", ".pom"];
+
+/// True if `path` is a file the maven plugin can extract metadata from.
+pub fn matches_maven_path(path: &str) -> bool {
+    MAVEN_EXTENSIONS.iter().any(|ext| path.ends_with(*ext))
+}
+
+/// Index columns this module contributes, as `(column_name, arrow_type_tag)`.
+/// Shared by the native `schema_fields()` and the WASM `plugin_schema` export so the two
+/// can't diverge. Column names match the keys used in the extracted `ExtensionRow` / JSON.
+/// Type tags understood by the host: `utf8`, `u32`, `i8`.
+pub const MAVEN_SCHEMA: &[(&str, &str)] = &[
+    ("group_id",    "utf8"),
+    ("artifact_id", "utf8"),
+    ("version",     "utf8"),
+    ("packaging",   "utf8"),
+];
 
 fn parse_pom_xml(contents: &str) -> Option<MavenMeta> {
     let group_id = extract_xml_tag(contents, "groupId")?;
@@ -139,6 +164,36 @@ pub extern "C" fn result_len() -> usize {
     RESULT_BUF.with(|buf| buf.borrow().len())
 }
 
+/// Self-description: comma-separated list of file extensions this plugin handles.
+/// The host calls this once at load time and caches it — matching is then a cheap
+/// host-side string check, with no per-file WASM call.
+#[unsafe(no_mangle)]
+pub extern "C" fn plugin_extensions() -> *const u8 {
+    let exts = MAVEN_EXTENSIONS.join(",");
+    RESULT_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        *buf = exts.into_bytes();
+        buf.as_ptr()
+    })
+}
+
+/// Self-description: the index columns this plugin contributes, as `name:type` pairs
+/// (e.g. `group_id:utf8,version:utf8`). The host parses this into Arrow fields once at load
+/// and composes them into the on-disk schema.
+#[unsafe(no_mangle)]
+pub extern "C" fn plugin_schema() -> *const u8 {
+    let s = MAVEN_SCHEMA
+        .iter()
+        .map(|(n, t)| format!("{}:{}", n, t))
+        .collect::<Vec<_>>()
+        .join(",");
+    RESULT_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        *buf = s.into_bytes();
+        buf.as_ptr()
+    })
+}
+
 fn extract_inner(path: &str, data: &[u8]) -> String {
     let meta = if path.ends_with(".pom") {
         std::str::from_utf8(data).ok().and_then(parse_pom_xml)
@@ -164,12 +219,14 @@ fn find_pom_via_host(data: &[u8]) -> Option<String> {
     #[cfg(target_arch = "wasm32")]
     {
         unsafe {
-            // Open archive via host
-            let handle = host_archive_open(data.as_ptr(), data.len(), 0); // 0 = JAR format
+            // Open archive with filter — host decompresses only pom.xml, skips everything else.
+            let name = b"pom.xml";
+            let handle = host_archive_open(
+                data.as_ptr(), data.len(), 0,
+                name.as_ptr(), name.len(),
+            );
             if handle == 0 { return None; }
 
-            // Request pom.xml entry
-            let name = b"pom.xml";
             let result = host_archive_entry(handle, name.as_ptr(), name.len());
             host_archive_close(handle);
 
@@ -188,7 +245,7 @@ fn find_pom_via_host(data: &[u8]) -> Option<String> {
 // Host function imports (resolved by wasmtime linker at instantiation)
 #[cfg(target_arch = "wasm32")]
 unsafe extern "C" {
-    fn host_archive_open(data_ptr: *const u8, data_len: usize, format: u32) -> u32;
+    fn host_archive_open(data_ptr: *const u8, data_len: usize, format: u32, filter_ptr: *const u8, filter_len: usize) -> u32;
     fn host_archive_entry(handle: u32, name_ptr: *const u8, name_len: usize) -> u64;
     fn host_archive_close(handle: u32);
 }
@@ -202,5 +259,51 @@ pub fn extract_maven_metadata(path: &str, data: &[u8]) -> Option<MavenMeta> {
         find_pom_in_jar(data).and_then(|xml| parse_pom_xml(&xml))
     } else {
         None
+    }
+}
+
+// ─── Native plugin (non-WASM, uses ljar for parallel JAR entry extraction) ──
+
+#[cfg(feature = "host-decompressors")]
+pub struct NativeMavenPlugin;
+
+#[cfg(feature = "host-decompressors")]
+impl ArchiveTypePlugin for NativeMavenPlugin {
+    fn name(&self) -> &str { "maven" }
+    fn type_id(&self) -> i8 { 1 }
+
+    fn matches_path(&self, path: &str) -> bool {
+        matches_maven_path(path)
+    }
+
+    fn schema_fields(&self) -> Vec<znippy_common::arrow::datatypes::Field> {
+        use znippy_common::arrow::datatypes::{DataType, Field};
+        MAVEN_SCHEMA.iter().map(|(name, ty)| {
+            let dt = match *ty {
+                "u32" => DataType::UInt32,
+                "i8"  => DataType::Int8,
+                _      => DataType::Utf8,
+            };
+            Field::new(*name, dt, true)
+        }).collect()
+    }
+
+    fn extract_metadata(&self, path: &str, data: &[u8]) -> Option<ExtensionRow> {
+        let meta = if path.ends_with(".pom") {
+            std::str::from_utf8(data).ok().and_then(parse_pom_xml)
+        } else {
+            // Use ljar to filter at central-directory level — only pom.xml is decompressed.
+            ljar::decompress_jar_filter(data, "pom.xml")
+                .ok()
+                .and_then(|entries| entries.into_iter().find(|e| e.name.contains("pom.xml")))
+                .and_then(|e| std::str::from_utf8(&e.data).ok().and_then(parse_pom_xml))
+        }?;
+
+        let mut fields = HashMap::new();
+        fields.insert("group_id".into(),    ExtensionValue::Str(meta.group_id));
+        fields.insert("artifact_id".into(), ExtensionValue::Str(meta.artifact_id));
+        fields.insert("version".into(),     ExtensionValue::Str(meta.version));
+        fields.insert("packaging".into(),   ExtensionValue::Str(meta.packaging));
+        Some(ExtensionRow { fields })
     }
 }

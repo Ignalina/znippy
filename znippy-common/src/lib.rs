@@ -1,5 +1,9 @@
 extern crate core;
 
+/// Re-export arrow so plugins implement `schema_fields()` against the exact same arrow
+/// version as the core trait, avoiding type-mismatch across crate boundaries.
+pub use arrow;
+
 pub mod codec;
 pub mod common_config;
 pub mod index;
@@ -26,9 +30,13 @@ pub use decompress::decompress_archive;
 
 pub use index::{
     VerifyReport, ZNIPPY_INDEX_SCHEMA,
+    MULTI_INDEX_MAGIC, ManifestEntry, IndexFooter,
     build_arrow_metadata_for_config, build_metadata_batch,
-    extract_config_from_arrow_metadata, is_probably_compressed, list_archive_contents,
-    read_znippy_index, should_skip_compression, verify_archive_integrity, znippy_index_schema,
+    extract_config_from_arrow_metadata, interpret_footer,
+    is_probably_compressed, list_archive_contents,
+    read_manifest_bytes, read_znippy_index, read_znippy_manifest,
+    should_skip_compression, verify_archive_integrity, write_manifest_bytes,
+    znippy_index_schema,
 };
 
 #[derive(Debug)]

@@ -102,6 +102,8 @@ fn perf_benchmark_suite() -> Result<()> {
         vec![ArchiveEntry {
             relative_path: "text.txt".into(),
             data: generate_text_data(size),
+        pkg_type: None,
+        repo: None,
         }],
     )?);
 
@@ -111,6 +113,8 @@ fn perf_benchmark_suite() -> Result<()> {
         vec![ArchiveEntry {
             relative_path: "pattern.bin".into(),
             data: generate_binary_data(size),
+        pkg_type: None,
+        repo: None,
         }],
     )?);
 
@@ -120,6 +124,8 @@ fn perf_benchmark_suite() -> Result<()> {
         vec![ArchiveEntry {
             relative_path: "random.bin".into(),
             data: generate_random_data(size),
+        pkg_type: None,
+        repo: None,
         }],
     )?);
 
@@ -128,6 +134,8 @@ fn perf_benchmark_suite() -> Result<()> {
         .map(|i| ArchiveEntry {
             relative_path: format!("files/file_{:06}.txt", i),
             data: generate_text_data(10 * 1024),
+            pkg_type: None,
+            repo: None,
         })
         .collect();
     results.push(bench_roundtrip("100k_small_files_10kb", small_entries)?);
@@ -137,26 +145,38 @@ fn perf_benchmark_suite() -> Result<()> {
         ArchiveEntry {
             relative_path: "pom.xml".into(),
             data: generate_text_data(32 * 1024),
+        pkg_type: None,
+        repo: None,
         },
         ArchiveEntry {
             relative_path: "app.jar".into(),
             data: generate_random_data(200 * 1024 * 1024),
+        pkg_type: None,
+        repo: None,
         },
         ArchiveEntry {
             relative_path: "sources.jar".into(),
             data: generate_text_data(100 * 1024 * 1024),
+        pkg_type: None,
+        repo: None,
         },
         ArchiveEntry {
             relative_path: "javadoc.jar".into(),
             data: generate_text_data(80 * 1024 * 1024),
+        pkg_type: None,
+        repo: None,
         },
         ArchiveEntry {
             relative_path: "metadata.xml".into(),
             data: generate_text_data(16 * 1024),
+        pkg_type: None,
+        repo: None,
         },
         ArchiveEntry {
             relative_path: "deps.tar.gz".into(),
             data: generate_random_data(150 * 1024 * 1024),
+        pkg_type: None,
+        repo: None,
         },
     ];
     results.push(bench_roundtrip("mixed_repo_530mb", mixed_entries)?);
@@ -168,6 +188,8 @@ fn perf_benchmark_suite() -> Result<()> {
         vec![ArchiveEntry {
             relative_path: "huge.bin".into(),
             data: generate_text_data(huge_size),
+        pkg_type: None,
+        repo: None,
         }],
     )?);
 
@@ -222,6 +244,8 @@ fn collect_files_recursive(dir: &Path) -> Vec<ArchiveEntry> {
                 entries.push(ArchiveEntry {
                     relative_path: rel.to_string_lossy().to_string(),
                     data,
+                pkg_type: None,
+                repo: None,
                 });
             }
         }
@@ -481,6 +505,8 @@ fn extract_jar_contents(jar_name: &str, data: &[u8]) -> Option<Vec<ArchiveEntry>
                     results.push(ArchiveEntry {
                         relative_path: format!("{}/{}", jar_name, name),
                         data: raw_data,
+                        pkg_type: None,
+                        repo: None,
                     });
                 }
             }
@@ -586,6 +612,8 @@ fn perf_real_rust_crates() -> Result<()> {
                 entries.push(ArchiveEntry {
                     relative_path: rel,
                     data,
+                pkg_type: None,
+                repo: None,
                 });
             }
         }

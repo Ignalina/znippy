@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 
+use arrow::datatypes::Field;
+
 /// Metadata extracted from a single file by a plugin
 #[derive(Debug, Clone)]
 pub struct ExtensionRow {
@@ -43,6 +45,15 @@ pub trait ArchiveTypePlugin: Send + Sync {
 
     /// Per-file extraction. Return None to skip.
     fn extract_metadata(&self, path: &str, data: &[u8]) -> Option<ExtensionRow>;
+
+    /// The Arrow columns this module contributes to the index. The writer composes the
+    /// on-disk schema as `base columns + pkg_type + these fields`. Each `Field`'s name must
+    /// match the key the plugin uses in `ExtensionRow::fields`. Default: no columns.
+    fn schema_fields(&self) -> Vec<Field> { Vec::new() }
+
+    /// Return true if this plugin wants to handle this file (checked before reading data).
+    /// Default false means the plugin is never called for that path.
+    fn matches_path(&self, _path: &str) -> bool { false }
 
     /// Whether this plugin benefits from batched processing.
     fn supports_batch(&self) -> bool { false }
@@ -184,8 +195,17 @@ impl PluginRegistry {
         self.plugin.as_ref().map(|p| p.type_id())
     }
 
+    /// Arrow columns contributed by the active plugin (empty if none).
+    pub fn schema_fields(&self) -> Vec<Field> {
+        self.plugin.as_ref().map(|p| p.schema_fields()).unwrap_or_default()
+    }
+
     pub fn has_plugin(&self) -> bool {
         self.plugin.is_some()
+    }
+
+    pub fn matches(&self, path: &str) -> bool {
+        self.plugin.as_ref().map(|p| p.matches_path(path)).unwrap_or(false)
     }
 }
 

@@ -7,6 +7,8 @@ use crate::plugin::{ArchiveTypePlugin, ExtensionRow, ExtensionValue};
 use std::collections::HashMap;
 
 #[cfg(feature = "wasm-plugins")]
+use arrow::datatypes::{DataType, Field};
+#[cfg(feature = "wasm-plugins")]
 use wasmtime::*;
 
 // ─── Host State (shared decompression services) ──────────────────────
@@ -28,7 +30,7 @@ pub enum ArchiveFormat {
     TarBz2 = 2,  // tar + lbzip2
 }
 
-/// An opened archive handle — holds decompressed entries
+/// An opened archive handle — holds only the entries that matched the open-time filter.
 struct OpenArchive {
     entries: Vec<ArchiveEntry>,
 }
@@ -59,6 +61,11 @@ pub struct WasmPlugin {
     type_id: i8,
     engine: Engine,
     module: Module,
+    /// Extensions the plugin handles, fetched once from `plugin_extensions` at load.
+    /// Matching is then a cheap host-side string check (no per-file WASM call).
+    extensions: Vec<String>,
+    /// Index columns the plugin contributes, fetched once from `plugin_schema` at load.
+    schema: Vec<Field>,
 }
 
 #[cfg(feature = "wasm-plugins")]
@@ -67,14 +74,53 @@ impl WasmPlugin {
     pub fn load(wasm_path: &str, name: &str, type_id: i8) -> anyhow::Result<Self> {
         let engine = Engine::default();
         let module = Module::from_file(&engine, wasm_path)?;
-        Ok(Self { name: name.to_string(), type_id, engine, module })
+        let extensions = Self::fetch_extensions(&engine, &module);
+        let schema = Self::fetch_schema(&engine, &module);
+        Ok(Self { name: name.to_string(), type_id, engine, module, extensions, schema })
     }
 
     /// Load a WASM plugin from bytes
     pub fn load_bytes(wasm_bytes: &[u8], name: &str, type_id: i8) -> anyhow::Result<Self> {
         let engine = Engine::default();
         let module = Module::new(&engine, wasm_bytes)?;
-        Ok(Self { name: name.to_string(), type_id, engine, module })
+        let extensions = Self::fetch_extensions(&engine, &module);
+        let schema = Self::fetch_schema(&engine, &module);
+        Ok(Self { name: name.to_string(), type_id, engine, module, extensions, schema })
+    }
+
+    /// Instantiate the module, call a no-arg export that returns a pointer to a UTF-8 string
+    /// in the result buffer, and read it back. Returns None if the export is missing/fails.
+    fn call_string_export(engine: &Engine, module: &Module, export: &str) -> Option<String> {
+        let mut store = Store::new(engine, HostState::new());
+        let mut linker = Linker::new(engine);
+        register_host_functions(&mut linker).ok()?;
+        let instance = linker.instantiate(&mut store, module).ok()?;
+        let memory = instance.get_memory(&mut store, "memory")?;
+        let func = instance.get_typed_func::<(), u32>(&mut store, export).ok()?;
+        let ptr = func.call(&mut store, ()).ok()?;
+        let result_len = instance.get_typed_func::<(), u32>(&mut store, "result_len").ok()?;
+        let len = result_len.call(&mut store, ()).ok()? as usize;
+        let mut buf = vec![0u8; len];
+        memory.read(&store, ptr as usize, &mut buf).ok()?;
+        String::from_utf8(buf).ok()
+    }
+
+    /// Call `plugin_extensions` once and cache the result. Empty if the plugin omits it —
+    /// such a plugin then matches nothing (a loud-enough signal that it's misconfigured).
+    fn fetch_extensions(engine: &Engine, module: &Module) -> Vec<String> {
+        match Self::call_string_export(engine, module, "plugin_extensions") {
+            Some(s) => s.split(',').map(|e| e.trim().to_string()).filter(|e| !e.is_empty()).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Call `plugin_schema` once and parse `name:type` pairs into Arrow fields.
+    /// Empty if the plugin omits it — its extracted metadata then has no columns to land in.
+    fn fetch_schema(engine: &Engine, module: &Module) -> Vec<Field> {
+        match Self::call_string_export(engine, module, "plugin_schema") {
+            Some(s) => parse_schema_str(&s),
+            None => Vec::new(),
+        }
     }
 
     fn call_extract(&self, path: &str, data: &[u8]) -> Option<String> {
@@ -119,6 +165,14 @@ impl ArchiveTypePlugin for WasmPlugin {
 
     fn type_id(&self) -> i8 {
         self.type_id
+    }
+
+    fn matches_path(&self, path: &str) -> bool {
+        self.extensions.iter().any(|ext| path.ends_with(ext.as_str()))
+    }
+
+    fn schema_fields(&self) -> Vec<Field> {
+        self.schema.clone()
     }
 
     fn extract_metadata(&self, path: &str, data: &[u8]) -> Option<ExtensionRow> {
@@ -197,11 +251,13 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()>
         },
     )?;
 
-    // host_archive_open(data_ptr, data_len, format) -> handle
+    // host_archive_open(data_ptr, data_len, format, filter_ptr, filter_len) -> handle
+    // filter is a substring; only matching entries are decompressed and stored.
+    // Returns 0 if the archive is invalid or no entries match.
     linker.func_wrap(
         "env",
         "host_archive_open",
-        |mut caller: Caller<'_, HostState>, data_ptr: u32, data_len: u32, format: u32| -> u32 {
+        |mut caller: Caller<'_, HostState>, data_ptr: u32, data_len: u32, format: u32, filter_ptr: u32, filter_len: u32| -> u32 {
             let memory = match caller.get_export("memory") {
                 Some(Extern::Memory(m)) => m,
                 _ => return 0,
@@ -212,16 +268,25 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()>
                 return 0;
             }
 
+            let mut filter_buf = vec![0u8; filter_len as usize];
+            if memory.read(&caller, filter_ptr as usize, &mut filter_buf).is_err() {
+                return 0;
+            }
+            let filter = match std::str::from_utf8(&filter_buf) {
+                Ok(s) => s.to_string(),
+                Err(_) => return 0,
+            };
+
             let entries = match format {
-                0 => jar_list_entries(&input),  // JAR/ZIP via ljar-rs
+                0 => jar_filtered_entries(&input, &filter),
                 1 => tar_gz_list_entries(&input),
                 2 => tar_bz2_list_entries(&input),
                 _ => return 0,
             };
 
             let entries = match entries {
-                Some(e) => e,
-                None => return 0,
+                Some(e) if !e.is_empty() => e,
+                _ => return 0,
             };
 
             let state = caller.data_mut();
@@ -245,7 +310,6 @@ fn register_host_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()>
                 }
             };
 
-            // Simple JSON array
             let json = format!("[{}]",
                 names.iter().map(|n| format!("\"{}\"", n)).collect::<Vec<_>>().join(",")
             );
@@ -358,27 +422,6 @@ fn zstd_decompress(data: &[u8]) -> Option<Vec<u8>> {
     crate::codec::decompress_frame(data).ok()
 }
 
-/// List entries in a JAR/ZIP using ljar-rs parallel decompressor
-fn jar_list_entries(data: &[u8]) -> Option<Vec<ArchiveEntry>> {
-    #[cfg(feature = "host-decompressors")]
-    {
-        ljar::decompress_jar(data).ok().map(|entries| {
-            entries
-                .into_iter()
-                .map(|e| ArchiveEntry {
-                    name: e.name,
-                    uncompressed_size: e.data.len() as u64,
-                    data: e.data,
-                })
-                .collect()
-        })
-    }
-    #[cfg(not(feature = "host-decompressors"))]
-    {
-        minimal_jar_entries(data)
-    }
-}
-
 fn tar_gz_list_entries(data: &[u8]) -> Option<Vec<ArchiveEntry>> {
     #[cfg(feature = "host-decompressors")]
     {
@@ -414,24 +457,36 @@ fn tar_entries_from_bytes(tar_data: &[u8]) -> Option<Vec<ArchiveEntry>> {
             let name = entry.path().ok()?.to_string_lossy().into_owned();
             let mut data = Vec::new();
             entry.read_to_end(&mut data).ok()?;
-            entries.push(ArchiveEntry {
-                name,
-                uncompressed_size: data.len() as u64,
-                data,
-            });
+            entries.push(ArchiveEntry { name, data });
         }
     }
     Some(entries)
 }
 
-// ─── Minimal JAR parser (for bootstrap until ljar native link) ───────
+/// Decompress only entries whose name contains `filter`.
+/// With host-decompressors: filtered at the central-directory level via ljar — non-matching
+/// entries are never read or decompressed.
+/// Without host-decompressors: minimal single-threaded parser that also skips non-matching entries.
+fn jar_filtered_entries(data: &[u8], filter: &str) -> Option<Vec<ArchiveEntry>> {
+    #[cfg(feature = "host-decompressors")]
+    {
+        ljar::decompress_jar_filter(data, filter).ok().map(|entries| {
+            entries.into_iter().map(|e| ArchiveEntry { name: e.name, data: e.data }).collect()
+        })
+    }
+    #[cfg(not(feature = "host-decompressors"))]
+    {
+        minimal_jar_filtered_entries(data, filter)
+    }
+}
 
-fn minimal_jar_entries(data: &[u8]) -> Option<Vec<ArchiveEntry>> {
+/// Minimal single-threaded JAR parser that decompresses only entries matching `filter`.
+#[cfg(not(feature = "host-decompressors"))]
+fn minimal_jar_filtered_entries(data: &[u8], filter: &str) -> Option<Vec<ArchiveEntry>> {
     const EOCD_SIG: u32 = 0x06054b50;
     const CD_SIG: u32 = 0x02014b50;
     const LOCAL_SIG: u32 = 0x04034b50;
 
-    // Find EOCD
     let start = data.len().saturating_sub(65557);
     let mut eocd_pos = None;
     for i in (start..data.len().saturating_sub(21)).rev() {
@@ -444,33 +499,30 @@ fn minimal_jar_entries(data: &[u8]) -> Option<Vec<ArchiveEntry>> {
     let cd_offset = u32::from_le_bytes(data[eocd_pos+16..eocd_pos+20].try_into().ok()?) as usize;
     let cd_entries = u16::from_le_bytes(data[eocd_pos+10..eocd_pos+12].try_into().ok()?) as usize;
 
-    let mut entries = Vec::with_capacity(cd_entries);
+    let mut entries = Vec::new();
     let mut pos = cd_offset;
 
     for _ in 0..cd_entries {
         if pos + 46 > data.len() { break; }
-        let sig = u32::from_le_bytes(data[pos..pos+4].try_into().ok()?);
-        if sig != CD_SIG { break; }
+        if u32::from_le_bytes(data[pos..pos+4].try_into().ok()?) != CD_SIG { break; }
 
-        let compression = u16::from_le_bytes(data[pos+10..pos+12].try_into().ok()?);
-        let comp_size = u32::from_le_bytes(data[pos+20..pos+24].try_into().ok()?) as usize;
-        let uncomp_size = u32::from_le_bytes(data[pos+24..pos+28].try_into().ok()?) as usize;
-        let name_len = u16::from_le_bytes(data[pos+28..pos+30].try_into().ok()?) as usize;
-        let extra_len = u16::from_le_bytes(data[pos+30..pos+32].try_into().ok()?) as usize;
-        let comment_len = u16::from_le_bytes(data[pos+32..pos+34].try_into().ok()?) as usize;
+        let compression  = u16::from_le_bytes(data[pos+10..pos+12].try_into().ok()?) ;
+        let comp_size    = u32::from_le_bytes(data[pos+20..pos+24].try_into().ok()?) as usize;
+        let name_len     = u16::from_le_bytes(data[pos+28..pos+30].try_into().ok()?) as usize;
+        let extra_len    = u16::from_le_bytes(data[pos+30..pos+32].try_into().ok()?) as usize;
+        let comment_len  = u16::from_le_bytes(data[pos+32..pos+34].try_into().ok()?) as usize;
         let local_offset = u32::from_le_bytes(data[pos+42..pos+46].try_into().ok()?) as usize;
 
         let name = std::str::from_utf8(&data[pos+46..pos+46+name_len]).unwrap_or("").to_string();
 
-        if !name.ends_with('/') {
-            // Decompress from local file header
+        // Skip non-matching and directory entries without touching their data.
+        if !name.ends_with('/') && name.contains(filter) {
             if local_offset + 30 <= data.len() {
                 let lsig = u32::from_le_bytes(data[local_offset..local_offset+4].try_into().ok()?);
                 if lsig == LOCAL_SIG {
                     let ln = u16::from_le_bytes(data[local_offset+26..local_offset+28].try_into().ok()?) as usize;
                     let le = u16::from_le_bytes(data[local_offset+28..local_offset+30].try_into().ok()?) as usize;
                     let ds = local_offset + 30 + ln + le;
-
                     if ds + comp_size <= data.len() {
                         let raw = &data[ds..ds + comp_size];
                         let entry_data = match compression {
@@ -491,6 +543,27 @@ fn minimal_jar_entries(data: &[u8]) -> Option<Vec<ArchiveEntry>> {
 }
 
 // ─── JSON parser ─────────────────────────────────────────────────────
+
+/// Parse a `plugin_schema` description (`name:type,name:type`) into Arrow fields.
+/// Type tags: `utf8`, `u32`, `i8`; unknown tags default to Utf8. All columns nullable.
+#[cfg(feature = "wasm-plugins")]
+fn parse_schema_str(s: &str) -> Vec<Field> {
+    s.split(',')
+        .filter_map(|pair| {
+            let mut it = pair.splitn(2, ':');
+            let name = it.next()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let dt = match it.next().unwrap_or("utf8").trim() {
+                "u32" => DataType::UInt32,
+                "i8" => DataType::Int8,
+                _ => DataType::Utf8,
+            };
+            Some(Field::new(name, dt, true))
+        })
+        .collect()
+}
 
 fn parse_json_to_row(json: &str) -> Option<ExtensionRow> {
     let json = json.trim().trim_start_matches('{').trim_end_matches('}');

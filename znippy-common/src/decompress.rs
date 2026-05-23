@@ -1,5 +1,4 @@
-use anyhow::{Context, Result};
-use arrow::datatypes::SchemaRef;
+use anyhow::Result;
 use arrow_array::{
     BooleanArray, FixedSizeBinaryArray, StringArray, UInt8Array, UInt32Array, UInt64Array,
 };
@@ -31,11 +30,17 @@ pub fn decompress_archive(
     let (schema, batches) = read_znippy_index(index_path)?;
     let config = &CONFIG;
 
-    let batch = Arc::new(batches.into_iter().next().unwrap_or_else(|| {
-        arrow::record_batch::RecordBatch::new_empty(Arc::new(
+    // For v0.7, read_znippy_index already concatenates sub-indexes into a single batch.
+    // We still handle the rare case of multiple batches (e.g. large v0.6 archives written
+    // with multiple IPC record batches) by merging them here.
+    let batch = Arc::new(match batches.len() {
+        0 => arrow::record_batch::RecordBatch::new_empty(Arc::new(
             crate::index::ZNIPPY_INDEX_SCHEMA.as_ref().clone(),
-        ))
-    }));
+        )),
+        1 => batches.into_iter().next().unwrap(),
+        _ => arrow_select::concat::concat_batches(&schema, batches.iter())
+            .map_err(|e| anyhow::anyhow!("failed to merge index batches: {}", e))?,
+    });
     let batch_for_writer = Arc::clone(&batch);
     let batch_for_reader = Arc::clone(&batch);
 

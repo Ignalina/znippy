@@ -1,11 +1,11 @@
 [package]
 name = "znippy-plugin-maven"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 description = "Maven/JAR metadata plugin for znippy (compiles to native + WASM)"
 license = "MIT"
 repository = "https://github.com/Ignalina/znippy"
-authors = ["Rickard Lundin <rickard@x14.se>"]
+authors = ["Rickard Lundin <rickard@ignalina.dk>"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -14,7 +14,10 @@ crate-type = ["cdylib", "rlib"]
 miniz_oxide = "0.8"
 quick-xml = "0.36"
 ureq = { version = "2", optional = true }
+ljar = { version = "0.1.0", optional = true }
+znippy-common = { path = "../znippy-common", optional = true }
 
 [features]
 default = []
-resolve = ["ureq"]
+resolve = ["dep:ureq"]
+host-decompressors = ["dep:ljar", "dep:znippy-common"]

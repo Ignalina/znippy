@@ -17,6 +17,17 @@
 - [x] Direct buffer construction (bypass LargeBinaryBuilder copy)
 - [x] Removed custom hybrid format (trailer, magic, raw section)
 
+## Done (v0.7.0)
+- [x] Module-owned schema: `ArchiveTypePlugin::schema_fields()`, `compose_index_schema`, `build_metadata_batch` generic over ext columns (Step 1)
+- [x] WASM plugin: `plugin_schema` export (`name:type` pairs), `plugin_extensions` — fully documented in design.md §5
+- [x] Multi-index container format: manifest Arrow IPC + `ZNPYMIDX` magic footer (Step 2)
+- [x] `ArchiveEntry` gains `pkg_type: Option<i8>` + `repo: Option<String>` for per-entry grouping
+- [x] v0.7 writer (stream_packer + packer): always emits manifest; groups blobs by `(pkg_type, repo)`
+- [x] v0.7 reader: `read_znippy_index` detects magic, reads manifest, merges sub-indexes into one batch
+- [x] `read_znippy_manifest` for direct manifest inspection
+- [x] Dropped v0.6 read support (archives must be re-compressed)
+- [x] 20 integration tests (5 new v0.7: manifest roundtrip, footer detection, multi-index write/read, single-group v0.7)
+
 ## Arrow IPC Serialization Bottleneck — Technical Analysis
 
 ### The numbers
@@ -132,6 +143,74 @@ pub fn compress_dir(input: &Path, output: &Path, no_skip: bool) -> Result<Compre
 #### F4: Plugin metadata on chunk_seq=0
 Extension DenseUnion column currently always null. Wire up plugin metadata
 injection for the first chunk of each file.
+
+#### F5: Self-contained package-handler modules (znippy as a thin host)
+
+**Vision:** znippy core knows *nothing* about any specific package type. A "module"
+(= package handler, native or WASM) is fully self-contained:
+- It declares which files it handles (`plugin_extensions`) — already implemented.
+- It declares its own CLI commands and parses its own parameters.
+- znippy's only responsibility is to **enumerate the registered handlers** and **delegate**.
+
+znippy must never hardcode a plugin's parameters. Adding a new package type (maven, cargo,
+npm, docker, …) requires zero changes to znippy core — you register the module and it brings
+its full CLI surface with it.
+
+**Why:** otherwise znippy would have to know every present and future plugin's flags
+(`--plugin-type-id`, resolver depth, etc.). That doesn't scale and couples the host to every
+handler. Self-description inverts it: the module owns its parameters.
+
+**Design sketch (extends the `ArchiveTypePlugin` interface):**
+- Interface gains a delegated CLI entrypoint, e.g. `fn cli(&self, args: &[String]) -> Result<()>`
+  (default no-op). Native modules implement it directly; WASM modules export a matching
+  `plugin_cli(args_ptr, args_len)` and parse the opaque arg blob themselves.
+- znippy CLI: `znippy <module> <args...>` looks up the module by name in the registry and
+  forwards everything after the module name verbatim. The registry's job is discovery +
+  dispatch, not argument parsing.
+- `znippy modules` (or `list-handlers`) enumerates registered package handlers — the only
+  plugin-aware command znippy itself owns.
+- Replaces the current `--plugin <path> --plugin-type-id <n>` flags, which leak plugin
+  knowledge into the host. `type_id` and `name` become module self-description (exports),
+  not CLI args.
+
+**Module owns its Arrow schema (currently violated):**
+Today `pkg_type` + the 5 `maven_*` columns are hardcoded in `ZNIPPY_INDEX_SCHEMA`
+(`znippy-common/src/index.rs`) and filled by maven-specific code in `build_metadata_batch`.
+That's the host-knows-about-maven coupling to remove. Target:
+- Trait gains `fn schema_fields(&self) -> Vec<Field>` (WASM: `plugin_schema` export).
+- Writer composes the final schema = `base(9) + ⋃ registered modules' fields`.
+- Each module fills only its own columns; `build_metadata_batch` has no per-type code.
+- Column-name prefix convention is a hard rule (`maven_*`, `cargo_*`, `python_*`) so modules
+  never collide. Schema is defined by the registered module set, so it's stable/predictable
+  even though some columns are null for a given row.
+
+**Archive model: one .znippy is a multi-type container.**
+A single archive holds multiple package types, each with multiple repos:
+`{ maven: [repo1, repo2], cargo: [repo1, repo2, repo3], pip: [...] }`.
+- `pkg_type` (Int8) discriminates which module owns a row → which `*_` columns are populated.
+- `repo` (Utf8) is the repo within that type. A "logical sub-archive" = rows sharing `(pkg_type, repo)`.
+- Selective extract by `(type, repo)` — ties into F1: `znippy extract dump.znippy --type maven --repo repo1`.
+
+**create/decompress are FORMAT-level (shared), not per-module — important.**
+The container format (blobs + Arrow IPC index + footer) is universal, so modules must NOT each
+reimplement the compressor/decompressor. A module plugs into:
+- **write/create**: `matches_path` + `extract_metadata` + `schema_fields` hooks the core pipeline calls.
+- **read/query**: package-specific subcommands (`znippy maven lookup --gav …`) that translate to a
+  DuckDB/DataFusion query over the Arrow-IPC file — NOT a hand-rolled index walk. The engine does
+  execution; the module owns only the schema + the ergonomic command surface.
+Generic file extraction (decompress) stays type-agnostic in core.
+
+**CLI surface:**
+- `znippy create -i … -o …` / `znippy extract … -o …` — core, type-agnostic.
+- `znippy <module> <subop> …` — module-provided query/ops, forwarded verbatim (module parses args).
+- `znippy modules` — enumerate registered handlers + their subcommands (the only plugin-aware core cmd).
+
+**Open questions:**
+- WASM transport for an argv array (length-prefixed UTF-8 blob vs JSON).
+- How a WASM module surfaces its sub-command help text to `znippy <module> --help`.
+- Whether modules can register more than one command each.
+- Schema = union of *all registered* modules vs only *modules used* in this archive (Arrow writes
+  schema first, so "all registered" is simpler; nulls are cheap via the validity bitmap).
 
 ## Performance Baseline (v0.5.0 Arrow IPC, 8-core T14s laptop, release)
 

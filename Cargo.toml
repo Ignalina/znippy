@@ -16,4 +16,3 @@ znippy-common = { path = "znippy-common" }
 znippy-compress = { path = "znippy-compress" }
 znippy-decompress = { path = "znippy-decompress" }
 znippy-cli = { path = "znippy-cli" }
-openzl-sys-rs = { path = "../openzl-sys-rs" }

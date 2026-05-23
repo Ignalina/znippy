@@ -43,6 +43,23 @@ blake3 checksum groups are bound to **chunk_seq** ordering, not thread identity.
 Any machine with any number of cores reproduces the same checksums by sorting
 decompressed chunks by chunk_seq before hashing.
 
+### Law 4: Writer Is Concurrent — Compressors Never Wait for Index
+
+The writer thread runs as a separate OS thread alongside the compressor threads.
+It receives `(Blob, ChunkMeta)` from compressor threads via a channel and writes
+each blob to disk **immediately** as it arrives — never buffering all blobs in memory.
+
+Ring buffer slot release:
+- `Blob::Owned` (compressed): compressor thread calls `tx_ret` *before* sending to writer —
+  the slot is free the moment the compressor finishes, regardless of how fast the writer is.
+- `Blob::Revolver` (skip/store path): writer calls `tx_ret` after `write_all` completes —
+  the slot is held only until the raw bytes hit disk, then immediately recycled.
+
+**Consequence:** compressor threads and the reader thread never stall waiting for index writing.
+The Arrow IPC sub-indexes, manifest, and footer are written only *after* all blobs are flushed —
+by which time every ring buffer slot has been returned and every compressor thread has exited.
+Index writing is sequential but uncontested; no useful parallel work is delayed.
+
 ---
 
 ## Ingest Pipeline (Zero-Copy End-to-End)
@@ -101,16 +118,21 @@ decompressed chunks by chunk_seq before hashing.
 │  └─────────────────────────────────────────┼───────────────────────┘    │
 │                                            │                            │
 │  ┌─────────────────────────────────────────▼───────────────────────┐    │
-│  │  Phase 4: Write (Arrow IPC Stream, single-file)                │    │
+│  │  Phase 4: Write (v0.7 — blobs inline, index at end)            │    │
 │  │                                                                 │    │
-│  │  Dual pipeline per chunk:                                       │    │
-│  │    compressed=true  → Buffer::from(compressed_vec)              │    │
-│  │    compressed=false → Buffer::from(raw_vec) — ZERO COPY         │    │
+│  │  Writer thread runs CONCURRENTLY with compressors (Law 4):     │    │
 │  │                                                                 │    │
-│  │  Both paths: ownership transfer to Arrow Buffer (no memcpy)     │    │
-│  │  Result: valid Arrow IPC Stream file (DuckDB-readable)          │    │
+│  │  while recv (Blob, ChunkMeta):                                  │    │
+│  │    write_all(blob bytes) → NVMe   ← streaming, no buffer       │    │
+│  │    if Blob::Revolver: tx_ret(slot) ← release ring buffer NOW   │    │
+│  │    record BlobMeta { blob_offset, blob_size }                   │    │
 │  │                                                                 │    │
-│  │  Flush Arrow batch every N chunks (bounded memory)              │    │
+│  │  [all blobs done, compressors exited, all slots returned]       │    │
+│  │                                                                 │    │
+│  │  for each (pkg_type, repo) group:                               │    │
+│  │    write Arrow IPC sub-index  ← metadata only, no blob data    │    │
+│  │  write manifest (Arrow IPC)                                     │    │
+│  │  write MAGIC + manifest_offset  ← 16-byte v0.7 footer          │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -515,10 +537,19 @@ znippy extract nexus-dump.znippy --group maven/ --out ./maven-mirror/
 
 ## Section 5: Plugin System — Native + WASM with Host Services
 
-### Architecture
+### Overview
 
-WASM plugins run sandboxed but get native multi-core decompression via host functions.
-No threading inside WASM — all parallelism happens on the host side.
+Znippy plugins extract file-type-specific metadata during compression and store it in the
+Arrow index. Two plugin types share one trait (`ArchiveTypePlugin`) with identical semantics:
+
+| Type | Example | When to use |
+|------|---------|-------------|
+| **Native** (compiled in) | `NativeMavenPlugin`, `CargoPlugin` | Production default — zero overhead |
+| **WASM** (loaded at runtime) | `maven.wasm` | Sandboxed, hot-swappable, third-party |
+
+CLI: native maven is used by default; pass `--plugin path.wasm` to load a WASM plugin instead.
+
+### Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -534,69 +565,248 @@ No threading inside WASM — all parallelism happens on the host side.
 │  ║     │               │               │                ║  │
 │  ║  ┌──┴───────────────┴───────────────┴──────────┐     ║  │
 │  ║  │  Host Functions (Linker)                    │     ║  │
-│  ║  │  • host_decompress(ptr, len, codec) → bytes │     ║  │
-│  ║  │  • host_archive_open(ptr, len, fmt) → hndl  │     ║  │
-│  ║  │  • host_archive_entry(hndl, name) → bytes   │     ║  │
-│  ║  │  • host_archive_list(hndl) → JSON           │     ║  │
+│  ║  │  • host_decompress(ptr,len,codec) → u64     │     ║  │
+│  ║  │  • host_archive_open(ptr,len,fmt,           │     ║  │
+│  ║  │      filter_ptr,filter_len) → handle        │     ║  │
+│  ║  │  • host_archive_entry(hndl,name) → u64      │     ║  │
+│  ║  │  • host_archive_list(hndl) → u64 (JSON)     │     ║  │
 │  ║  │  • host_archive_close(hndl)                 │     ║  │
 │  ║  └──▲──────────────────────────▲───────────────┘     ║  │
 │  ║     │                          │                     ║  │
 │  ║  ┌──┴────────┐  ┌─────────────┴──┐  ┌───────────┐   ║  │
 │  ║  │  maven    │  │    image       │  │  custom   │   ║  │
 │  ║  │  .wasm    │  │    .wasm       │  │  .wasm    │   ║  │
-│  ║  │  (185KB)  │  │    (EXIF)      │  │  (user)   │   ║  │
 │  ║  └───────────┘  └────────────────┘  └───────────┘   ║  │
 │  ╚══════════════════════════════════════════════════════╝  │
 │                                                             │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │  Native Plugins (compiled in, zero overhead)          │  │
+│  │  • NativeMavenPlugin — ljar parallel, GAV extraction  │  │
 │  │  • CargoPlugin — filename parse, no decompression     │  │
-│  │  • (future: npm, docker, etc.)                        │  │
 │  └───────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Native Plugin: NativeMavenPlugin
+
+Extracts Maven GAV (groupId, artifactId, version, packaging) from `.jar`, `.war`, `.ear`, `.pom`.
+
+For JAR/WAR/EAR files it calls `ljar::decompress_jar_filter(data, "pom.xml")` which:
+- Walks only the ZIP central directory header (O(1) per non-matching entry)
+- Decompresses matching entries in parallel across all CPU cores (rayon)
+- Returns empty if no `pom.xml` found — plugin returns `None`, file is stored as-is
+
+For `.pom` files it parses XML directly without any decompression.
+
+### WASM Plugin: maven.wasm
+
+Same logic compiled to `wasm32-unknown-unknown`:
+
+```
+cargo build --target wasm32-unknown-unknown --release -p znippy-plugin-maven
+```
+
+The WASM module calls `host_archive_open(ptr, len, 0, filter_ptr, filter_len)` which:
+- Applies the filter at the central-directory level on the host (same ljar path as native)
+- Returns handle `0` if nothing matches — plugin returns `"null"` without allocating
+- Decompresses only matched entries via host-side ljar (multi-core)
+
+No CLI-specific code is needed inside the plugin — any `.wasm` that exports the standard ABI
+(see below) is loadable by the CLI.
+
+### WASM Plugin ABI
+
+The ABI has two parts: the **logical interface** (mirrors the `ArchiveTypePlugin` trait, one
+export per method) and the **transport** (how bytes cross the WASM wall, since WASM has no shared heap).
+
+| Export | Signature | Maps to trait method | Role |
+|--------|-----------|----------------------|------|
+| `plugin_extensions` | `() → u32` | `matches_path` | Logical: comma-separated extension list, cached at load |
+| `plugin_schema` | `() → u32` | `schema_fields` | Logical: `name:type` column list, cached at load |
+| `extract` | `(path_ptr, path_len, data_ptr, data_len) → u32` | `extract_metadata` | Logical: extract; result in thread-local |
+| `alloc` | `(size: u32) → u32` | — | Transport: allocate WASM memory for host writes |
+| `dealloc` | `(ptr: u32, size: u32)` | — | Transport: free a previous `alloc` |
+| `result_len` | `() → u32` | — | Transport: byte length of last result buffer |
+
+`extract` writes a UTF-8 JSON object to a thread-local buffer and returns its pointer;
+`result_len()` lets the host read exactly that many bytes back. Returns `"null"` (4 bytes) when
+no metadata is applicable — host skips this file without allocating.
+
+`plugin_extensions` returns e.g. `".jar,.war,.ear,.pom"`. The host calls it **once** at load
+and caches the list, so `matches_path` is a cheap host-side string check — no per-file WASM call
+(critical because `matches_path` runs on every file in the pre-pass). A plugin that omits this
+export matches nothing.
+
+This is the key idea: `alloc`/`dealloc`/`result_len` are **not** the interface — they're the
+transport. The interface is the trait; native plugins implement it directly, WASM plugins
+implement the same contract via one export per method.
 
 ### Host Function API
 
 WASM plugins import these from `"env"`:
 
-| Function | Signature | Returns |
-|----------|-----------|---------|
-| `host_decompress` | `(ptr, len, codec) → u64` | `(out_ptr << 32) \| out_len` |
-| `host_archive_open` | `(ptr, len, format) → u32` | Handle |
-| `host_archive_list` | `(handle) → u64` | JSON `["name1","name2",...]` |
-| `host_archive_entry` | `(handle, name_ptr, name_len) → u64` | Raw bytes of entry |
-| `host_archive_close` | `(handle)` | — |
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `host_decompress` | `(ptr, len, codec) → u64` | Decompress raw bytes. Result: `(out_ptr << 32 \| out_len)` |
+| `host_archive_open` | `(ptr, len, format, filter_ptr, filter_len) → u32` | Open archive, keep only entries containing filter substring. Returns `0` if invalid or no match. |
+| `host_archive_list` | `(handle) → u64` | JSON `["name1","name2",...]` of stored entries |
+| `host_archive_entry` | `(handle, name_ptr, name_len) → u64` | Raw bytes of a named entry |
+| `host_archive_close` | `(handle)` | Free handle |
 
-**Codec IDs:** 0=deflate, 1=gzip(lgz), 2=bzip2(lbzip2), 3=zstd
+**Codec IDs:** `0`=deflate, `1`=gzip (lgz), `2`=bzip2 (lbzip2), `3`=zstd
 
-**Archive Format IDs:** 0=jar/zip(ljar), 1=tar.gz, 2=tar.bz2
+**Archive Format IDs:** `0`=jar/zip (ljar), `1`=tar.gz, `2`=tar.bz2
 
-### Data Flow
+**Filter optimization**: the filter is applied at open time at the central-directory level.
+Non-matching entries are never decompressed. `handle=0` → no matches → plugin returns `"null"` immediately.
 
-All data crosses the WASM boundary as raw bytes `(ptr, len)`:
-- Host calls plugin's `alloc(size)` to get writeable WASM memory
-- Writes result bytes there, returns packed `(ptr << 32 | len)` as u64
-- Plugin unpacks: `ptr = result >> 32`, `len = result & 0xFFFFFFFF`
-- No serialization for binary data — strings are UTF-8 bytes
+All data crosses the WASM boundary as raw bytes via `(ptr, len)` pairs packed into a `u64`:
+`ptr = result >> 32`, `len = result & 0xFFFF_FFFF`.
+
+### CLI Plugin Loading
+
+```sh
+# Default: native NativeMavenPlugin (ljar, multi-core, no sandbox)
+znippy compress -i repo/ -o archive.znippy
+
+# WASM plugin: same metadata, sandboxed, updatable without recompile
+znippy compress -i repo/ -o archive.znippy --plugin maven.wasm
+
+# Custom WASM plugin with a different Arrow type_id
+znippy compress -i photos/ -o archive.znippy --plugin exif.wasm --plugin-type-id 3
+```
+
+`--plugin` replaces the default native maven plugin. The native and WASM paths produce
+identical Arrow index output — only the execution environment differs.
+
+### Arrow Index: Maven Metadata Columns
+
+When either plugin extracts maven metadata, five nullable columns are written for `chunk_seq=0` rows:
+
+| Column | Arrow Type | Example |
+|--------|-----------|---------|
+| `pkg_type` | Int8, nullable | `1` (maven) |
+| `maven_group_id` | Utf8, nullable | `"org.springframework"` |
+| `maven_artifact_id` | Utf8, nullable | `"spring-core"` |
+| `maven_version` | Utf8, nullable | `"6.1.8"` |
+| `maven_packaging` | Utf8, nullable | `"jar"` |
+
+DuckDB query example:
+```sql
+SELECT maven_group_id, maven_artifact_id, maven_version, COUNT(*) AS chunks
+FROM 'archive.znippy'
+WHERE pkg_type = 1
+GROUP BY maven_group_id, maven_artifact_id, maven_version
+ORDER BY chunks DESC;
+```
 
 ### Native vs WASM Decision Matrix
 
-| Factor | Native | WASM |
-|--------|--------|------|
+| Factor | NativeMavenPlugin | maven.wasm |
+|--------|------------------|------------|
 | Latency | ~5μs/call | ~50μs/call |
-| Decompression | Direct (multi-core) | Via host functions (multi-core) |
+| JAR decompression | ljar directly (rayon) | ljar via host functions (rayon) |
+| Sandboxing | None (full trust) | Full (wasmtime) |
 | Updatable | Recompile znippy | Drop in new .wasm |
-| Sandbox | None (full trust) | Full isolation |
-| Use for | Built-in types (cargo, npm) | Third-party, user plugins |
+| Use for | Default production | Benchmarking, custom, third-party |
 
-### Backend Integration Plan
+### Backend Integration
 
-| Backend | Library | Threading Model | Status |
-|---------|---------|-----------------|--------|
-| JAR/ZIP | ljar-rs | rayon thread pool | ✅ Minimal fallback, native TODO |
-| Bzip2 | lbzip2-rs | workers-per-core (no rayon) | 🔲 Wire to host_decompress |
-| Gzip | lgz-rs | parallel (planned) | 🔲 Pending lgz creation |
-| Zstd | znippy codec | znippy's own thread pool | ✅ Wired via codec layer |
+| Archive Format | Library | Threading | Status |
+|---------------|---------|-----------|--------|
+| JAR/ZIP | ljar-rs | rayon thread pool | ✅ Native + WASM host function |
+| Bzip2 | lbzip2-rs | workers per core | 🔲 Wire to host_decompress |
+| Gzip | lgz-rs | parallel (done) | ✅ Wired via host_decompress / tar.gz |
+| Zstd | znippy codec | znippy thread pool | ✅ Via codec layer |
+
+---
+
+## Section 6: Self-Contained Modules + Multi-Index Container (planned)
+
+### Goal
+
+znippy core knows **nothing** about any package type. Each module (= package handler) owns
+its type's entire lifecycle:
+
+| Responsibility | Native | WASM export | Status |
+|----------------|--------|-------------|--------|
+| Which files it handles | `matches_path` | `plugin_extensions` | ✅ |
+| Its Arrow schema | `schema_fields` | `plugin_schema` | ✅ (native + WASM) |
+| Metadata extraction | `extract_metadata` | `extract` | ✅ |
+| Its CLI subcommands | `cli(args)` | `plugin_cli` | planned (F5) |
+
+The compressor/decompressor stay **format-level and shared** — modules never reimplement them
+(see backlog F5).
+
+### Step 1 (implemented): module-owned schema, single index
+
+- `ArchiveTypePlugin` gains `fn schema_fields(&self) -> Vec<Field>` (default empty).
+- Core `ZNIPPY_INDEX_SCHEMA` is the **base 9 columns** only. The writer composes the on-disk
+  schema as `base(9) + pkg_type + active module's fields` via `compose_index_schema(ext_fields)`.
+- `build_metadata_batch` builds the extension columns **generically** from each file's
+  `ExtensionRow`, keyed by `Field::name()` — no per-type code in core.
+- The hardcoded `maven_*` columns are removed from core.
+- **Column names are unprefixed** (`group_id`, `version`, not `maven_group_id`). Safe because a
+  single index carries exactly one module's columns; prefixing was only needed for a hypothetical
+  union table, which the multi-index design (Step 2) replaces.
+
+### Step 2 (implemented, v0.7): multi-index container
+
+**Problem:** an Arrow IPC stream allows exactly **one** schema. A multi-type archive
+(maven + cargo + pip), where each type has its own narrow schema, cannot share one stream
+without a union schema — which reintroduces null-column bloat and forces core to aggregate
+every module's fields.
+
+**Solution:** multiple Arrow IPC streams in one file, plus a manifest.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ blob region:  [blob_0][blob_1]...[blob_N]   all chunk bytes        │
+│                              (interleaved, stream-as-produced)     │
+├──────────────────────────────────────────────────────────────────┤
+│ index_0: Arrow IPC stream   sub-znippy (pkg_type=1, repo=maven)    │  ← narrow schema
+│ index_1: Arrow IPC stream   sub-znippy (pkg_type=1, repo=libs)     │
+│ index_2: Arrow IPC stream   sub-znippy (pkg_type=2, repo=cargo)    │
+│ ...                                                                │
+├──────────────────────────────────────────────────────────────────┤
+│ manifest: Arrow IPC stream  (itself DuckDB-readable as .arrow)     │
+│   pkg_type · repo · module_name · index_offset · index_len ·       │
+│   row_count                                                        │
+├──────────────────────────────────────────────────────────────────┤
+│ [8 bytes "ZNPYMIDX"] [8 bytes LE u64] = manifest_offset  footer   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+- A **sub-znippy** = rows sharing `(pkg_type, repo)`; each is an independently valid Arrow IPC
+  stream with a narrow schema. Blobs referenced by existing `blob_offset`/`blob_size` columns
+  point into the shared interleaved blob region.
+- **Backward compatibility:** a reader sees 8 bytes before the trailing offset. If they equal
+  `"ZNPYMIDX"` it is v0.7; otherwise v0.6. v0.6 files never carry the magic.
+- **Blobs: interleaved** (stream-as-produced). Grouping blobs per sub-znippy would require
+  buffering all data before any write, which conflicts with the streaming write model.
+  Sub-znippy extraction is done via `znippy export-index --type maven` (emits a standalone
+  `.arrow`), not by slicing the blob region.
+
+**Read path:** read footer → detect magic → if v0.7: manifest_offset → manifest → list of
+sub-indexes; merge all sub-index batches into a single batch for format-agnostic callers
+(`decompress_archive`, `ZnippyArchive`). Per-type query (`znippy maven lookup …`) can use the
+sub-index byte range directly with DuckDB/DataFusion.
+
+**DuckDB tradeoff (important):**
+- v0.6 single-index is one valid Arrow IPC stream → `SELECT * FROM 'a.znippy'` works directly.
+  **Preserved** for single-type archives.
+- The multi-index file is *not* a single stream — whole-file direct query is replaced by per-type
+  access (module subcommand, or `znippy export-index --type maven` to emit a standalone `.arrow`).
+- **Decision (implemented):** single-type archives keep the v0.6 layout; multi-type (or any
+  `ArchiveEntry` with distinct `(pkg_type, repo)` pairs) uses the v0.7 manifest container.
+
+**Settled design decisions:**
+- Manifest format: Arrow IPC stream (DuckDB-readable as `.arrow`, not a hand-rolled struct).
+- Blobs: interleaved (stream-as-produced, simplest; no buffering required).
+- `ArchiveEntry` gains optional `pkg_type: Option<i8>` + `repo: Option<String>`; absent means
+  "untyped default group" → v0.6 output.
+
+WASM `plugin_schema` transport is settled: `name:type` pairs (`group_id:utf8,version:utf8`),
+type tags `utf8`/`u32`/`i8`, parsed host-side into Arrow fields.
 
 

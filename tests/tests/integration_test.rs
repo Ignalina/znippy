@@ -6,6 +6,7 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 use znippy_common::{ZnippyArchive, ZnippyReader};
+use znippy_common::{ManifestEntry, interpret_footer, read_manifest_bytes, write_manifest_bytes};
 use znippy_compress::{ArchiveEntry, compress_dir, compress_stream};
 
 /// Helper: decompress an archive and return map of relative_path → file contents
@@ -44,6 +45,8 @@ fn test_stream_compress_single_small_file() -> Result<()> {
     compressor.sender().send(ArchiveEntry {
         relative_path: "hello.txt".to_string(),
         data: content.to_vec(),
+        pkg_type: None,
+        repo: None,
     })?;
     let report = compressor.finish()?;
 
@@ -82,6 +85,8 @@ fn test_stream_compress_multiple_files() -> Result<()> {
         compressor.sender().send(ArchiveEntry {
             relative_path: path.to_string(),
             data: data.clone(),
+            pkg_type: None,
+            repo: None,
         })?;
     }
     let report = compressor.finish()?;
@@ -111,6 +116,8 @@ fn test_stream_compress_empty_file() -> Result<()> {
     compressor.sender().send(ArchiveEntry {
         relative_path: "empty.txt".to_string(),
         data: vec![],
+        pkg_type: None,
+        repo: None,
     })?;
     let report = compressor.finish()?;
 
@@ -136,6 +143,8 @@ fn test_stream_compress_large_file_multi_chunk() -> Result<()> {
     compressor.sender().send(ArchiveEntry {
         relative_path: "large.bin".to_string(),
         data: data.clone(),
+        pkg_type: None,
+        repo: None,
     })?;
     let report = compressor.finish()?;
 
@@ -159,6 +168,8 @@ fn test_stream_compress_already_compressed_file_skipped() -> Result<()> {
     compressor.sender().send(ArchiveEntry {
         relative_path: "image.png".to_string(),
         data: data.clone(),
+        pkg_type: None,
+        repo: None,
     })?;
     let report = compressor.finish()?;
 
@@ -183,6 +194,8 @@ fn test_stream_compress_no_skip_forces_compression() -> Result<()> {
     compressor.sender().send(ArchiveEntry {
         relative_path: "image.png".to_string(),
         data: data.clone(),
+        pkg_type: None,
+        repo: None,
     })?;
     let report = compressor.finish()?;
 
@@ -226,6 +239,8 @@ fn test_compress_dir_basic() -> Result<()> {
         &input_dir.path().to_path_buf(),
         &archive_path.to_path_buf(),
         false,
+        None,
+        None,
     )?;
 
     assert_eq!(report.total_files, 2);
@@ -263,6 +278,8 @@ fn test_compress_dir_with_mixed_file_types() -> Result<()> {
         &input_dir.path().to_path_buf(),
         &archive_path.to_path_buf(),
         false,
+        None,
+        None,
     )?;
 
     assert_eq!(report.total_files, 2);
@@ -286,6 +303,8 @@ fn test_compress_dir_with_mixed_file_types() -> Result<()> {
 fn test_index_schema_fields() {
     let schema = znippy_common::znippy_index_schema();
     let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    // znippy_index_schema() is the type-agnostic base; module columns are composed in
+    // at write time via compose_index_schema(), not part of this static.
     assert_eq!(
         field_names,
         vec![
@@ -311,6 +330,8 @@ fn test_read_znippy_index_after_compress() -> Result<()> {
     compressor.sender().send(ArchiveEntry {
         relative_path: "test.txt".to_string(),
         data: b"test data for index read".to_vec(),
+        pkg_type: None,
+        repo: None,
     })?;
     compressor.finish()?;
 
@@ -346,6 +367,8 @@ fn test_verify_via_decompress() -> Result<()> {
     compressor.sender().send(ArchiveEntry {
         relative_path: "check.bin".to_string(),
         data: data.clone(),
+        pkg_type: None,
+        repo: None,
     })?;
     compressor.finish()?;
 
@@ -373,16 +396,165 @@ fn test_list_archive_contents() -> Result<()> {
     compressor.sender().send(ArchiveEntry {
         relative_path: "foo.txt".to_string(),
         data: b"foo".to_vec(),
+        pkg_type: None,
+        repo: None,
     })?;
     compressor.sender().send(ArchiveEntry {
         relative_path: "bar.txt".to_string(),
         data: b"bar".to_vec(),
+        pkg_type: None,
+        repo: None,
     })?;
     compressor.finish()?;
 
     // list_archive_contents prints to stdout - just verify it doesn't error
     znippy_common::list_archive_contents(&archive_path)?;
 
+    Ok(())
+}
+
+// ─── Manifest codec unit tests (v0.7) ─────────────────────────────────────
+
+#[test]
+fn test_manifest_roundtrip() -> Result<()> {
+    let entries = vec![
+        ManifestEntry {
+            pkg_type: 1,
+            repo: "central".to_string(),
+            module_name: "maven".to_string(),
+            index_offset: 0,
+            index_len: 1024,
+            row_count: 42,
+        },
+        ManifestEntry {
+            pkg_type: 2,
+            repo: "crates-io".to_string(),
+            module_name: "cargo".to_string(),
+            index_offset: 1024,
+            index_len: 512,
+            row_count: 17,
+        },
+    ];
+
+    let bytes = write_manifest_bytes(&entries)?;
+    let decoded = read_manifest_bytes(&bytes)?;
+    assert_eq!(decoded, entries);
+    Ok(())
+}
+
+#[test]
+fn test_manifest_empty_roundtrip() -> Result<()> {
+    let bytes = write_manifest_bytes(&[])?;
+    let decoded = read_manifest_bytes(&bytes)?;
+    assert!(decoded.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_interpret_footer_single_v06() {
+    // 8-byte footer: just an offset — should be Single.
+    let offset: u64 = 12345;
+    let tail = offset.to_le_bytes();
+    match interpret_footer(&tail) {
+        znippy_common::IndexFooter::Single { index_offset } => assert_eq!(index_offset, 12345),
+        other => panic!("expected Single, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_interpret_footer_multi_v07() {
+    // 16-byte footer: MAGIC + offset — should be Multi.
+    let magic = znippy_common::MULTI_INDEX_MAGIC;
+    let offset: u64 = 99999;
+    let mut tail = [0u8; 16];
+    tail[..8].copy_from_slice(&magic);
+    tail[8..].copy_from_slice(&offset.to_le_bytes());
+    match interpret_footer(&tail) {
+        znippy_common::IndexFooter::Multi { manifest_offset } => assert_eq!(manifest_offset, 99999),
+        other => panic!("expected Multi, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_multi_index_write_read_roundtrip() -> Result<()> {
+    let out_dir = TempDir::new()?;
+    let archive_path = out_dir.path().join("multi.znippy");
+
+    let compressor = compress_stream(&archive_path.to_path_buf(), false)?;
+
+    // Two groups: (pkg_type=1, repo="maven") and (pkg_type=2, repo="cargo")
+    compressor.sender().send(ArchiveEntry {
+        relative_path: "pom.xml".to_string(),
+        data: b"<project/>".to_vec(),
+        pkg_type: Some(1),
+        repo: Some("maven".to_string()),
+    })?;
+    compressor.sender().send(ArchiveEntry {
+        relative_path: "lib.jar".to_string(),
+        data: b"JAR_CONTENT".to_vec(),
+        pkg_type: Some(1),
+        repo: Some("maven".to_string()),
+    })?;
+    compressor.sender().send(ArchiveEntry {
+        relative_path: "Cargo.toml".to_string(),
+        data: b"[package]".to_vec(),
+        pkg_type: Some(2),
+        repo: Some("cargo".to_string()),
+    })?;
+    compressor.finish()?;
+
+    // Verify manifest via dedicated reader
+    let manifest = znippy_common::read_znippy_manifest(&archive_path)?;
+    assert_eq!(manifest.len(), 2, "expected 2 sub-indexes in manifest");
+
+    let maven = manifest.iter().find(|e| e.repo == "maven").expect("maven entry missing");
+    assert_eq!(maven.pkg_type, 1);
+    assert_eq!(maven.row_count, 2);
+
+    let cargo = manifest.iter().find(|e| e.repo == "cargo").expect("cargo entry missing");
+    assert_eq!(cargo.pkg_type, 2);
+    assert_eq!(cargo.row_count, 1);
+
+    // Full round-trip: decompress and verify all files
+    let files = decompress_to_map(&archive_path)?;
+    assert_eq!(files.len(), 3);
+    assert_eq!(files["pom.xml"], b"<project/>");
+    assert_eq!(files["lib.jar"], b"JAR_CONTENT");
+    assert_eq!(files["Cargo.toml"], b"[package]");
+
+    Ok(())
+}
+
+#[test]
+fn test_single_group_writes_v07() -> Result<()> {
+    // When all entries share the same (pkg_type, repo), the archive is still v0.7 (1-entry manifest).
+    let out_dir = TempDir::new()?;
+    let archive_path = out_dir.path().join("single.znippy");
+
+    let compressor = compress_stream(&archive_path.to_path_buf(), false)?;
+    compressor.sender().send(ArchiveEntry {
+        relative_path: "a.txt".to_string(),
+        data: b"aaa".to_vec(),
+        pkg_type: Some(1),
+        repo: Some("r1".to_string()),
+    })?;
+    compressor.sender().send(ArchiveEntry {
+        relative_path: "b.txt".to_string(),
+        data: b"bbb".to_vec(),
+        pkg_type: Some(1),
+        repo: Some("r1".to_string()),
+    })?;
+    compressor.finish()?;
+
+    // read_znippy_manifest should succeed — v0.7 with 1 entry
+    let manifest = znippy_common::read_znippy_manifest(&archive_path)?;
+    assert_eq!(manifest.len(), 1);
+    assert_eq!(manifest[0].pkg_type, 1);
+    assert_eq!(manifest[0].repo, "r1");
+    assert_eq!(manifest[0].row_count, 2);
+
+    let files = decompress_to_map(&archive_path)?;
+    assert_eq!(files.len(), 2);
     Ok(())
 }
 
@@ -400,6 +572,8 @@ fn test_znippy_archive_extract_file_multi_chunk() -> Result<()> {
     compressor.sender().send(ArchiveEntry {
         relative_path: "big.bin".to_string(),
         data: data.clone(),
+        pkg_type: None,
+        repo: None,
     })?;
     let report = compressor.finish()?;
     assert!(report.chunks >= 2, "Expected multiple chunks, got {}", report.chunks);

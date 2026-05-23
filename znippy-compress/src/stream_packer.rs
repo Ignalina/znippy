@@ -8,8 +8,8 @@ use std::thread;
 use znippy_common::chunkrevolver::{ChunkRevolver, SendPtr, get_chunk_slice};
 use znippy_common::common_config::CONFIG;
 use znippy_common::index::{
-    ZNIPPY_INDEX_SCHEMA, build_arrow_metadata_for_config, build_metadata_batch,
-    should_skip_compression,
+    build_arrow_metadata_for_config, build_metadata_batch, compose_index_schema,
+    should_skip_compression, write_manifest_bytes, ManifestEntry, MULTI_INDEX_MAGIC,
 };
 use znippy_common::meta::{BlobMeta, ChunkMeta, WriterStats};
 use znippy_common::{CompressionReport, split_into_microchunks};
@@ -19,6 +19,24 @@ use crate::Blob;
 pub struct ArchiveEntry {
     pub relative_path: String,
     pub data: Vec<u8>,
+    /// Package type discriminator. None means "untyped / default group".
+    /// When all entries share the same (pkg_type, repo), the archive is written
+    /// in v0.6 format. Multiple distinct pairs produce a v0.7 multi-index archive.
+    pub pkg_type: Option<i8>,
+    /// Repository label for this entry. None is treated as "".
+    pub repo: Option<String>,
+}
+
+impl ArchiveEntry {
+    pub fn new(relative_path: impl Into<String>, data: Vec<u8>) -> Self {
+        Self { relative_path: relative_path.into(), data, pkg_type: None, repo: None }
+    }
+}
+
+impl Default for ArchiveEntry {
+    fn default() -> Self {
+        Self { relative_path: String::new(), data: Vec::new(), pkg_type: None, repo: None }
+    }
 }
 
 /// A handle to the streaming compressor.
@@ -56,6 +74,13 @@ pub fn compress_stream(output: &PathBuf, no_skip: bool) -> Result<StreamCompress
     })
 }
 
+/// Per-file metadata collected by the reader thread and consumed by the writer.
+struct FileRegistry {
+    paths: Vec<String>,
+    pkg_types: Vec<Option<i8>>,
+    repos: Vec<Option<String>>,
+}
+
 fn run_compression_pipeline(
     rx_entry: Receiver<ArchiveEntry>,
     output: &PathBuf,
@@ -73,7 +98,7 @@ fn run_compression_pipeline(
         Receiver<(Blob, ChunkMeta)>,
     ) = unbounded();
     let (tx_return, rx_return): (Sender<(u8, u64)>, Receiver<(u8, u64)>) = unbounded();
-    let (paths_tx, paths_rx) = bounded::<Vec<String>>(1);
+    let (paths_tx, paths_rx) = bounded::<FileRegistry>(1);
     let (checksum_tx, checksum_rx) = bounded::<Vec<[u8; 32]>>(1);
 
     let mut revolver = ChunkRevolver::new(&CONFIG);
@@ -87,6 +112,8 @@ fn run_compression_pipeline(
 
         thread::spawn(move || {
             let mut paths: Vec<String> = Vec::new();
+            let mut pkg_types: Vec<Option<i8>> = Vec::new();
+            let mut repos: Vec<Option<String>> = Vec::new();
             let mut inflight_chunks = 0usize;
             let mut uncompressed_files: u64 = 0;
             let mut uncompressed_bytes: u64 = 0;
@@ -107,6 +134,8 @@ fn run_compression_pipeline(
                     compressed_bytes += data_len;
                 }
 
+                pkg_types.push(entry.pkg_type);
+                repos.push(entry.repo);
                 paths.push(entry.relative_path);
 
                 let mut cursor = std::io::Cursor::new(entry.data);
@@ -199,7 +228,7 @@ fn run_compression_pipeline(
                 uncompressed_bytes,
                 compressed_files,
                 compressed_bytes,
-                paths,
+                FileRegistry { paths, pkg_types, repos },
             )
         })
     };
@@ -345,55 +374,89 @@ fn run_compression_pipeline(
             writerstats.total_written_bytes += blob_size;
         }
 
-        // Receive paths and checksums from main thread
-        let paths = paths_rx.recv().expect("Failed to receive paths");
+        // Receive file registry and checksums from main thread
+        let reg = paths_rx.recv().expect("Failed to receive file registry");
         let checksums = checksum_rx.recv().expect("Failed to receive checksums");
 
-        // Record where Arrow IPC starts
-        let index_offset = current_offset;
+        use arrow::ipc::writer::StreamWriter;
 
-        // Build and write Arrow IPC index
-        let batch = build_metadata_batch(&all_blobs, &checksums, |file_index| {
-            paths[file_index as usize].clone()
-        })
-        .expect("Failed to build metadata batch");
+        // ── v0.7 writer ────────────────────────────────────────────────────
+        // Group blob indices by (pkg_type, repo). BTreeMap keeps groups in stable order.
+        let file_keys: Vec<(i8, String)> = reg.pkg_types.iter()
+            .zip(reg.repos.iter())
+            .map(|(p, r)| (p.unwrap_or(0), r.clone().unwrap_or_default()))
+            .collect();
+
+        let mut groups: std::collections::BTreeMap<(i8, String), Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, blob) in all_blobs.iter().enumerate() {
+            let key = file_keys[blob.chunk_meta.file_index as usize].clone();
+            groups.entry(key).or_default().push(i);
+        }
 
         let meta_map = build_arrow_metadata_for_config(&CONFIG);
-        let schema_with_meta = arrow::datatypes::Schema::new_with_metadata(
-            ZNIPPY_INDEX_SCHEMA.fields().to_vec(),
-            meta_map,
-        );
+        let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
 
-        use arrow::ipc::writer::StreamWriter;
-        let mut stream_writer = StreamWriter::try_new(&mut writer, &schema_with_meta)
-            .expect("Failed to create Arrow stream writer");
-        stream_writer.write(&batch).expect("Failed to write batch");
-        stream_writer.finish().expect("Failed to finish Arrow stream");
+        for ((pkg_type, repo), blob_indices) in &groups {
+            let sub_start = current_offset;
+            let group_blobs: Vec<_> = blob_indices.iter()
+                .map(|&i| all_blobs[i].clone())
+                .collect();
+            let row_count = group_blobs.len() as u64;
 
-        // 8-byte LE footer: byte offset where Arrow IPC starts
-        writer
-            .write_all(&index_offset.to_le_bytes())
-            .expect("Failed to write footer");
+            let batch = build_metadata_batch(&group_blobs, &checksums, |fi| {
+                reg.paths[fi as usize].clone()
+            }, &[], &[])
+            .expect("Failed to build sub-index batch");
+
+            let schema_with_meta = arrow::datatypes::Schema::new_with_metadata(
+                compose_index_schema(&[]).fields().to_vec(),
+                meta_map.clone(),
+            );
+            let mut sub_bytes: Vec<u8> = Vec::new();
+            let mut sw = StreamWriter::try_new(&mut sub_bytes, &schema_with_meta)
+                .expect("Failed to create sub-index writer");
+            sw.write(&batch).expect("Failed to write sub-index batch");
+            sw.finish().expect("Failed to finish sub-index stream");
+
+            let sub_len = sub_bytes.len() as u64;
+            writer.write_all(&sub_bytes).expect("Failed to write sub-index");
+            current_offset += sub_len;
+            writerstats.total_written_bytes += sub_len;
+
+            manifest_entries.push(ManifestEntry {
+                pkg_type: *pkg_type,
+                repo: repo.clone(),
+                module_name: String::new(),
+                index_offset: sub_start,
+                index_len: sub_len,
+                row_count,
+            });
+        }
+
+        // Write manifest + 16-byte v0.7 footer (MAGIC + manifest_offset).
+        let manifest_offset = current_offset;
+        let manifest_bytes = write_manifest_bytes(&manifest_entries)
+            .expect("Failed to serialize manifest");
+        writer.write_all(&manifest_bytes).expect("Failed to write manifest");
+        writer.write_all(&MULTI_INDEX_MAGIC).expect("Failed to write magic");
+        writer.write_all(&manifest_offset.to_le_bytes()).expect("Failed to write manifest offset");
         writer.flush().expect("Failed to flush");
 
-        log::info!(
-            "[writer] Done: {} chunks, {} blob bytes, Arrow index at offset {}",
-            writerstats.total_chunks,
-            writerstats.total_written_bytes,
-            index_offset,
-        );
+        log::info!("[writer] v0.7 archive: {} group(s), {} blob bytes, manifest at {}",
+            manifest_entries.len(), writerstats.total_written_bytes, manifest_offset);
 
         writerstats
     });
 
-    // Wait for reader to finish; it returns collected paths
-    let (uncompressed_files, uncompressed_bytes, compressed_files, compressed_bytes, paths) =
+    // Wait for reader to finish; it returns file registry (paths + pkg_types + repos)
+    let (uncompressed_files, uncompressed_bytes, compressed_files, compressed_bytes, reg) =
         reader_thread.join().unwrap();
 
     let total_files = (uncompressed_files + compressed_files) as u64;
 
-    // Send paths to writer before compressors finish (writer is still consuming rx_compressed)
-    paths_tx.send(paths).expect("Failed to send paths to writer");
+    // Send file registry to writer before compressors finish (writer is still consuming rx_compressed)
+    paths_tx.send(reg).expect("Failed to send file registry to writer");
 
     tx_chunk_array.into_iter().for_each(drop);
 
@@ -416,7 +479,7 @@ fn run_compression_pipeline(
 
     let writerstats = writer_thread.join().unwrap();
 
-    log::info!("[stream] v0.6 archive written");
+    log::info!("[stream] archive written");
 
     let report = CompressionReport {
         total_files,
