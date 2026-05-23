@@ -759,22 +759,79 @@ every module's fields.
 
 **Solution:** multiple Arrow IPC streams in one file, plus a manifest.
 
+#### Logical view — one archive, many types and repos
+
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│ blob region:  [blob_0][blob_1]...[blob_N]   all chunk bytes        │
-│                              (interleaved, stream-as-produced)     │
-├──────────────────────────────────────────────────────────────────┤
-│ index_0: Arrow IPC stream   sub-znippy (pkg_type=1, repo=maven)    │  ← narrow schema
-│ index_1: Arrow IPC stream   sub-znippy (pkg_type=1, repo=libs)     │
-│ index_2: Arrow IPC stream   sub-znippy (pkg_type=2, repo=cargo)    │
-│ ...                                                                │
-├──────────────────────────────────────────────────────────────────┤
-│ manifest: Arrow IPC stream  (itself DuckDB-readable as .arrow)     │
-│   pkg_type · repo · module_name · index_offset · index_len ·       │
-│   row_count                                                        │
-├──────────────────────────────────────────────────────────────────┤
-│ [8 bytes "ZNPYMIDX"] [8 bytes LE u64] = manifest_offset  footer   │
-└──────────────────────────────────────────────────────────────────┘
+  dump.znippy
+  ┌────────────────────────────────────────────────────────────┐
+  │                                                            │
+  │   pkg_type = 1  (maven)        pkg_type = 2  (cargo)      │
+  │   ┌─────────────────────┐      ┌─────────────���───────┐    │
+  │   │  repo = "libs"      │      │  repo = "stable"    │    │
+  │   │  spring-core.jar    │      │  serde-1.0.jar      │    │
+  │   │  guava.jar          │      │  tokio-1.47.jar      │    │
+  │   │  …                  │      │  …                  │    │
+  │   ├─────────────────────┤      ├─────────────────────┤    │
+  │   │  repo = "release"   │      │  repo = "nightly"   │    │
+  │   │  myapp-2.0.jar      │      │  rayon-1.10.crate   │    │
+  │   │  …                  │      │  …                  │    │
+  │   └─────────────────────┘      └─────────────────────┘    │
+  │                                                            │
+  │   pkg_type = 3  (pip)                                      │
+  │   ┌─────────────────────┐                                  │
+  │   │  repo = "main"      │                                  │
+  │   │  numpy-2.0.whl      │                                  │
+  │   │  requests-2.32.whl  │                                  │
+  │   │  …                  │                                  │
+  │   └─────────────────────┘                                  │
+  └────────────────────────────────────────────────────────────┘
+```
+
+#### Physical file layout
+
+```
+  dump.znippy  (on disk)
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │  BLOB REGION  (written as produced — interleaved across all types)    │
+  │  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐             │
+  │  │ blob_0 │ │ blob_1 │ │ blob_2 │ │ blob_3 │ │ blob_N │  …          │
+  │  │ maven  │ │ cargo  │ │ pip    │ │ maven  │ │ cargo  │             │
+  │  │ libs   │ │ stable │ │ main   │ │release │ │nightly │             │
+  │  └────────┘ └────────┘ └────────┘ └────────┘ └────────┘             │
+  │                   ↑ no grouping — stream order only                   │
+  ├───────────────────────────────────────────────────────────────────────┤
+  │  SUB-INDEX REGION  (one Arrow IPC stream per (pkg_type, repo) group)  │
+  │                                                                       │
+  │  ┌──────────────────────────────┐  ┌──────────────────────────────┐  │
+  │  │ Arrow IPC sub-index           │  │ Arrow IPC sub-index           │  │
+  │  │ ─────────────────────────    │  │ ─────────────────────────    │  │
+  │  │ pkg_type=1  repo="libs"      │  │ pkg_type=1  repo="release"   │  │
+  │  │ relative_path  blob_off  …   │  │ relative_path  blob_off  …   │  │
+  │  │ spring-core.jar   0      …   │  │ myapp-2.0.jar   3072     …   │  │
+  │  │ guava.jar        512     …   │  │ …                            │  │
+  │  └──────────────────────────────┘  └──────────────────────────────┘  │
+  │  ┌──────────────────────────────┐  ┌──────────────────────────────┐  │
+  │  │ Arrow IPC sub-index           │  │ Arrow IPC sub-index           │  │
+  │  │ ─────────────────────────    │  │ ─────────────────────────    │  │
+  │  │ pkg_type=2  repo="stable"    │  │ pkg_type=3  repo="main"      │  │
+  │  │ relative_path  blob_off  …   │  │ relative_path  blob_off  …   │  │
+  │  │ serde-1.0.crate  1024    …   │  │ numpy-2.0.whl    2048    …   │  │
+  │  └──────────────────────────────┘  └──────────────────────────────┘  │
+  │    … one sub-index per (pkg_type, repo) pair                          │
+  ├───────────────────────────────────────────────────────────────────────┤
+  │  MANIFEST  (Arrow IPC stream — DuckDB/Polars readable as .arrow)      │
+  │  ┌───────────┬───────────┬────────────────┬────────────┬───────────┐  │
+  │  │ pkg_type  │   repo    │ sub_idx_offset │ sub_idx_sz │ row_count │  │
+  │  ├───────────┼───────────┼────────────────┼────────────┼───────────┤  │
+  │  │     1     │ "libs"    │    <offset_0>  │  <size_0>  │    412    │  │
+  │  │     1     │ "release" │    <offset_1>  │  <size_1>  │     88    │  │
+  │  │     2     │ "stable"  │    <offset_2>  │  <size_2>  │   9162    │  │
+  │  │     3     │ "main"    │    <offset_3>  │  <size_3>  │    541    │  │
+  │  └───────────┴───────────┴────────────────┴────────────┴───────────┘  │
+  ├───────────────────────────────────────────────────────────────────────┤
+  │  FOOTER  (16 bytes)                                                   │
+  │  [ "ZNPYMIDX"  8 bytes magic ] [ manifest_offset  8 bytes LE u64 ]   │
+  └───────────────────────────────────────────────────────────────────────┘
 ```
 
 - A **sub-znippy** = rows sharing `(pkg_type, repo)`; each is an independently valid Arrow IPC
