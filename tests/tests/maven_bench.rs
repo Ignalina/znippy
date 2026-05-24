@@ -215,7 +215,6 @@ fn maven_both_paths_agree() {
 // ─── Throughput benchmarks (run with: cargo test -p znippy-tests -- maven --include-ignored --nocapture) ─
 
 #[test]
-#[ignore]
 fn maven_bench_native_throughput() {
     let jar = make_test_jar("com.example", "biglib", "2.0.0");
     let plugin = NativeMavenPlugin;
@@ -236,7 +235,6 @@ fn maven_bench_native_throughput() {
 }
 
 #[test]
-#[ignore]
 fn maven_bench_fallback_throughput() {
     let jar = make_test_jar("com.example", "biglib", "2.0.0");
     let iterations = 2000;
@@ -256,7 +254,6 @@ fn maven_bench_fallback_throughput() {
 }
 
 #[test]
-#[ignore]
 fn maven_bench_compare() {
     // Side-by-side comparison of native vs fallback on same JAR
     let jar = make_test_jar("com.example", "biglib", "2.0.0");
