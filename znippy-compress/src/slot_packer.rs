@@ -94,25 +94,15 @@ pub fn compress_dir(
     );
     let total_files = all_files.len() as u64;
 
-    // Plugin pre-pass — per-file metadata extraction, OUTSIDE the slice pipeline.
-    let ext_meta: Vec<FileExtMeta> = if let Some(reg) = plugin {
-        let type_id = reg.type_id().unwrap_or(0);
-        all_files
-            .iter()
-            .map(|path| {
-                let rel = path.strip_prefix(input_dir).unwrap_or(path).to_string_lossy();
-                if !reg.matches(&rel) {
-                    return None;
-                }
-                let data = std::fs::read(path).ok()?;
-                reg.extract(&rel, &data).map(|row| (type_id, row))
-            })
-            .collect()
-    } else {
-        vec![None; all_files.len()]
-    };
+    // Plugin metadata is now extracted INLINE during the reader loop (zero-copy
+    // from the slot buffer). No separate pre-pass, no double read.
+    // For files larger than slice_size (rare), we fall back to a separate fs::read.
     let ext_fields: Vec<znippy_common::arrow::datatypes::Field> =
         plugin.map(|r| r.schema_fields()).unwrap_or_default();
+
+    // Channel for inline metadata extraction results from the reader thread.
+    // The reader extracts metadata while data is in the slot buffer (no double read).
+    let (tx_meta, rx_meta) = bounded::<(usize, FileExtMeta)>(256);
 
     let output_path = output.with_extension("znippy");
     let file = Arc::new(File::create(&output_path)?);
@@ -134,9 +124,19 @@ pub fn compress_dir(
     }
 
     // ── READER: the single source ───────────────────────────────────────────
+    // SAFETY: plugin outlives reader_thread (we join it before returning from compress_dir).
+    // We pass the plugin as a usize (pointer cast) to satisfy Send requirements.
+    let plugin_addr: usize = plugin.map(|p| p as *const _ as usize).unwrap_or(0);
+
     let reader_thread = {
         let all_files = Arc::clone(&all_files);
+        let input_dir = input_dir.clone();
         thread::spawn(move || -> (u64, u64, u64, u64) {
+            let plugin_ref: Option<&znippy_common::plugin::PluginRegistry> = if plugin_addr != 0 {
+                Some(unsafe { &*(plugin_addr as *const znippy_common::plugin::PluginRegistry) })
+            } else {
+                None
+            };
             let mut uncompressed_files = 0u64;
             let mut uncompressed_bytes = 0u64;
             let mut compressed_files = 0u64;
@@ -165,6 +165,12 @@ pub fn compress_dir(
                 let mut rdr = BufReader::new(f);
                 let mut fdata_offset = 0u64;
                 let mut chunk_seq = 0u32;
+
+                // Check if plugin wants this file (before reading data).
+                let wants_meta = plugin_ref
+                    .map(|r| r.matches(&path.strip_prefix(&input_dir)
+                        .unwrap_or(path).to_string_lossy()))
+                    .unwrap_or(false);
 
                 // Empty file → one zero-length slice so it appears in the index.
                 if file_size == 0 {
@@ -197,12 +203,39 @@ pub fn compress_dir(
                     if got == 0 {
                         break;
                     }
+
+                    // Inline plugin extraction: for small files the entire content is
+                    // in this single slice — extract metadata directly from slot memory.
+                    // No double-read, no extra allocation.
+                    if wants_meta && small && chunk_seq == 0 {
+                        let rel = path.strip_prefix(&input_dir)
+                            .unwrap_or(path).to_string_lossy();
+                        if let Some(reg) = plugin_ref {
+                            if let Some(row) = reg.extract(&rel, &buf[..got]) {
+                                tx_meta.send((file_index, Some((reg.type_id().unwrap_or(0), row)))).ok();
+                            }
+                        }
+                    }
+
                     fill.commit_slice(got, skip, file_index as u64, fdata_offset, chunk_seq);
                     fdata_offset += got as u64;
                     chunk_seq += 1;
                     remaining = remaining.saturating_sub(got as u64);
                     if got < want {
                         break; // short read = EOF
+                    }
+                }
+
+                // Fallback: big files that were sliced — re-read for metadata (rare).
+                if wants_meta && !small {
+                    if let Some(reg) = plugin_ref {
+                        let rel = path.strip_prefix(&input_dir)
+                            .unwrap_or(path).to_string_lossy();
+                        if let Ok(data) = std::fs::read(path) {
+                            if let Some(row) = reg.extract(&rel, &data) {
+                                tx_meta.send((file_index, Some((reg.type_id().unwrap_or(0), row)))).ok();
+                            }
+                        }
                     }
                 }
             }
@@ -224,6 +257,7 @@ pub fn compress_dir(
 
             // Dropping tx_slice here lets the workers exit once the queue empties.
             drop(tx_slice);
+            drop(tx_meta);
             drop(pool);
 
             (uncompressed_files, uncompressed_bytes, compressed_files, compressed_bytes)
@@ -343,6 +377,14 @@ pub fn compress_dir(
         w.join().map_err(|_| anyhow!("barrel panicked"))??;
     }
     let mut all_blobs = writer_thread.join().map_err(|_| anyhow!("writer panicked"))??;
+
+    // Collect inline-extracted metadata from the reader thread channel.
+    let mut ext_meta: Vec<FileExtMeta> = vec![None; all_files.len()];
+    while let Ok((idx, meta)) = rx_meta.try_recv() {
+        if idx < ext_meta.len() {
+            ext_meta[idx] = meta;
+        }
+    }
 
     // Stable index order (out-of-order completion is fine on disk; index is sorted).
     all_blobs.sort_by_key(|b| (b.chunk_meta.file_index, b.chunk_meta.chunk_seq));
