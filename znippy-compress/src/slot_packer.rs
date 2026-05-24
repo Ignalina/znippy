@@ -15,11 +15,13 @@ use crossbeam_channel::bounded;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use walkdir::WalkDir;
+use io_uring::{IoUring, opcode, types};
 
 use znippy_common::common_config::CONFIG;
 use znippy_common::index::{
@@ -144,96 +146,219 @@ pub fn compress_dir(
 
             let mut cur = None;
 
-            for (file_index, path) in all_files.iter().enumerate() {
-                let skip = !no_skip && should_skip_compression(path);
-                let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
-                if skip {
-                    uncompressed_files += 1;
-                    uncompressed_bytes += file_size;
-                } else {
-                    compressed_files += 1;
-                    compressed_bytes += file_size;
-                }
+            // io_uring batch: read small files directly into slot memory.
+            // Large files (> slice_size) use the sequential path.
+            const BATCH_SIZE: usize = 64;
 
-                let f = match File::open(path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        log::warn!("[reader] open {} failed: {}", path.display(), e);
-                        continue;
+            let mut ring = IoUring::new(BATCH_SIZE as u32)
+                .expect("io_uring init failed");
+
+            struct BatchEntry {
+                file_index: usize,
+                size: usize,
+                skip: bool,
+                wants_meta: bool,
+            }
+
+            let mut batch: Vec<BatchEntry> = Vec::with_capacity(BATCH_SIZE);
+            let mut batch_fds: Vec<File> = Vec::with_capacity(BATCH_SIZE);
+
+            let mut file_iter = all_files.iter().enumerate().peekable();
+
+            while file_iter.peek().is_some() {
+                // ── Collect small files that fit in current slot ─────────────
+                batch.clear();
+                batch_fds.clear();
+
+                // Ensure we have a slot.
+                ensure_room(&pool, &tx_slice, &mut cur, 1);
+
+                let mut batch_total: usize = 0;
+
+                while let Some(&(file_index, path)) = file_iter.peek() {
+                    let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                    let small = file_size <= slice_size as u64 && file_size > 0;
+
+                    if !small {
+                        break; // non-batchable → handle below
                     }
-                };
-                let mut rdr = BufReader::new(f);
-                let mut fdata_offset = 0u64;
-                let mut chunk_seq = 0u32;
+                    if batch.len() >= BATCH_SIZE {
+                        break; // ring full
+                    }
 
-                // Check if plugin wants this file (before reading data).
-                let wants_meta = plugin_ref
-                    .map(|r| r.matches(&path.strip_prefix(&input_dir)
-                        .unwrap_or(path).to_string_lossy()))
-                    .unwrap_or(false);
+                    let avail = cur.as_ref().unwrap().remaining();
+                    if batch_total + file_size as usize > avail {
+                        break; // won't fit in this slot
+                    }
 
-                // Empty file → one zero-length slice so it appears in the index.
-                if file_size == 0 {
-                    ensure_room(&pool, &tx_slice, &mut cur, 0);
-                    let fill = cur.as_mut().unwrap();
-                    fill.commit_slice(0, skip, file_index as u64, 0, 0);
-                    continue;
-                }
+                    file_iter.next();
 
-                let mut remaining = file_size;
-                // Small file (≤ slice_size) is NEVER split: read it whole as one slice.
-                // Big file is cut into slice_size logs (may spill across slots).
-                let small = file_size <= slice_size as u64;
-                while remaining > 0 {
-                    let want = if small {
-                        file_size as usize
+                    let skip = !no_skip && should_skip_compression(path);
+                    if skip {
+                        uncompressed_files += 1;
+                        uncompressed_bytes += file_size;
                     } else {
-                        slice_size.min(remaining as usize)
-                    };
-                    ensure_room(&pool, &tx_slice, &mut cur, want);
-                    let fill = cur.as_mut().unwrap();
-                    let buf = fill.writable(want);
-                    let got = match read_fully(&mut rdr, buf) {
-                        Ok(g) => g,
+                        compressed_files += 1;
+                        compressed_bytes += file_size;
+                    }
+
+                    let wants_meta = plugin_ref
+                        .map(|r| r.matches(&path.strip_prefix(&input_dir)
+                            .unwrap_or(path).to_string_lossy()))
+                        .unwrap_or(false);
+
+                    let f = match File::open(path) {
+                        Ok(f) => f,
                         Err(e) => {
-                            log::warn!("[reader] read {} failed: {}", path.display(), e);
-                            break;
+                            log::warn!("[reader] open {} failed: {}", path.display(), e);
+                            continue;
                         }
                     };
-                    if got == 0 {
-                        break;
+
+                    batch.push(BatchEntry {
+                        file_index,
+                        size: file_size as usize,
+                        skip,
+                        wants_meta,
+                    });
+                    batch_fds.push(f);
+                    batch_total += file_size as usize;
+                }
+
+                // ── Submit batch reads directly into slot memory ─────────────
+                if !batch.is_empty() {
+                    let fill = cur.as_mut().unwrap();
+
+                    // Pre-allocate positions: get pointers for each file in sequence.
+                    let mut ptrs: Vec<*mut u8> = Vec::with_capacity(batch.len());
+                    for entry in &batch {
+                        let buf = fill.writable(entry.size);
+                        ptrs.push(buf.as_mut_ptr());
+                        // Advance cursor by committing a placeholder (we'll have
+                        // the data after io_uring completes — slot memory is ours).
+                        fill.commit_slice(entry.size, entry.skip, entry.file_index as u64, 0, 0);
                     }
 
-                    // Inline plugin extraction: for small files the entire content is
-                    // in this single slice — extract metadata directly from slot memory.
-                    // No double-read, no extra allocation.
-                    if wants_meta && small && chunk_seq == 0 {
-                        let rel = path.strip_prefix(&input_dir)
-                            .unwrap_or(path).to_string_lossy();
-                        if let Some(reg) = plugin_ref {
-                            if let Some(row) = reg.extract(&rel, &buf[..got]) {
-                                tx_meta.send((file_index, Some((reg.type_id().unwrap_or(0), row)))).ok();
+                    // Submit all reads pointing to slot memory positions.
+                    {
+                        let mut sq = ring.submission();
+                        for (i, entry) in batch.iter().enumerate() {
+                            let fd = types::Fd(batch_fds[i].as_raw_fd());
+                            let read_op = opcode::Read::new(fd, ptrs[i], entry.size as u32)
+                                .offset(0)
+                                .build()
+                                .user_data(i as u64);
+                            unsafe { sq.push(&read_op).ok(); }
+                        }
+                    }
+                    ring.submit_and_wait(batch.len()).ok();
+
+                    // Drain completions.
+                    let mut completed = 0;
+                    while completed < batch.len() {
+                        for cqe in ring.completion() {
+                            let i = cqe.user_data() as usize;
+                            if cqe.result() < 0 {
+                                log::warn!("[reader] io_uring read failed for file_index {}",
+                                    batch[i].file_index);
+                            }
+                            completed += 1;
+                        }
+                    }
+
+                    // Inline plugin extraction (data is now in slot memory).
+                    for (i, entry) in batch.iter().enumerate() {
+                        if entry.wants_meta {
+                            let data = unsafe {
+                                std::slice::from_raw_parts(ptrs[i] as *const u8, entry.size)
+                            };
+                            let path = &all_files[entry.file_index];
+                            let rel = path.strip_prefix(&input_dir)
+                                .unwrap_or(path).to_string_lossy();
+                            if let Some(reg) = plugin_ref {
+                                if let Some(row) = reg.extract(&rel, data) {
+                                    tx_meta.send((entry.file_index, Some((reg.type_id().unwrap_or(0), row)))).ok();
+                                }
                             }
                         }
                     }
-
-                    fill.commit_slice(got, skip, file_index as u64, fdata_offset, chunk_seq);
-                    fdata_offset += got as u64;
-                    chunk_seq += 1;
-                    remaining = remaining.saturating_sub(got as u64);
-                    if got < want {
-                        break; // short read = EOF
-                    }
                 }
 
-                // Fallback: big files that were sliced — re-read for metadata (rare).
-                if wants_meta && !small {
-                    if let Some(reg) = plugin_ref {
-                        let rel = path.strip_prefix(&input_dir)
-                            .unwrap_or(path).to_string_lossy();
-                        if let Ok(data) = std::fs::read(path) {
-                            if let Some(row) = reg.extract(&rel, &data) {
-                                tx_meta.send((file_index, Some((reg.type_id().unwrap_or(0), row)))).ok();
+                // ── Handle non-batchable files (empty or large) ─────────────
+                while let Some(&(file_index, path)) = file_iter.peek() {
+                    let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                    let small = file_size <= slice_size as u64 && file_size > 0;
+
+                    if small {
+                        break; // back to batch mode
+                    }
+
+                    file_iter.next();
+
+                    let skip = !no_skip && should_skip_compression(path);
+                    if skip {
+                        uncompressed_files += 1;
+                        uncompressed_bytes += file_size;
+                    } else {
+                        compressed_files += 1;
+                        compressed_bytes += file_size;
+                    }
+
+                    // Empty file.
+                    if file_size == 0 {
+                        ensure_room(&pool, &tx_slice, &mut cur, 0);
+                        let fill = cur.as_mut().unwrap();
+                        fill.commit_slice(0, skip, file_index as u64, 0, 0);
+                        continue;
+                    }
+
+                    // Large file: sequential chunked reads.
+                    let f = match File::open(path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            log::warn!("[reader] open {} failed: {}", path.display(), e);
+                            continue;
+                        }
+                    };
+                    let mut rdr = BufReader::new(f);
+                    let mut fdata_offset = 0u64;
+                    let mut chunk_seq = 0u32;
+                    let mut remaining = file_size;
+
+                    let wants_meta = plugin_ref
+                        .map(|r| r.matches(&path.strip_prefix(&input_dir)
+                            .unwrap_or(path).to_string_lossy()))
+                        .unwrap_or(false);
+
+                    while remaining > 0 {
+                        let want = slice_size.min(remaining as usize);
+                        ensure_room(&pool, &tx_slice, &mut cur, want);
+                        let fill = cur.as_mut().unwrap();
+                        let buf = fill.writable(want);
+                        let got = match read_fully(&mut rdr, buf) {
+                            Ok(g) => g,
+                            Err(e) => {
+                                log::warn!("[reader] read {} failed: {}", path.display(), e);
+                                break;
+                            }
+                        };
+                        if got == 0 { break; }
+                        fill.commit_slice(got, skip, file_index as u64, fdata_offset, chunk_seq);
+                        fdata_offset += got as u64;
+                        chunk_seq += 1;
+                        remaining = remaining.saturating_sub(got as u64);
+                        if got < want { break; }
+                    }
+
+                    // Fallback metadata for large files.
+                    if wants_meta {
+                        if let Some(reg) = plugin_ref {
+                            let rel = path.strip_prefix(&input_dir)
+                                .unwrap_or(path).to_string_lossy();
+                            if let Ok(data) = std::fs::read(path) {
+                                if let Some(row) = reg.extract(&rel, &data) {
+                                    tx_meta.send((file_index, Some((reg.type_id().unwrap_or(0), row)))).ok();
+                                }
                             }
                         }
                     }
