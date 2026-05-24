@@ -20,7 +20,7 @@ znippy-compress = { version = "0.7.2" }
 #znippy-compress = { path = "../znippy-compress" }
 znippy-decompress = { version = "0.7.2" }
 #znippy-decompress = { path ="../znippy-decompress" }
-znippy-common = { version = "0.7.2", features = ["host-decompressors", "wasm-plugins"] }
+znippy-common = { version = "0.7.3", features = ["host-decompressors", "wasm-plugins"] }
 #znippy-common = { path ="../znippy-common" }
 znippy-plugin-maven = { version = "0.7.2", path = "../znippy-plugin-maven", features = ["host-decompressors"] }
 env_logger = { version = "0.11.8" }
