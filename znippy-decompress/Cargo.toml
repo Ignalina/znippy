@@ -15,5 +15,5 @@ default = []
 
 [dependencies]
 anyhow = "1.0.100"
-znippy-common = { version = "0.7.3" }
+znippy-common = { version = "0.7.4" }
 #znippy-common = { path = "../znippy-common" }

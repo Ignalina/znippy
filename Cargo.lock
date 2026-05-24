@@ -3487,7 +3487,7 @@ dependencies = [
 
 [[package]]
 name = "znippy-common"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "arrow",
