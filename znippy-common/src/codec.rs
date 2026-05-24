@@ -56,14 +56,25 @@ impl CompressCtx {
 }
 
 pub fn decompress_frame(compressed: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    decompress_into(compressed, &mut out)?;
+    Ok(out)
+}
+
+/// Decompress into a reusable buffer; returns bytes written (`out` is truncated
+/// to that). Reuse the same `out` across chunks to keep the decompress path
+/// allocation-free (the no-hot-path-alloc rule).
+pub fn decompress_into(compressed: &[u8], out: &mut Vec<u8>) -> Result<usize> {
     use openzl_sys_rs::*;
     let decompressed_size = zl_get_decompressed_size(compressed)
         .map_err(|e| anyhow!("OpenZL getDecompressedSize: {}", e))?;
-    let mut output = vec![0u8; decompressed_size];
-    let written = zl_decompress(&mut output, compressed)
+    if out.len() < decompressed_size {
+        out.resize(decompressed_size, 0);
+    }
+    let written = zl_decompress(&mut out[..decompressed_size], compressed)
         .map_err(|e| anyhow!("OpenZL decompress: {}", e))?;
-    output.truncate(written);
-    Ok(output)
+    out.truncate(written);
+    Ok(written)
 }
 
 #[cfg(test)]
