@@ -1,27 +1,21 @@
-//! No-barrier slice pipeline (TODO_NOW.md "THE FINAL SOLUTION 2026").
+//! Two-pass directory compression.
 //!
-//! River model: one reader pours files into shared 200 MB slots; small files
-//! coalesce bow-to-stern (1 file = 1 slice), big files are cut into slice-size
-//! logs spilling across slots. All workers pull slices off ONE global queue and
-//! never wait for a slot to finish. Each worker compresses (if needed), stamps
-//! BLAKE3 over the ORIGINAL bytes, pwrites the payload at a reserved offset, and
-//! releases the slot. The finalizer builds the arrow-ipc index from metadata
-//! only — no payload ever crosses a channel.
+//! Pass 1 — BIG files (> slice_size): sequential chunked reads, metadata by re-reading file.
+//! Pass 2 — SMALL files (≤ slice_size): read into slot, metadata from in-memory data.
 //!
-//! This is the directory-compression entry point (`compress_dir`).
+//! Arrow IPC index is written incrementally — each pass writes its batch as soon as it finishes.
+//! No accumulation, no merge.
 
 use anyhow::{Result, anyhow};
 use crossbeam_channel::bounded;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::os::unix::fs::FileExt;
-use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use walkdir::WalkDir;
-use io_uring::{IoUring, opcode, types};
 
 use znippy_common::common_config::CONFIG;
 use znippy_common::index::{
@@ -32,14 +26,9 @@ use znippy_common::meta::{BlobMeta, ChunkMeta};
 use znippy_common::slotpool::Magazine;
 use znippy_common::CompressionReport;
 
-/// Slot buffer size. Big enough that the single reader stays ahead of the cores.
 const SLOT_SIZE: usize = 200 * 1024 * 1024;
-/// Read-ahead depth: number of slots the reader can fill before the cores drain.
 const NUM_SLOTS: usize = 8;
 
-/// A fired round handed from a barrel to the writer. Carries either the
-/// compressed output buffer (recycled after pwrite) or, for the skip path, a
-/// pointer into the slot (the writer pwrites it zero-copy, then frees the slot).
 struct WriteJob {
     buf: Option<Vec<u8>>,
     ptr: *const u8,
@@ -53,12 +42,8 @@ struct WriteJob {
     compressed: bool,
     uncompressed_size: u64,
 }
-// Safety: `ptr` (skip path) addresses slot memory that stays live until the
-// writer calls `release_one` after the pwrite — the reader's reclaim-all barrier
-// guarantees no job outlives its slot.
 unsafe impl Send for WriteJob {}
 
-/// Read until `buf` is full or EOF; returns bytes read (< buf.len() only at EOF).
 fn read_fully<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
@@ -96,455 +81,110 @@ pub fn compress_dir(
     );
     let total_files = all_files.len() as u64;
 
-    // Plugin metadata is now extracted INLINE during the reader loop (zero-copy
-    // from the slot buffer). No separate pre-pass, no double read.
-    // For files larger than slice_size (rare), we fall back to a separate fs::read.
     let ext_fields: Vec<znippy_common::arrow::datatypes::Field> =
         plugin.map(|r| r.schema_fields()).unwrap_or_default();
 
-    // Channel for inline metadata extraction results from the reader thread.
-    // The reader extracts metadata while data is in the slot buffer (no double read).
-    let (tx_meta, rx_meta) = bounded::<(usize, FileExtMeta)>(256);
-
     let output_path = output.with_extension("znippy");
     let file = Arc::new(File::create(&output_path)?);
-    let out_cursor = Arc::new(AtomicU64::new(0)); // blob region starts at 0
+    let out_cursor = Arc::new(AtomicU64::new(0));
 
     let num_workers = CONFIG.max_core_in_flight.max(1);
-    let pool = Magazine::new(NUM_SLOTS, SLOT_SIZE, num_workers);
-    let slice_size = pool.slice_size();
-    let returner = pool.returner();
+    let slice_size = SLOT_SIZE / num_workers.max(1);
 
-    // The current (reader→barrels) and the write belt (barrels→writer).
-    let (tx_slice, rx_slice) = bounded(NUM_SLOTS * 4);
-    let (tx_write, rx_write) = bounded::<WriteJob>(num_workers * 4);
-    // Recycled compressed-output buffers: the writer returns each after pwrite,
-    // so the compress path never allocates per round.
-    let (free_bufs_tx, free_bufs_rx) = bounded::<Vec<u8>>(num_workers * 4);
-    for _ in 0..num_workers * 4 {
-        free_bufs_tx.send(Vec::new()).ok();
-    }
-
-    // ── READER: the single source ───────────────────────────────────────────
-    // SAFETY: plugin outlives reader_thread (we join it before returning from compress_dir).
-    // We pass the plugin as a usize (pointer cast) to satisfy Send requirements.
-    let plugin_addr: usize = plugin.map(|p| p as *const _ as usize).unwrap_or(0);
-
-    let reader_thread = {
-        let all_files = Arc::clone(&all_files);
-        let input_dir = input_dir.clone();
-        thread::spawn(move || -> (u64, u64, u64, u64) {
-            let plugin_ref: Option<&znippy_common::plugin::PluginRegistry> = if plugin_addr != 0 {
-                Some(unsafe { &*(plugin_addr as *const znippy_common::plugin::PluginRegistry) })
-            } else {
-                None
-            };
-            let mut uncompressed_files = 0u64;
-            let mut uncompressed_bytes = 0u64;
-            let mut compressed_files = 0u64;
-            let mut compressed_bytes = 0u64;
-
-            let mut cur = None;
-
-            // io_uring batch: read small files directly into slot memory.
-            // Large files (> slice_size) use the sequential path.
-            const BATCH_SIZE: usize = 64;
-
-            let mut ring = IoUring::new(BATCH_SIZE as u32)
-                .expect("io_uring init failed");
-
-            struct BatchEntry {
-                file_index: usize,
-                size: usize,
-                skip: bool,
-                wants_meta: bool,
-            }
-
-            let mut batch: Vec<BatchEntry> = Vec::with_capacity(BATCH_SIZE);
-            let mut batch_fds: Vec<File> = Vec::with_capacity(BATCH_SIZE);
-
-            let mut file_iter = all_files.iter().enumerate().peekable();
-
-            while file_iter.peek().is_some() {
-                // ── Collect small files that fit in current slot ─────────────
-                batch.clear();
-                batch_fds.clear();
-
-                // Ensure we have a slot.
-                ensure_room(&pool, &tx_slice, &mut cur, 1);
-
-                let mut batch_total: usize = 0;
-
-                while let Some(&(file_index, path)) = file_iter.peek() {
-                    let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
-                    let small = file_size <= slice_size as u64 && file_size > 0;
-
-                    if !small {
-                        break; // non-batchable → handle below
-                    }
-                    if batch.len() >= BATCH_SIZE {
-                        break; // ring full
-                    }
-
-                    let avail = cur.as_ref().unwrap().remaining();
-                    if batch_total + file_size as usize > avail {
-                        break; // won't fit in this slot
-                    }
-
-                    file_iter.next();
-
-                    let skip = !no_skip && should_skip_compression(path);
-                    if skip {
-                        uncompressed_files += 1;
-                        uncompressed_bytes += file_size;
-                    } else {
-                        compressed_files += 1;
-                        compressed_bytes += file_size;
-                    }
-
-                    let wants_meta = plugin_ref
-                        .map(|r| r.matches(&path.strip_prefix(&input_dir)
-                            .unwrap_or(path).to_string_lossy()))
-                        .unwrap_or(false);
-
-                    let f = match File::open(path) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            log::warn!("[reader] open {} failed: {}", path.display(), e);
-                            continue;
-                        }
-                    };
-
-                    batch.push(BatchEntry {
-                        file_index,
-                        size: file_size as usize,
-                        skip,
-                        wants_meta,
-                    });
-                    batch_fds.push(f);
-                    batch_total += file_size as usize;
-                }
-
-                // ── Submit batch reads directly into slot memory ─────────────
-                if !batch.is_empty() {
-                    let fill = cur.as_mut().unwrap();
-
-                    // Pre-allocate positions: get pointers for each file in sequence.
-                    let mut ptrs: Vec<*mut u8> = Vec::with_capacity(batch.len());
-                    for entry in &batch {
-                        let buf = fill.writable(entry.size);
-                        ptrs.push(buf.as_mut_ptr());
-                        // Advance cursor by committing a placeholder (we'll have
-                        // the data after io_uring completes — slot memory is ours).
-                        fill.commit_slice(entry.size, entry.skip, entry.file_index as u64, 0, 0);
-                    }
-
-                    // Submit all reads pointing to slot memory positions.
-                    {
-                        let mut sq = ring.submission();
-                        for (i, entry) in batch.iter().enumerate() {
-                            let fd = types::Fd(batch_fds[i].as_raw_fd());
-                            let read_op = opcode::Read::new(fd, ptrs[i], entry.size as u32)
-                                .offset(0)
-                                .build()
-                                .user_data(i as u64);
-                            unsafe { sq.push(&read_op).ok(); }
-                        }
-                    }
-                    ring.submit_and_wait(batch.len()).ok();
-
-                    // Drain completions.
-                    let mut completed = 0;
-                    while completed < batch.len() {
-                        for cqe in ring.completion() {
-                            let i = cqe.user_data() as usize;
-                            if cqe.result() < 0 {
-                                log::warn!("[reader] io_uring read failed for file_index {}",
-                                    batch[i].file_index);
-                            }
-                            completed += 1;
-                        }
-                    }
-
-                    // Inline plugin extraction (data is now in slot memory).
-                    for (i, entry) in batch.iter().enumerate() {
-                        if entry.wants_meta {
-                            let data = unsafe {
-                                std::slice::from_raw_parts(ptrs[i] as *const u8, entry.size)
-                            };
-                            let path = &all_files[entry.file_index];
-                            let rel = path.strip_prefix(&input_dir)
-                                .unwrap_or(path).to_string_lossy();
-                            if let Some(reg) = plugin_ref {
-                                if let Some(row) = reg.extract(&rel, data) {
-                                    tx_meta.send((entry.file_index, Some((reg.type_id().unwrap_or(0), row)))).ok();
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // ── Handle non-batchable files (empty or large) ─────────────
-                while let Some(&(file_index, path)) = file_iter.peek() {
-                    let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
-                    let small = file_size <= slice_size as u64 && file_size > 0;
-
-                    if small {
-                        break; // back to batch mode
-                    }
-
-                    file_iter.next();
-
-                    let skip = !no_skip && should_skip_compression(path);
-                    if skip {
-                        uncompressed_files += 1;
-                        uncompressed_bytes += file_size;
-                    } else {
-                        compressed_files += 1;
-                        compressed_bytes += file_size;
-                    }
-
-                    // Empty file.
-                    if file_size == 0 {
-                        ensure_room(&pool, &tx_slice, &mut cur, 0);
-                        let fill = cur.as_mut().unwrap();
-                        fill.commit_slice(0, skip, file_index as u64, 0, 0);
-                        continue;
-                    }
-
-                    // Large file: sequential chunked reads.
-                    let f = match File::open(path) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            log::warn!("[reader] open {} failed: {}", path.display(), e);
-                            continue;
-                        }
-                    };
-                    let mut rdr = BufReader::new(f);
-                    let mut fdata_offset = 0u64;
-                    let mut chunk_seq = 0u32;
-                    let mut remaining = file_size;
-
-                    let wants_meta = plugin_ref
-                        .map(|r| r.matches(&path.strip_prefix(&input_dir)
-                            .unwrap_or(path).to_string_lossy()))
-                        .unwrap_or(false);
-
-                    while remaining > 0 {
-                        let want = slice_size.min(remaining as usize);
-                        ensure_room(&pool, &tx_slice, &mut cur, want);
-                        let fill = cur.as_mut().unwrap();
-                        let buf = fill.writable(want);
-                        let got = match read_fully(&mut rdr, buf) {
-                            Ok(g) => g,
-                            Err(e) => {
-                                log::warn!("[reader] read {} failed: {}", path.display(), e);
-                                break;
-                            }
-                        };
-                        if got == 0 { break; }
-                        fill.commit_slice(got, skip, file_index as u64, fdata_offset, chunk_seq);
-                        fdata_offset += got as u64;
-                        chunk_seq += 1;
-                        remaining = remaining.saturating_sub(got as u64);
-                        if got < want { break; }
-                    }
-
-                    // Fallback metadata for large files.
-                    if wants_meta {
-                        if let Some(reg) = plugin_ref {
-                            let rel = path.strip_prefix(&input_dir)
-                                .unwrap_or(path).to_string_lossy();
-                            if let Ok(data) = std::fs::read(path) {
-                                if let Some(row) = reg.extract(&rel, &data) {
-                                    tx_meta.send((file_index, Some((reg.type_id().unwrap_or(0), row)))).ok();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Publish the last partial slot.
-            if let Some(fill) = cur.take() {
-                for s in fill.publish() {
-                    tx_slice.send(s).ok();
-                }
-            }
-
-            // Wait for the pipeline to fully drain: reclaiming every slot proves all
-            // slices were processed AND released, so the pool memory is safe to drop.
-            for _ in 0..pool.num_slots() {
-                if pool.claim().is_none() {
-                    break;
-                }
-            }
-
-            // Dropping tx_slice here lets the workers exit once the queue empties.
-            drop(tx_slice);
-            drop(tx_meta);
-            drop(pool);
-
-            (uncompressed_files, uncompressed_bytes, compressed_files, compressed_bytes)
-        })
-    };
-
-    // ── BARRELS: compress (or skip) and toss to the writer — never wait on I/O ─
-    let mut workers = Vec::with_capacity(num_workers);
-    for _ in 0..num_workers {
-        let rx_slice = rx_slice.clone();
-        let tx_write = tx_write.clone();
-        let free_bufs_rx = free_bufs_rx.clone();
-        let returner = returner.clone();
-        let level = CONFIG.compression_level;
-        workers.push(thread::spawn(move || -> Result<()> {
-            let mut cctx = znippy_common::codec::CompressCtx::new(level)?;
-            while let Ok(slice) = rx_slice.recv() {
-                // Safety: slot stays live until release_one (compress: here; skip: writer).
-                let src = unsafe { slice.as_slice() };
-                let checksum = *blake3::hash(src).as_bytes(); // ORIGINAL bytes, pre-compression
-                if slice.skip {
-                    // Hand the slot bytes to the writer; it frees the slot after pwrite.
-                    tx_write
-                        .send(WriteJob {
-                            buf: None,
-                            ptr: src.as_ptr(),
-                            on_disk_len: src.len(),
-                            slot_id: slice.slot_id,
-                            release_slot: true,
-                            file_index: slice.file_index,
-                            fdata_offset: slice.fdata_offset,
-                            chunk_seq: slice.chunk_seq,
-                            checksum,
-                            compressed: false,
-                            uncompressed_size: src.len() as u64,
-                        })
-                        .ok();
-                } else {
-                    let mut buf = free_bufs_rx.recv().unwrap_or_default();
-                    let n = cctx.compress_into(src, &mut buf)?;
-                    let uncompressed_size = src.len() as u64;
-                    returner.release_one(slice.slot_id); // input consumed → free slot now
-                    tx_write
-                        .send(WriteJob {
-                            buf: Some(buf),
-                            ptr: std::ptr::null(),
-                            on_disk_len: n,
-                            slot_id: 0,
-                            release_slot: false,
-                            file_index: slice.file_index,
-                            fdata_offset: slice.fdata_offset,
-                            chunk_seq: slice.chunk_seq,
-                            checksum,
-                            compressed: true,
-                            uncompressed_size,
-                        })
-                        .ok();
-                }
-            }
-            Ok(())
-        }));
-    }
-
-    // ── WRITER: one worker that only fires bytes at the disk ────────────────────
-    let writer_thread = {
-        let file = Arc::clone(&file);
-        let out_cursor = Arc::clone(&out_cursor);
-        let returner = returner.clone();
-        thread::spawn(move || -> Result<Vec<BlobMeta>> {
-            let mut all_blobs: Vec<BlobMeta> = Vec::new();
-            while let Ok(job) = rx_write.recv() {
-                let off = out_cursor.fetch_add(job.on_disk_len as u64, Ordering::Relaxed);
-                match job.buf {
-                    Some(mut buf) => {
-                        file.write_all_at(&buf[..job.on_disk_len], off)?;
-                        buf.clear();
-                        free_bufs_tx.send(buf).ok(); // recycle for a barrel
-                    }
-                    None => {
-                        // Safety: slot is live until we release it just below.
-                        let bytes =
-                            unsafe { std::slice::from_raw_parts(job.ptr, job.on_disk_len) };
-                        file.write_all_at(bytes, off)?;
-                        if job.release_slot {
-                            returner.release_one(job.slot_id);
-                        }
-                    }
-                }
-                all_blobs.push(BlobMeta {
-                    chunk_meta: ChunkMeta {
-                        fdata_offset: job.fdata_offset,
-                        file_index: job.file_index,
-                        chunk_seq: job.chunk_seq,
-                        checksum: job.checksum,
-                        compressed: job.compressed,
-                        uncompressed_size: job.uncompressed_size,
-                        compressed_size: job.on_disk_len as u64,
-                    },
-                    blob_offset: off,
-                    blob_size: job.on_disk_len as u64,
-                });
-            }
-            Ok(all_blobs)
-        })
-    };
-
-    // Drop main's handles so the belts close when reader/barrels/writer finish.
-    // (tx_slice moved into the reader; free_bufs_tx moved into the writer.)
-    drop(tx_write);
-    drop(rx_slice);
-    drop(free_bufs_rx);
-
-    // ── FINALIZER (main): join, then build the index from metadata only ─────────
-    let (uncompressed_files, uncompressed_bytes, compressed_files, compressed_bytes) =
-        reader_thread.join().map_err(|_| anyhow!("reader panicked"))?;
-    for w in workers {
-        w.join().map_err(|_| anyhow!("barrel panicked"))??;
-    }
-    let mut all_blobs = writer_thread.join().map_err(|_| anyhow!("writer panicked"))??;
-
-    // Collect inline-extracted metadata from the reader thread channel.
-    let mut ext_meta: Vec<FileExtMeta> = vec![None; all_files.len()];
-    while let Ok((idx, meta)) = rx_meta.try_recv() {
-        if idx < ext_meta.len() {
-            ext_meta[idx] = meta;
+    // ── PARTITION ────────────────────────────────────────────────────────────
+    let mut big_indices: Vec<usize> = Vec::new();
+    let mut small_indices: Vec<usize> = Vec::new();
+    for (i, path) in all_files.iter().enumerate() {
+        let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+        if size > slice_size as u64 || size == 0 {
+            big_indices.push(i);
+        } else {
+            small_indices.push(i);
         }
     }
 
-    // Stable index order (out-of-order completion is fine on disk; index is sorted).
-    all_blobs.sort_by_key(|b| (b.chunk_meta.file_index, b.chunk_meta.chunk_seq));
+    let mut ext_meta: Vec<FileExtMeta> = vec![None; all_files.len()];
+    let mut uncompressed_files = 0u64;
+    let mut uncompressed_bytes = 0u64;
+    let mut compressed_files = 0u64;
+    let mut compressed_bytes = 0u64;
+    let mut total_chunks = 0u64;
+    let mut row_count = 0u64;
 
-    let total_chunks = all_blobs.len() as u64;
-    let index_offset = out_cursor.load(Ordering::Relaxed); // end of blob region
-    let blob_bytes = index_offset;
-
-    let input_dir_for_paths = input_dir.clone();
-    let all_files_for_paths = Arc::clone(&all_files);
-    let path_resolver = |file_index: u64| {
-        let idx = file_index as usize;
-        all_files_for_paths[idx]
-            .strip_prefix(&input_dir_for_paths)
-            .unwrap_or(&all_files_for_paths[idx])
-            .to_string_lossy()
-            .to_string()
-    };
-
+    // Arrow IPC StreamWriter — stays open across both passes.
     use arrow::ipc::writer::StreamWriter;
-    let row_count = all_blobs.len() as u64;
-    let batch = build_metadata_batch(&all_blobs, path_resolver, &ext_meta, &ext_fields)
-        .map_err(|e| anyhow!("build index batch: {e}"))?;
     let meta_map = build_arrow_metadata_for_config(&CONFIG);
     let composed = compose_index_schema(&ext_fields);
     let schema_with_meta =
         arrow::datatypes::Schema::new_with_metadata(composed.fields().to_vec(), meta_map);
-    let mut sub_bytes: Vec<u8> = Vec::new();
-    let mut sw = StreamWriter::try_new(&mut sub_bytes, &schema_with_meta)
+    let mut index_buf: Vec<u8> = Vec::new();
+    let mut sw = StreamWriter::try_new(&mut index_buf, &schema_with_meta)
         .map_err(|e| anyhow!("index writer: {e}"))?;
-    sw.write(&batch).map_err(|e| anyhow!("index write: {e}"))?;
+
+    let input_dir_for_paths = input_dir.clone();
+    let all_files_for_paths = Arc::clone(&all_files);
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASS 1: BIG FILES
+    // ══════════════════════════════════════════════════════════════════════════
+    if !big_indices.is_empty() {
+        let (uf, ub, cf, cb, blobs, meta) = run_big_pass(
+            &all_files, input_dir, &big_indices, no_skip, plugin,
+            &file, &out_cursor, num_workers,
+        )?;
+        uncompressed_files += uf; uncompressed_bytes += ub;
+        compressed_files += cf; compressed_bytes += cb;
+        for (idx, m) in meta { if idx < ext_meta.len() { ext_meta[idx] = m; } }
+
+        total_chunks += blobs.len() as u64;
+        row_count += blobs.len() as u64;
+        let all_f = Arc::clone(&all_files_for_paths);
+        let inp = input_dir_for_paths.clone();
+        let resolver = |file_index: u64| {
+            let idx = file_index as usize;
+            all_f[idx].strip_prefix(&inp).unwrap_or(&all_f[idx])
+                .to_string_lossy().to_string()
+        };
+        let batch = build_metadata_batch(&blobs, resolver, &ext_meta, &ext_fields)
+            .map_err(|e| anyhow!("big index batch: {e}"))?;
+        sw.write(&batch).map_err(|e| anyhow!("big index write: {e}"))?;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PASS 2: SMALL FILES
+    // ══════════════════════════════════════════════════════════════════════════
+    if !small_indices.is_empty() {
+        let (uf, ub, cf, cb, blobs, meta) = run_small_pass(
+            &all_files, input_dir, &small_indices, no_skip, plugin,
+            &file, &out_cursor, num_workers, slice_size,
+        )?;
+        uncompressed_files += uf; uncompressed_bytes += ub;
+        compressed_files += cf; compressed_bytes += cb;
+        for (idx, m) in meta { if idx < ext_meta.len() { ext_meta[idx] = m; } }
+
+        total_chunks += blobs.len() as u64;
+        row_count += blobs.len() as u64;
+        let all_f = Arc::clone(&all_files_for_paths);
+        let inp = input_dir_for_paths.clone();
+        let resolver = |file_index: u64| {
+            let idx = file_index as usize;
+            all_f[idx].strip_prefix(&inp).unwrap_or(&all_f[idx])
+                .to_string_lossy().to_string()
+        };
+        let batch = build_metadata_batch(&blobs, resolver, &ext_meta, &ext_fields)
+            .map_err(|e| anyhow!("small index batch: {e}"))?;
+        sw.write(&batch).map_err(|e| anyhow!("small index write: {e}"))?;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // FINALIZE: flush index buffer to disk
+    // ══════════════════════════════════════════════════════════════════════════
     sw.finish().map_err(|e| anyhow!("index finish: {e}"))?;
 
-    let sub_len = sub_bytes.len() as u64;
-    file.write_all_at(&sub_bytes, index_offset)?;
+    let index_offset = out_cursor.load(Ordering::Relaxed);
+    let blob_bytes = index_offset;
+    let sub_len = index_buf.len() as u64;
+    file.write_all_at(&index_buf, index_offset)?;
 
     let manifest_offset = index_offset + sub_len;
     let pkg_type_val: i8 = plugin.and_then(|r| r.type_id()).unwrap_or(0);
@@ -568,13 +208,7 @@ pub fn compress_dir(
     )?;
     file.sync_all()?;
 
-    let total_bytes_out =
-        after_manifest + MULTI_INDEX_MAGIC.len() as u64 + 8;
-
-    log::info!(
-        "[slot_packer] {} chunks, {} blob bytes, manifest at {}",
-        total_chunks, blob_bytes, manifest_offset
-    );
+    let total_bytes_out = after_manifest + MULTI_INDEX_MAGIC.len() as u64 + 8;
 
     Ok(CompressionReport {
         total_files,
@@ -594,8 +228,311 @@ pub fn compress_dir(
     })
 }
 
-/// Ensure `cur` is a claimed slot with at least `need` bytes free; publish &
-/// re-claim when full. `need` is always ≤ SLOT_SIZE, so a fresh slot fits it.
+// ─────────────────────────────────────────────────────────────────────────────
+// PASS 1: big files — sequential chunked reads, re-read for metadata
+// ─────────────────────────────────────────────────────────────────────────────
+fn run_big_pass(
+    all_files: &Arc<Vec<PathBuf>>,
+    input_dir: &PathBuf,
+    big_indices: &[usize],
+    no_skip: bool,
+    plugin: Option<&znippy_common::plugin::PluginRegistry>,
+    file: &Arc<File>,
+    out_cursor: &Arc<AtomicU64>,
+    num_workers: usize,
+) -> Result<(u64, u64, u64, u64, Vec<BlobMeta>, Vec<(usize, FileExtMeta)>)> {
+    let pool = Magazine::new(NUM_SLOTS, SLOT_SIZE, num_workers);
+    let returner = pool.returner();
+    let (tx_slice, rx_slice) = bounded(NUM_SLOTS * 4);
+    let (tx_write, rx_write) = bounded::<WriteJob>(num_workers * 4);
+    let (free_bufs_tx, free_bufs_rx) = bounded::<Vec<u8>>(num_workers * 4);
+    for _ in 0..num_workers * 4 { free_bufs_tx.send(Vec::new()).ok(); }
+    let (tx_meta, rx_meta) = bounded::<(usize, FileExtMeta)>(256);
+
+    let plugin_addr: usize = plugin.map(|p| p as *const _ as usize).unwrap_or(0);
+
+    let reader = {
+        let all_files = Arc::clone(all_files);
+        let input_dir = input_dir.clone();
+        let big_indices = big_indices.to_vec();
+        let tx_meta = tx_meta.clone();
+        thread::spawn(move || -> (u64, u64, u64, u64) {
+            let plugin_ref: Option<&znippy_common::plugin::PluginRegistry> =
+                if plugin_addr != 0 { Some(unsafe { &*(plugin_addr as *const _) }) } else { None };
+
+            let mut uf = 0u64; let mut ub = 0u64;
+            let mut cf = 0u64; let mut cb = 0u64;
+            let mut cur = None;
+            let ss = pool.slice_size();
+
+            for &file_index in &big_indices {
+                let path = &all_files[file_index];
+                let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                let skip = !no_skip && should_skip_compression(path);
+                if skip { uf += 1; ub += file_size; } else { cf += 1; cb += file_size; }
+
+                if file_size == 0 {
+                    ensure_room(&pool, &tx_slice, &mut cur, 0);
+                    cur.as_mut().unwrap().commit_slice(0, skip, file_index as u64, 0, 0);
+                    continue;
+                }
+
+                let f = match File::open(path) {
+                    Ok(f) => f,
+                    Err(e) => { log::warn!("[big] open {}: {}", path.display(), e); continue; }
+                };
+                let mut rdr = BufReader::new(f);
+                let mut fdata_offset = 0u64;
+                let mut chunk_seq = 0u32;
+                let mut remaining = file_size;
+
+                while remaining > 0 {
+                    let want = ss.min(remaining as usize);
+                    ensure_room(&pool, &tx_slice, &mut cur, want);
+                    let fill = cur.as_mut().unwrap();
+                    let buf = fill.writable(want);
+                    let got = match read_fully(&mut rdr, buf) {
+                        Ok(g) => g,
+                        Err(e) => { log::warn!("[big] read {}: {}", path.display(), e); break; }
+                    };
+                    if got == 0 { break; }
+                    fill.commit_slice(got, skip, file_index as u64, fdata_offset, chunk_seq);
+                    fdata_offset += got as u64;
+                    chunk_seq += 1;
+                    remaining = remaining.saturating_sub(got as u64);
+                    if got < want { break; }
+                }
+
+                // Big file metadata: re-read the file (acceptable for large files).
+                if let Some(reg) = plugin_ref {
+                    let rel = path.strip_prefix(&input_dir).unwrap_or(path).to_string_lossy();
+                    if reg.matches(&rel) {
+                        if let Ok(data) = std::fs::read(path) {
+                            if let Some(row) = reg.extract(&rel, &data) {
+                                tx_meta.send((file_index, Some((reg.type_id().unwrap_or(0), row)))).ok();
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(fill) = cur.take() {
+                for s in fill.publish() { tx_slice.send(s).ok(); }
+            }
+
+            // Drain: reclaim all slots to prove workers/writer are done with slot memory.
+            for _ in 0..NUM_SLOTS {
+                if pool.claim().is_none() { break; }
+            }
+
+            drop(tx_slice);
+            drop(tx_meta);
+            drop(pool);
+            (uf, ub, cf, cb)
+        })
+    };
+
+    let workers = spawn_workers(num_workers, rx_slice.clone(), tx_write.clone(), free_bufs_rx.clone(), returner.clone());
+    let writer = spawn_writer(Arc::clone(file), Arc::clone(out_cursor), returner.clone(), rx_write, free_bufs_tx);
+
+    drop(tx_write); drop(rx_slice); drop(free_bufs_rx); drop(tx_meta);
+
+    let (uf, ub, cf, cb) = reader.join().map_err(|_| anyhow!("big reader panicked"))?;
+    for w in workers { w.join().map_err(|_| anyhow!("big worker panicked"))??; }
+    let blobs = writer.join().map_err(|_| anyhow!("big writer panicked"))??;
+
+    let mut meta = Vec::new();
+    while let Ok(m) = rx_meta.try_recv() { meta.push(m); }
+
+    Ok((uf, ub, cf, cb, blobs, meta))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PASS 2: small files — read into slot, metadata from in-memory data
+// ─────────────────────────────────────────────────────────────────────────────
+fn run_small_pass(
+    all_files: &Arc<Vec<PathBuf>>,
+    input_dir: &PathBuf,
+    small_indices: &[usize],
+    no_skip: bool,
+    plugin: Option<&znippy_common::plugin::PluginRegistry>,
+    file: &Arc<File>,
+    out_cursor: &Arc<AtomicU64>,
+    num_workers: usize,
+    _slice_size: usize,
+) -> Result<(u64, u64, u64, u64, Vec<BlobMeta>, Vec<(usize, FileExtMeta)>)> {
+    let pool = Magazine::new(NUM_SLOTS, SLOT_SIZE, num_workers);
+    let returner = pool.returner();
+    let (tx_slice, rx_slice) = bounded(NUM_SLOTS * 4);
+    let (tx_write, rx_write) = bounded::<WriteJob>(num_workers * 4);
+    let (free_bufs_tx, free_bufs_rx) = bounded::<Vec<u8>>(num_workers * 4);
+    for _ in 0..num_workers * 4 { free_bufs_tx.send(Vec::new()).ok(); }
+    let (tx_meta, rx_meta) = bounded::<(usize, FileExtMeta)>(256);
+
+    let plugin_addr: usize = plugin.map(|p| p as *const _ as usize).unwrap_or(0);
+
+    let reader = {
+        let all_files = Arc::clone(all_files);
+        let input_dir = input_dir.clone();
+        let small_indices = small_indices.to_vec();
+        let tx_meta = tx_meta.clone();
+        thread::spawn(move || -> (u64, u64, u64, u64) {
+            let plugin_ref: Option<&znippy_common::plugin::PluginRegistry> =
+                if plugin_addr != 0 { Some(unsafe { &*(plugin_addr as *const _) }) } else { None };
+
+            let mut uf = 0u64; let mut ub = 0u64;
+            let mut cf = 0u64; let mut cb = 0u64;
+            let mut cur = None;
+
+            for &file_index in &small_indices {
+                let path = &all_files[file_index];
+                let file_size = path.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+                let skip = !no_skip && should_skip_compression(path);
+                if skip { uf += 1; ub += file_size as u64; }
+                else { cf += 1; cb += file_size as u64; }
+
+                // Ensure slot has room for this file.
+                ensure_room(&pool, &tx_slice, &mut cur, file_size);
+                let fill = cur.as_mut().unwrap();
+
+                // Read directly into slot buffer.
+                let buf = fill.writable(file_size);
+                let got = match File::open(path).and_then(|mut f| read_fully(&mut f, buf)) {
+                    Ok(g) => g,
+                    Err(e) => { log::warn!("[small] read {}: {}", path.display(), e); continue; }
+                };
+
+                // Inline metadata extraction — data is right here in memory.
+                if let Some(reg) = plugin_ref {
+                    let rel = path.strip_prefix(&input_dir).unwrap_or(path).to_string_lossy();
+                    if reg.matches(&rel) {
+                        let data = &buf[..got];
+                        if let Some(row) = reg.extract(&rel, data) {
+                            tx_meta.send((file_index, Some((reg.type_id().unwrap_or(0), row)))).ok();
+                        }
+                    }
+                }
+
+                fill.commit_slice(got, skip, file_index as u64, 0, 0);
+            }
+
+            if let Some(fill) = cur.take() {
+                for s in fill.publish() { tx_slice.send(s).ok(); }
+            }
+
+            // Drain: reclaim all slots to prove workers/writer are done with slot memory.
+            for _ in 0..NUM_SLOTS {
+                if pool.claim().is_none() { break; }
+            }
+
+            drop(tx_slice);
+            drop(tx_meta);
+            drop(pool);
+            (uf, ub, cf, cb)
+        })
+    };
+
+    let workers = spawn_workers(num_workers, rx_slice.clone(), tx_write.clone(), free_bufs_rx.clone(), returner.clone());
+    let writer = spawn_writer(Arc::clone(file), Arc::clone(out_cursor), returner.clone(), rx_write, free_bufs_tx);
+
+    drop(tx_write); drop(rx_slice); drop(free_bufs_rx); drop(tx_meta);
+
+    let (uf, ub, cf, cb) = reader.join().map_err(|_| anyhow!("small reader panicked"))?;
+    for w in workers { w.join().map_err(|_| anyhow!("small worker panicked"))??; }
+    let blobs = writer.join().map_err(|_| anyhow!("small writer panicked"))??;
+
+    let mut meta = Vec::new();
+    while let Ok(m) = rx_meta.try_recv() { meta.push(m); }
+
+    Ok((uf, ub, cf, cb, blobs, meta))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn spawn_workers(
+    num_workers: usize,
+    rx_slice: crossbeam_channel::Receiver<znippy_common::slotpool::Round>,
+    tx_write: crossbeam_channel::Sender<WriteJob>,
+    free_bufs_rx: crossbeam_channel::Receiver<Vec<u8>>,
+    returner: znippy_common::slotpool::Ejector,
+) -> Vec<thread::JoinHandle<Result<()>>> {
+    let level = CONFIG.compression_level;
+    (0..num_workers).map(|_| {
+        let rx = rx_slice.clone();
+        let tw = tx_write.clone();
+        let fb = free_bufs_rx.clone();
+        let ret = returner.clone();
+        thread::spawn(move || -> Result<()> {
+            let mut cctx = znippy_common::codec::CompressCtx::new(level)?;
+            while let Ok(slice) = rx.recv() {
+                let src = unsafe { slice.as_slice() };
+                let checksum = *blake3::hash(src).as_bytes();
+                if slice.skip {
+                    tw.send(WriteJob {
+                        buf: None, ptr: src.as_ptr(), on_disk_len: src.len(),
+                        slot_id: slice.slot_id, release_slot: true,
+                        file_index: slice.file_index, fdata_offset: slice.fdata_offset,
+                        chunk_seq: slice.chunk_seq, checksum, compressed: false,
+                        uncompressed_size: src.len() as u64,
+                    }).ok();
+                } else {
+                    let mut buf = fb.recv().unwrap_or_default();
+                    let n = cctx.compress_into(src, &mut buf)?;
+                    let usz = src.len() as u64;
+                    ret.release_one(slice.slot_id);
+                    tw.send(WriteJob {
+                        buf: Some(buf), ptr: std::ptr::null(), on_disk_len: n,
+                        slot_id: 0, release_slot: false,
+                        file_index: slice.file_index, fdata_offset: slice.fdata_offset,
+                        chunk_seq: slice.chunk_seq, checksum, compressed: true,
+                        uncompressed_size: usz,
+                    }).ok();
+                }
+            }
+            Ok(())
+        })
+    }).collect()
+}
+
+fn spawn_writer(
+    file: Arc<File>,
+    out_cursor: Arc<AtomicU64>,
+    returner: znippy_common::slotpool::Ejector,
+    rx_write: crossbeam_channel::Receiver<WriteJob>,
+    free_bufs_tx: crossbeam_channel::Sender<Vec<u8>>,
+) -> thread::JoinHandle<Result<Vec<BlobMeta>>> {
+    thread::spawn(move || -> Result<Vec<BlobMeta>> {
+        let mut blobs = Vec::new();
+        while let Ok(job) = rx_write.recv() {
+            let off = out_cursor.fetch_add(job.on_disk_len as u64, Ordering::Relaxed);
+            match job.buf {
+                Some(mut buf) => {
+                    file.write_all_at(&buf[..job.on_disk_len], off)?;
+                    buf.clear();
+                    free_bufs_tx.send(buf).ok();
+                }
+                None => {
+                    let bytes = unsafe { std::slice::from_raw_parts(job.ptr, job.on_disk_len) };
+                    file.write_all_at(bytes, off)?;
+                    if job.release_slot { returner.release_one(job.slot_id); }
+                }
+            }
+            blobs.push(BlobMeta {
+                chunk_meta: ChunkMeta {
+                    fdata_offset: job.fdata_offset, file_index: job.file_index,
+                    chunk_seq: job.chunk_seq, checksum: job.checksum,
+                    compressed: job.compressed, uncompressed_size: job.uncompressed_size,
+                    compressed_size: job.on_disk_len as u64,
+                },
+                blob_offset: off, blob_size: job.on_disk_len as u64,
+            });
+        }
+        Ok(blobs)
+    })
+}
+
 fn ensure_room<'p>(
     pool: &'p Magazine,
     tx_slice: &crossbeam_channel::Sender<znippy_common::slotpool::Round>,
@@ -605,16 +542,10 @@ fn ensure_room<'p>(
     loop {
         if cur.is_none() {
             *cur = pool.claim();
-            if cur.is_none() {
-                return; // pool shut down
-            }
+            if cur.is_none() { return; }
         }
-        if cur.as_ref().unwrap().remaining() >= need {
-            return;
-        }
+        if cur.as_ref().unwrap().remaining() >= need { return; }
         let slices = cur.take().unwrap().publish();
-        for s in slices {
-            tx_slice.send(s).ok();
-        }
+        for s in slices { tx_slice.send(s).ok(); }
     }
 }
