@@ -3,18 +3,31 @@ claude --resume 2d931445-8071-4c0e-a350-9a94e9fa5a14
 
 ---
 
-## ⏯ RESUME HERE (paused 2026-05-24 session 2)
+## ⏯ RESUME HERE (paused 2026-05-24 session 3)
 
-DONE session 2 (all GREEN, 21 integration + 5 common tests pass):
-- decompress.rs READ path migrated off ChunkRevolver onto Magazine/Gatling model.
-  Reader: pread (read_exact_at, no seek) blobs into 200 MB slots. Workers: decompress
-  (or zero-copy skip), blake3 verify, pwrite to pre-created output files at fdata_offset.
-  No per-thread ring routing. Drain loop in reader = memory-safety barrier (mirrors
-  slot_packer.rs write path exactly).
-- ChunkRevolver + int_ring DELETED from znippy-common (chunkrevolver.rs, int_ring.rs,
-  tests/test.rs). LARGE_SIZE=128 inlined in common_config.rs. strategic_config_mini
-  (never used) removed. Serde imports cleaned up. znippy-common now has 0 import warnings.
-- NEXT: parallel file opens (tiny-file reader bottleneck), P2 bench cols, benchmarks.
+DONE session 3 (all GREEN, 21 integration + 5 common tests pass; pushed):
+- READ path REWRITTEN to N-worker positioned I/O (commit 2985eb4). Dropped Magazine
+  on read entirely. N workers (max_core_in_flight) share ONE atomic row cursor; each:
+  fetch_add(row) -> pread(blob_offset) -> decompress_into(reused buf) / skip ->
+  blake3 verify -> pwrite(fdata_offset). No reader thread, no channel, no slots, no
+  drain, NO UNSAFE. codec::decompress_into added (per-worker buffer reuse, no per-chunk
+  alloc). Rationale: read input is random-access (index has every offset), so a single
+  Magazine reader was a needless bottleneck — parallel pread gives NVMe real queue depth.
+- Decompress MB/s (Magazine -> N-worker): mixed_repo 2335->6310 (2.7x, the realistic
+  holger mixed/skip workload), random_500mb 2146->2890, 100k_small_files 1687->1832.
+  Tiny-archive cases (text/single, 9000x ratio) within noise — CPU/output-bound, not read-bound.
+- Random-access extract_file (archive.rs) verified WORKING + untouched (separate module).
+- WRITE path confirmed maxed (plumbing done; gated by zstd L19, not the machine).
+  random_500mb compress ~104 MB/s is L19-on-incompressible; fix = store-if-incompressible
+  (write-path, deferred), NOT a global level drop.
+
+NEXT (read-side, optional — diminishing returns):
+- #4 parallel/lazy output-file opens: pre-create is serial today. Could help 100k_small_files
+  IF files span many dirs (one big dir serializes on dir lock). Needs rayon/dashmap dep or
+  hand-rolled threads. SPECULATIVE — measure first.
+- #6 extract_file (archive.rs): allocates per chunk + reopens archive per call. For
+  artifact-serving: keep one fd, pread, reuse decompress_into. Certain win for that path.
+- Earlier session-1 follow-ups: P2 bench cols (file count + cores), store-if-incompressible.
 
 DONE session 1 (all GREEN, build + 21 integration + slotpool/common tests pass):
 - Gatling pipeline IS the compressor. `compress_dir` = slot_packer.rs, `compress_stream`

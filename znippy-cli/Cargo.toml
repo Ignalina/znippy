@@ -1,6 +1,6 @@
 [package]
 name = "znippy-cli"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 authors = ["Rickard Lundin <rickard@ignalina.dk>"]
 description = "CLI for Znippy, a parallel chunked compression system."
@@ -16,11 +16,11 @@ default = []
 [dependencies]
 clap = { version = "4.5.51", features = ["derive"] }
 anyhow = { version = "1.0.100" }
-znippy-compress = { version = "0.7.1" }
+znippy-compress = { version = "0.7.2" }
 #znippy-compress = { path = "../znippy-compress" }
-znippy-decompress = { version = "0.7.1" }
+znippy-decompress = { version = "0.7.2" }
 #znippy-decompress = { path ="../znippy-decompress" }
-znippy-common = { version = "0.7.1", features = ["host-decompressors", "wasm-plugins"] }
+znippy-common = { version = "0.7.2", features = ["host-decompressors", "wasm-plugins"] }
 #znippy-common = { path ="../znippy-common" }
-znippy-plugin-maven = { version = "0.7.1", path = "../znippy-plugin-maven", features = ["host-decompressors"] }
+znippy-plugin-maven = { version = "0.7.2", path = "../znippy-plugin-maven", features = ["host-decompressors"] }
 env_logger = { version = "0.11.8" }

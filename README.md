@@ -6,18 +6,18 @@
 High-performance archive format with per-file compression, parallel processing, and random access.
 Built on **Apache Arrow IPC** + **OpenZL** (zstd+lz4 under the hood).
 
-## Benchmarks (v0.7 Gatling pipeline, release)
+## Benchmarks (v0.7.2 Gatling pipeline, release — 32 cores)
 
-| Test | In | Out | Ratio | Compress | Decompress |
-|------|-----|-----|-------|----------|------------|
-| text 500MB | 500 MB | 0.06 MB | 9014x | 1,656 MB/s | 1,707 MB/s |
-| binary pattern 500MB | 500 MB | 0.07 MB | 7338x | 2,370 MB/s | 1,754 MB/s |
-| random (incompressible) 500MB | 500 MB | 500 MB | 1.0x | 102 MB/s | 1,786 MB/s |
-| 100k small files (10KB) | 977 MB | 17.4 MB | 56.2x | 4,321 MB/s | 661 MB/s |
-| mixed repo 530MB | 530 MB | 530 MB | 1.0x | 2,850 MB/s | 1,738 MB/s |
-| single file 2GB | 2,048 MB | 0.22 MB | 9509x | 6,077 MB/s | 1,874 MB/s |
+| Test | In | Out | Ratio | Compress | Decompress | Files |
+|------|-----|-----|-------|----------|------------|-------|
+| text 500MB | 500 MB | 0.06 MB | 9014x | 1,639 MB/s | 2,874 MB/s | 1 |
+| binary pattern 500MB | 500 MB | 0.07 MB | 7338x | 2,242 MB/s | 2,976 MB/s | 1 |
+| random (incompressible) 500MB | 500 MB | 500 MB | 1.0x | 105 MB/s | 2,890 MB/s | 1 |
+| 100k small files (10KB) | 977 MB | 17.4 MB | 56.2x | 4,811 MB/s | 1,957 MB/s | 100,000 |
+| mixed repo 530MB | 530 MB | 530 MB | 1.0x | 3,118 MB/s | 6,310 MB/s | 6 |
+| single file 2GB | 2,048 MB | 0.22 MB | 9509x | 5,802 MB/s | 3,066 MB/s | 1 |
 
-Already-compressed files (.jar, .gz, .crate, etc.) are stored as-is at full write speed (skip path). Random/incompressible data is measured at openzl encoding cost. Decompression still uses the legacy read path — migrating it to the Gatling model is the next perf step.
+Both compress and decompress run the no-barrier Gatling pipeline across all cores. Already-compressed files (.jar, .gz, .crate, .png, .parquet, etc.) match the skip-extension list and are stored/restored as-is at full I/O speed — they never touch the codec. The `random 500MB` row uses a `.bin` path that is *not* in the skip list, so it is forced through openzl level-19 on incompressible data; it measures worst-case encoder cost, not a real-world path.
 
 ## Architecture — v0.7 Multi-Index Format
 
@@ -41,7 +41,7 @@ Blobs are written as produced (true streaming, no buffering). After all blobs fi
       │
       ▼
   ┌─────────────────┐
-  │  Split chunks   │  (ChunkRevolver ring buffer)
+  │  Split slices   │  (shared Magazine slots, 200 MB each)
   └────────┬────────┘
            │
      ┌─────┼─────┐        parallel across all cores
@@ -82,36 +82,39 @@ The writer thread runs concurrently alongside compressor threads — compressors
 
 ### Decompression pipeline
 
+The read path has no reader/writer split: every chunk in the index is
+independent work. N worker threads share one atomic row cursor; each grabs the
+next chunk and runs it end to end with positioned I/O (`pread`/`pwrite`), so
+parallel reads give the NVMe real queue depth and there is no central
+bottleneck.
+
 ```
   archive.znippy
       │
       └── read 16-byte footer → seek to manifest → read sub-indexes
       │
       ▼
-  ┌──────────────────────────┐
-  │ Reader Thread            │  seeks to blob_offset for each chunk
-  │ (blob_offset, blob_size) │
-  └──────────┬───────────────┘
-             │
-       ┌─────┼─────┐        parallel across all cores
-       ▼     ▼     ▼
-    ┌─────┐┌─────┐┌─────┐
-    │OpenZL││OpenZL││OpenZL│  decompress (or passthrough if stored raw)
-    └──┬───┘└──┬───┘└──┬───┘
-       │       │       │
-       ▼       ▼       ▼
-    ┌────────────────────────┐
-    │ Writer Thread          │  write restored files to disk
-    │ + Verify threads       │  BLAKE3 per checksum group
-    └────────────────────────┘
+   one atomic row cursor  ── fetch_add ──▶  N workers (all cores)
+                                              │
+        ┌─────────────────────────────────────┼─────────────────────┐
+        ▼                                     ▼                       ▼
+  ┌───────────────┐                    ┌───────────────┐      ┌───────────────┐
+  │ pread blob    │  positioned read   │ pread blob    │      │ pread blob    │
+  │ OpenZL / skip │  (reused buffers)  │ OpenZL / skip │ ...  │ OpenZL / skip │
+  │ blake3 verify │  per-chunk         │ blake3 verify │      │ blake3 verify │
+  │ pwrite output │  @ fdata_offset    │ pwrite output │      │ pwrite output │
+  └───────────────┘                    └───────────────┘      └───────────────┘
 ```
+
+No channel, no Magazine slots, no drain barrier, no `unsafe` — each worker owns
+its read/decompress buffers and reuses them across chunks.
 
 ## Features
 
-- **Parallel compression**: fan-out to all physical cores via ChunkRevolver ring buffer
+- **Parallel compression**: one global slice queue over shared Magazine slots; all cores pull work with no per-slot barrier
 - **Concurrent writer**: blobs written to disk as produced, never blocking compressors
-- **Blake3 checksums**: per-group integrity stored as Arrow column
-- **Random access**: `ZnippyArchive::extract_file` seeks directly to each chunk's blob offset
+- **Blake3 checksums**: per-chunk integrity stored as an Arrow column, verified on read
+- **Random access**: `ZnippyArchive::extract_file` preads each chunk's blob from a shared fd (safe under concurrent calls)
 - **Skip detection**: already-compressed files stored as-is at full write speed
 - **Multi-index format**: one Arrow IPC sub-index per `(pkg_type, repo)` group; Arrow IPC manifest
 - **Arrow IPC index**: full metadata queryable by DuckDB, Polars, pyarrow after parsing footer
@@ -207,7 +210,8 @@ cargo test --release -p znippy-tests --test perf_bench -- --ignored --nocapture
 - **v0.4.0**: Single-file format (Arrow IPC with inline zdata column), OpenZL backend, plugin system
 - **v0.5.0**: Dual-pipeline architecture, DuckDB/Polars queryable, zero-copy skip path
 - **v0.6.0**: Streaming format — blobs first, Arrow index last, 8-byte footer; true zero-buffer writes
-- **v0.7.0** (current): Multi-index container — one Arrow IPC sub-index per `(pkg_type, repo)` group; Arrow IPC manifest; 16-byte footer; module-owned schema; WASM plugin `plugin_schema` export
+- **v0.7.0**: Multi-index container — one Arrow IPC sub-index per `(pkg_type, repo)` group; Arrow IPC manifest; 16-byte footer; module-owned schema; WASM plugin `plugin_schema` export
+- **v0.7.2** (current): No-barrier Gatling pipeline on both paths — write via shared Magazine slots, read via N-worker positioned I/O; per-chunk blake3; ChunkRevolver removed
 - **v0.8.0** Iceberg support
 
 🧙 May Odin watch over every bit. 🧙

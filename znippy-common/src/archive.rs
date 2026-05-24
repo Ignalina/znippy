@@ -5,8 +5,9 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::FileExt;
+use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use arrow::record_batch::RecordBatch;
@@ -35,10 +36,12 @@ struct FileEntry {
     chunks: Vec<ChunkInfo>,
 }
 
-/// A znippy archive opened for random-access reads (v0.6 format).
-/// Loads only the Arrow IPC index on open; blobs are read on demand by seeking.
+/// A znippy archive opened for random-access reads.
+/// Loads only the Arrow IPC index on open; blobs are pread on demand. The
+/// archive fd is shared (`Arc<File>`) and read via positioned I/O, so
+/// `extract_file` is safe to call concurrently from many threads.
 pub struct ZnippyArchive {
-    archive_path: PathBuf,
+    archive: Arc<File>,
     file_index: HashMap<String, FileEntry>,
 }
 
@@ -46,8 +49,9 @@ impl ZnippyArchive {
     pub fn open(path: &Path) -> Result<Self> {
         let (_, batches) = read_znippy_index(path)?;
         let file_index = Self::build_file_index(&batches)?;
+        let archive = Arc::new(File::open(path)?);
         Ok(Self {
-            archive_path: path.to_path_buf(),
+            archive,
             file_index,
         })
     }
@@ -138,17 +142,18 @@ impl ZnippyReader for ZnippyArchive {
             .get(relative_path)
             .ok_or_else(|| anyhow!("file not found in archive: {}", relative_path))?;
 
-        let mut file = File::open(&self.archive_path)?;
         let mut result = Vec::with_capacity(entry.uncompressed_size as usize);
+        let mut blob = Vec::new(); // reused across chunks
+        let mut decomp = Vec::new(); // reused across compressed chunks
 
         for chunk in &entry.chunks {
-            file.seek(SeekFrom::Start(chunk.blob_offset))?;
-            let mut blob = vec![0u8; chunk.blob_size as usize];
-            file.read_exact(&mut blob)?;
+            blob.resize(chunk.blob_size as usize, 0);
+            // Positioned read — no shared seek, safe under concurrent calls.
+            self.archive.read_exact_at(&mut blob, chunk.blob_offset)?;
 
             if chunk.compressed {
-                let decompressed = codec::decompress_frame(&blob)?;
-                result.extend_from_slice(&decompressed);
+                codec::decompress_into(&blob, &mut decomp)?;
+                result.extend_from_slice(&decomp);
             } else {
                 result.extend_from_slice(&blob);
             }

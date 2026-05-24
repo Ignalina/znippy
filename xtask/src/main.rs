@@ -6,6 +6,9 @@ struct BenchEntry {
     name: String,
     compress_mbs: f64,
     decompress_mbs: f64,
+    /// Artifact (file) count for this case. Optional so older history lines parse.
+    #[serde(default)]
+    files: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -15,6 +18,10 @@ struct BenchRun {
     /// history lines (kept as test/baseline data) still parse — they read as "".
     #[serde(default)]
     version: String,
+    /// Logical core count of the machine that produced the run. Optional for
+    /// back-compat with pre-cores history lines (read as 0).
+    #[serde(default)]
+    cores: usize,
     results: Vec<BenchEntry>,
 }
 
@@ -113,7 +120,8 @@ fn check_and_record(tmp_file: &str, history_file: &str) {
     }
 
     // Append new run to history
-    let new_run = BenchRun { date: today(), version: znippy_version(), results: current };
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+    let new_run = BenchRun { date: today(), version: znippy_version(), cores, results: current };
     let line = serde_json::to_string(&new_run).expect("serialize bench run");
     let mut content = history_raw;
     if !content.is_empty() && !content.ends_with('\n') {

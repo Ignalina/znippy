@@ -35,6 +35,7 @@ impl BenchResult {
 
 fn bench_roundtrip(label: &str, entries: Vec<ArchiveEntry>) -> Result<BenchResult> {
     let input_size: u64 = entries.iter().map(|e| e.data.len() as u64).sum();
+    let file_count = entries.len();
 
     let out_dir = TempDir::new()?;
     let archive_path = out_dir.path().join("bench.znippy");
@@ -63,7 +64,7 @@ fn bench_roundtrip(label: &str, entries: Vec<ArchiveEntry>) -> Result<BenchResul
         output_size,
         compress_ms,
         decompress_ms,
-        file_count: 0,
+        file_count,
         compressed_files: report.compressed_files,
         skipped_files: report.uncompressed_files,
         chunks: report.chunks,
@@ -193,19 +194,20 @@ fn perf_benchmark_suite() -> Result<()> {
     )?);
 
     // Print results
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
     println!("\n=============================================================================================================");
-    println!("ZNIPPY PERFORMANCE BENCHMARK (OpenZL backend)");
+    println!("ZNIPPY PERFORMANCE BENCHMARK (OpenZL backend) — {} cores", cores);
     println!("=============================================================================================================");
     println!(
-        "{:<25} {:>8} {:>8} {:>6} {:>10} {:>10} {:>8} {:>8} {:>8} {:>8}",
+        "{:<25} {:>8} {:>8} {:>6} {:>10} {:>10} {:>8} {:>8} {:>8} {:>8} {:>8}",
         "Test", "In(MB)", "Out(MB)", "Ratio", "Comp MB/s", "Dec MB/s",
-        "Comp ms", "Dec ms", "Chunks", "Skipped"
+        "Comp ms", "Dec ms", "Chunks", "Files", "Skipped"
     );
-    println!("{:-<109}", "");
+    println!("{:-<118}", "");
 
     for r in &results {
         println!(
-            "{:<25} {:>8.2} {:>8.2} {:>6.2}x {:>9.1} {:>9.1} {:>8} {:>8} {:>8} {:>8}",
+            "{:<25} {:>8.2} {:>8.2} {:>6.2}x {:>9.1} {:>9.1} {:>8} {:>8} {:>8} {:>8} {:>8}",
             r.label,
             r.input_size as f64 / (1024.0 * 1024.0),
             r.output_size as f64 / (1024.0 * 1024.0),
@@ -215,15 +217,16 @@ fn perf_benchmark_suite() -> Result<()> {
             r.compress_ms,
             r.decompress_ms,
             r.chunks,
+            r.file_count,
             r.skipped_files,
         );
     }
     println!();
 
-    // Dump for xtask regression tracking
+    // Dump for xtask regression tracking (per-entry file count; cores added by xtask).
     let entries: Vec<String> = results.iter().map(|r| {
-        format!(r#"{{"name":"{}","compress_mbs":{:.1},"decompress_mbs":{:.1}}}"#,
-            r.label, r.compress_speed_mbs(), r.decompress_speed_mbs())
+        format!(r#"{{"name":"{}","compress_mbs":{:.1},"decompress_mbs":{:.1},"files":{}}}"#,
+            r.label, r.compress_speed_mbs(), r.decompress_speed_mbs(), r.file_count)
     }).collect();
     let _ = std::fs::write("/tmp/znippy_bench_last.json", format!("[{}]", entries.join(",")));
 
