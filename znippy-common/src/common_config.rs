@@ -1,7 +1,5 @@
-use crate::int_ring::MINI_SIZE;
-use crate::{ChunkQueue, RingBuffer, int_ring};
 use once_cell::sync::Lazy;
-use std::cmp::{max, min};
+use std::cmp::min;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 impl StrategicConfig {
@@ -41,7 +39,7 @@ pub fn strategic_config(resource: f32) -> StrategicConfig {
     let file_split_block_size = 10 * 1024 * 1024;
     let zstd_output_buffer_size = 1 * 1024 * 1024;
 
-    let mut max_chunks: u32 = (max_mem_allowed / file_split_block_size) as u32;
+    let max_chunks: u32 = (max_mem_allowed / file_split_block_size) as u32;
 
     log::info!(
         "[strategic_config] Detekterade {} kärnor och {} MiB minne",
@@ -64,29 +62,11 @@ pub fn strategic_config(resource: f32) -> StrategicConfig {
     sc
 }
 
-fn strategic_config_mini() -> StrategicConfig {
-    let mut sc = strategic_config(0.5);
-
-    // Downscale to mini
-    sc.max_chunks = min(sc.max_chunks as u64, int_ring::MINI_SIZE as u64) as u32;
-    sc.max_core_in_flight = min(sc.max_chunks as usize, sc.max_core_in_flight);
-    // TODO could add extra cores to zstd .. i guess.
-
-    log::info!(
-        "[strategic_config mini]  max_core_in_flight={}  max_core_in_compress for zstd {} max_chunks {} ",
-        sc.max_core_in_flight,
-        sc.max_core_in_compress,
-        sc.max_chunks
-    );
-    log_strategic_conf(&sc);
-    sc
-}
-
 fn strategic_confi_large() -> StrategicConfig {
     let mut sc = strategic_config(1.0);
 
-    // scale to large
-    sc.max_chunks = min(sc.max_chunks as u64, int_ring::LARGE_SIZE as u64) as u32;
+    // Cap at the legacy LARGE_SIZE (128 slots × 10 MB) — stored in archive metadata for compat.
+    sc.max_chunks = min(sc.max_chunks as u64, 128) as u32;
     log::info!(
         "[strategic_config large]  max_core_in_flight={}  max_core_in_compress for zstd {} max_chunks {} ",
         sc.max_core_in_flight,

@@ -8,11 +8,6 @@ pub mod codec;
 pub mod common_config;
 pub mod index;
 pub mod archive;
-mod int_ring;
-pub use int_ring::{ChunkQueue, RingBuffer};
-
-pub mod chunkrevolver;
-pub use chunkrevolver::{ChunkRevolver, get_chunk_slice, split_into_microchunks};
 
 pub mod slotpool;
 
@@ -21,8 +16,6 @@ pub use meta::{BlobMeta, ChunkMeta, FileMeta};
 
 pub mod plugin;
 pub mod plugins;
-
-use serde::{Deserialize, Serialize};
 
 pub mod decompress;
 mod skip;

@@ -3528,6 +3528,7 @@ dependencies = [
  "ljar",
  "miniz_oxide 0.8.9",
  "quick-xml",
+ "rayon",
  "ureq",
  "znippy-common",
 ]
