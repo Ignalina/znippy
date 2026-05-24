@@ -33,6 +33,6 @@ arrow = "58.3.0"
 arrow-array = "58.3.0"
 arrow-select = "58.3.0"
 crossbeam-channel = "0.5.15"
-ljar = { version = "0.1.0", optional = true }
+ljar = { version = "0.2.0", optional = true }
 lbzip2 = { version = "0.4.2", optional = true }
 lgz = { version = "0.2.0", optional = true }

@@ -1562,9 +1562,9 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "ljar"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6644fb69b336f4b9aff77e24874616a9d82f8a3e715375cdd5914010f3c485d5"
+checksum = "fbbaa9fc2385f7907c1a1c62bc8aa0305edb43745f73f8103e9015cec1e74bc5"
 dependencies = [
  "linflate",
  "rayon",
@@ -1575,6 +1575,16 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "lzip-parallel"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aed8e7306c02943273c6aad09c52fc7cd5de97aa1c24f9c30aa76d4b31ea19c1"
+dependencies = [
+ "linflate",
+ "rayon",
+]
 
 [[package]]
 name = "mach2"
@@ -3530,6 +3540,16 @@ dependencies = [
  "quick-xml",
  "rayon",
  "ureq",
+ "znippy-common",
+]
+
+[[package]]
+name = "znippy-plugin-python"
+version = "0.7.2"
+dependencies = [
+ "lzip-parallel",
+ "miniz_oxide 0.8.9",
+ "rayon",
  "znippy-common",
 ]
 

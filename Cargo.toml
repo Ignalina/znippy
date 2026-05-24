@@ -7,6 +7,7 @@ members = [
     "znippy-common",
     "znippy",
     "znippy-plugin-maven",
+    "znippy-plugin-python",
     "tests",
     "xtask",
 ]
