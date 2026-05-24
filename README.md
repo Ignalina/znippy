@@ -161,46 +161,47 @@ Single-core linflate is 3.7× faster than miniz_oxide. lgz is fully parallelized
 
 ## Testing & Benchmarks
 
-### Unit and integration tests (fast, no network)
+### Before publishing a crate — run everything
 
 ```bash
-# All quick tests — 20 integration tests covering format round-trips, v0.7 manifest, multi-index
+cargo xtask
+```
+
+This runs in order:
+1. `cargo test --workspace` — all unit + integration tests
+2. Synthetic performance suite (release build) — text, binary, random, 100k small files, mixed repo, 2 GB single file
+3. Maven plugin tests — correctness + native vs fallback throughput comparison
+4. Regression gate — fails if any benchmark drops >20% vs the last recorded run
+
+To also run the real-world network benchmarks (downloads ~1 GB on first run, cached to `/tmp/znippy-bench-cache/`):
+
+```bash
+cargo xtask -- --real
+```
+
+---
+
+### Run just the tests (no benchmarks, fast)
+
+```bash
 cargo test --workspace
-
-# Maven plugin unit tests
-cargo test -p znippy-tests --test maven_bench
 ```
 
-### Synthetic performance benchmarks
+Covers format round-trips, manifest, multi-index, Maven plugin correctness, and throughput benchmarks.
+
+---
+
+### Run individual suites
 
 ```bash
-# Synthetic suite: text, binary, random, 100k small files, mixed repo, 2GB single file
+# Synthetic performance suite only (release)
 cargo test --release -p znippy-tests --test perf_bench perf_benchmark_suite -- --nocapture
-```
 
-### Real-world benchmarks (network + disk, run explicitly)
+# Maven plugin tests only (correctness + throughput)
+cargo test --release -p znippy-tests --test maven_bench -- --nocapture
 
-These download real artifacts on first run and cache them in `/tmp/znippy-bench-cache/`.
-
-```bash
-# Rust crates from crates.io (downloads ~200 MB on first run)
-cargo test --release -p znippy-tests --test perf_bench perf_real_rust_crates -- --ignored --nocapture
-
-# Rust dependency tree (41k files, ~1 GB — slow: small-file overhead)
-cargo test --release -p znippy-tests --test perf_bench perf_real_rust_deps -- --ignored --nocapture
-
-# Java JARs from Maven Central
-cargo test --release -p znippy-tests --test perf_bench perf_real_java_deps -- --ignored --nocapture
-
-# Run all real-world benchmarks at once
+# Real-world benchmarks (network, explicit)
 cargo test --release -p znippy-tests --test perf_bench -- --ignored --nocapture
-```
-
-### Maven plugin benchmarks
-
-```bash
-# Compare native vs fallback GAV extraction throughput
-cargo test --release -p znippy-tests --test maven_bench -- --ignored --nocapture
 ```
 
 ## Roadmap

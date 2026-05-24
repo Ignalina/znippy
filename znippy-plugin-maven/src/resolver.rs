@@ -114,7 +114,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore] // requires network
     fn test_resolve_guava_transitive() {
         let pom = br#"<project>
     <modelVersion>4.0.0</modelVersion>

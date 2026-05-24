@@ -555,7 +555,6 @@ fn decompress_zip_entry(data: &[u8], offset: usize, compression: u16, comp_size:
 }
 
 #[test]
-#[ignore]
 #[cfg(feature = "resolve")]
 fn perf_real_java_deps() -> Result<()> {
     let java_dir = prepare_java_deps();
@@ -595,7 +594,6 @@ fn perf_real_java_deps() -> Result<()> {
 /// Benchmark .crate files from the local cargo registry cache.
 /// These are .tar.gz internally and should be skipped by compression.
 #[test]
-#[ignore]
 fn perf_real_rust_crates() -> Result<()> {
     let cache_dir = dirs::home_dir()
         .expect("no home dir")
@@ -642,7 +640,6 @@ fn perf_real_rust_crates() -> Result<()> {
 }
 
 #[test]
-#[ignore]
 fn perf_real_rust_deps() -> Result<()> {
     let rust_dir = prepare_rust_deps();
     let vendor_dir = rust_dir.join("vendor");
