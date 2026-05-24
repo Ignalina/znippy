@@ -22,6 +22,11 @@ pub trait ZnippyReader: Send + Sync {
     fn extract_file(&self, relative_path: &str) -> Result<Vec<u8>>;
     fn contains(&self, relative_path: &str) -> bool;
     fn file_size(&self, relative_path: &str) -> Option<u64>;
+
+    /// Batch extract multiple files. Default impl calls extract_file sequentially.
+    fn extract_files(&self, paths: &[&str]) -> Vec<Result<Vec<u8>>> {
+        paths.iter().map(|p| self.extract_file(p)).collect()
+    }
 }
 
 struct ChunkInfo {
