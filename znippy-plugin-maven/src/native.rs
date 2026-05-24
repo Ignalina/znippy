@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use znippy_common::plugin::{ArchiveTypePlugin, ExtensionRow, ExtensionValue};
+use rayon::prelude::*;
+use znippy_common::plugin::{ArchiveTypePlugin, BatchItem, ExtensionRow, ExtensionValue};
 use crate::pom::parse_pom_project;
 
 pub struct NativeMavenPlugin;
@@ -31,11 +32,29 @@ impl ArchiveTypePlugin for NativeMavenPlugin {
             parse_pom_project(&entry.data)?
         };
 
-        let mut fields = HashMap::new();
-        fields.insert("group_id".into(), ExtensionValue::Str(coord.group_id));
-        fields.insert("artifact_id".into(), ExtensionValue::Str(coord.artifact_id));
-        fields.insert("version".into(), ExtensionValue::Str(coord.version));
-        fields.insert("packaging".into(), ExtensionValue::Str(coord.packaging));
-        Some(ExtensionRow { fields })
+        Some(make_row(coord))
     }
+
+    fn supports_batch(&self) -> bool {
+        true
+    }
+
+    fn batch_threshold(&self) -> usize {
+        200 * 1024 * 1024
+    }
+
+    fn extract_batch(&self, items: &[BatchItem<'_>]) -> Vec<Option<ExtensionRow>> {
+        ljar::thread_pool().install(|| {
+            items.par_iter().map(|item| self.extract_metadata(item.path, item.data)).collect()
+        })
+    }
+}
+
+fn make_row(coord: crate::pom::MavenCoord) -> ExtensionRow {
+    let mut fields = HashMap::new();
+    fields.insert("group_id".into(), ExtensionValue::Str(coord.group_id));
+    fields.insert("artifact_id".into(), ExtensionValue::Str(coord.artifact_id));
+    fields.insert("version".into(), ExtensionValue::Str(coord.version));
+    fields.insert("packaging".into(), ExtensionValue::Str(coord.packaging));
+    ExtensionRow { fields }
 }

@@ -14,6 +14,8 @@ pub use int_ring::{ChunkQueue, RingBuffer};
 pub mod chunkrevolver;
 pub use chunkrevolver::{ChunkRevolver, get_chunk_slice, split_into_microchunks};
 
+pub mod slotpool;
+
 pub mod meta;
 pub use meta::{BlobMeta, ChunkMeta, FileMeta};
 

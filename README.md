@@ -6,20 +6,18 @@
 High-performance archive format with per-file compression, parallel processing, and random access.
 Built on **Apache Arrow IPC** + **OpenZL** (zstd+lz4 under the hood).
 
-## Benchmarks (v0.7, 8-core T14s, release)
+## Benchmarks (v0.7 Gatling pipeline, release)
 
 | Test | In | Out | Ratio | Compress | Decompress |
 |------|-----|-----|-------|----------|------------|
-| text 500MB | 500 MB | 0.12 MB | 4039x | 1,812 MB/s | 3,030 MB/s |
-| binary pattern 500MB | 500 MB | 0.22 MB | 2229x | 2,618 MB/s | 3,205 MB/s |
-| random (incompressible) 500MB | 500 MB | 500 MB | 1.0x | 184 MB/s | 3,068 MB/s |
-| 100k small files (10KB) | 977 MB | 17.5 MB | 55.9x | 3,223 MB/s | 726 MB/s |
-| mixed repo 530MB | 530 MB | 530 MB | 1.0x | 2,561 MB/s | 2,409 MB/s |
-| single file 2GB | 2,048 MB | 0.50 MB | 4128x | 3,436 MB/s | 3,075 MB/s |
-| **Rust crates (1.3k .crate)** | **197 MB** | **197 MB** | **1.0x** | **1,376 MB/s** | **2,370 MB/s** |
-| **Rust deps (41k files)** | **988 MB** | **137 MB** | **7.2x** | **67 MB/s** | **1,377 MB/s** |
+| text 500MB | 500 MB | 0.06 MB | 9014x | 1,656 MB/s | 1,707 MB/s |
+| binary pattern 500MB | 500 MB | 0.07 MB | 7338x | 2,370 MB/s | 1,754 MB/s |
+| random (incompressible) 500MB | 500 MB | 500 MB | 1.0x | 102 MB/s | 1,786 MB/s |
+| 100k small files (10KB) | 977 MB | 17.4 MB | 56.2x | 4,321 MB/s | 661 MB/s |
+| mixed repo 530MB | 530 MB | 530 MB | 1.0x | 2,850 MB/s | 1,738 MB/s |
+| single file 2GB | 2,048 MB | 0.22 MB | 9509x | 6,077 MB/s | 1,874 MB/s |
 
-Already-compressed files (.crate, .jar, .gz, etc.) are stored as-is at full write speed (skip path). Random/incompressible data is measured at openzl encoding cost. Small-file throughput is bottlenecked by per-chunk channel overhead — see backlog P4.
+Already-compressed files (.jar, .gz, .crate, etc.) are stored as-is at full write speed (skip path). Random/incompressible data is measured at openzl encoding cost. Decompression still uses the legacy read path — migrating it to the Gatling model is the next perf step.
 
 ## Architecture — v0.7 Multi-Index Format
 

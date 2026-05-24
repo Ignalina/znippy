@@ -1,6 +1,6 @@
 use anyhow::Result;
 use arrow_array::{
-    BooleanArray, FixedSizeBinaryArray, StringArray, UInt8Array, UInt32Array, UInt64Array,
+    BooleanArray, FixedSizeBinaryArray, StringArray, UInt32Array, UInt64Array,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -15,7 +15,6 @@ use crate::{
     ChunkMeta, ChunkRevolver, common_config::CONFIG,
     index::{VerifyReport, read_znippy_index},
 };
-use blake3::Hasher;
 
 use crate::chunkrevolver::{SendPtr, get_chunk_slice};
 use crate::meta::{ReaderStats, WriterStats};
@@ -91,43 +90,6 @@ pub fn decompress_archive(
     }
     let total_files = unique_files.len();
 
-    // Extract checksums: one per group, only for groups that appear in the index.
-    // Produces a sorted Vec<(group_id, expected_checksum)> with no gaps.
-    let group_checksums: Vec<(u8, [u8; 32])> = {
-        let group_col = batch
-            .column_by_name("checksum_group")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt8Array>()
-            .unwrap();
-        let cs_col = batch
-            .column_by_name("checksum")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .unwrap();
-
-        let mut map: HashMap<u8, [u8; 32]> = HashMap::new();
-        for row in 0..total_rows {
-            let group = group_col.value(row);
-            map.entry(group).or_insert_with(|| {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(cs_col.value(row));
-                arr
-            });
-        }
-        let mut groups: Vec<(u8, [u8; 32])> = map.into_iter().collect();
-        groups.sort_by_key(|(g, _)| *g);
-        groups
-    };
-
-    // Routing table: checksum_group value -> index in verify_txs
-    let group_to_idx: HashMap<u8, usize> = group_checksums
-        .iter()
-        .enumerate()
-        .map(|(i, (g, _))| (*g, i))
-        .collect();
-
     let mut revolver = ChunkRevolver::new(config);
     let base_ptrs = revolver.base_ptrs();
     let chunk_size = revolver.chunk_size();
@@ -169,9 +131,9 @@ pub fn decompress_archive(
             let chunk_seq_col = batch_for_reader
                 .column_by_name("chunk_seq").unwrap()
                 .as_any().downcast_ref::<UInt32Array>().unwrap();
-            let checksum_group_col = batch_for_reader
-                .column_by_name("checksum_group").unwrap()
-                .as_any().downcast_ref::<UInt8Array>().unwrap();
+            let checksum_col = batch_for_reader
+                .column_by_name("checksum").unwrap()
+                .as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
             let compressed_col = batch_for_reader
                 .column_by_name("compressed").unwrap()
                 .as_any().downcast_ref::<BooleanArray>().unwrap();
@@ -188,7 +150,8 @@ pub fn decompress_archive(
             for row_idx in 0..total_rows {
                 let fdata_offset = fdata_offset_col.value(row_idx);
                 let chunk_seq = chunk_seq_col.value(row_idx);
-                let checksum_group = checksum_group_col.value(row_idx);
+                let mut checksum = [0u8; 32];
+                checksum.copy_from_slice(checksum_col.value(row_idx));
                 let compressed = compressed_col.value(row_idx);
                 let uncompressed_size = uncompressed_size_col.value(row_idx);
                 let blob_offset = blob_offset_col.value(row_idx);
@@ -222,7 +185,7 @@ pub fn decompress_archive(
                     fdata_offset,
                     compressed_size: blob_size as u64,
                     chunk_seq,
-                    checksum_group,
+                    checksum,
                     compressed,
                     file_index: row_idx as u64,
                     uncompressed_size,
@@ -314,68 +277,15 @@ pub fn decompress_archive(
         decompressor_threads.push(handle);
     }
 
-    // VERIFY threads — one per group that actually appears in the index (no gap groups)
-    let num_groups = group_checksums.len();
-    let (verify_txs, verify_threads): (Vec<_>, Vec<_>) = group_checksums
-        .into_iter()
-        .map(|(grp_id, expected)| {
-            let (vtx, vrx): (
-                crossbeam_channel::Sender<(u32, Vec<u8>)>,
-                crossbeam_channel::Receiver<(u32, Vec<u8>)>,
-            ) = crossbeam_channel::bounded(64);
-            let handle = thread::spawn(move || -> (bool, u64) {
-                let mut hasher = Hasher::new();
-                let mut next_seq: u32 = 0;
-                let mut pending: std::collections::BTreeMap<u32, Vec<u8>> =
-                    std::collections::BTreeMap::new();
-                let mut total_bytes: u64 = 0;
-
-                while let Ok((seq, data)) = vrx.recv() {
-                    if seq == next_seq {
-                        hasher.update(&data);
-                        total_bytes += data.len() as u64;
-                        next_seq += 1;
-                        while let Some(buffered) = pending.remove(&next_seq) {
-                            hasher.update(&buffered);
-                            total_bytes += buffered.len() as u64;
-                            next_seq += 1;
-                        }
-                    } else {
-                        pending.insert(seq, data);
-                    }
-                }
-                while let Some((&seq, _)) = pending.iter().next() {
-                    if seq == next_seq {
-                        let buffered = pending.remove(&seq).unwrap();
-                        hasher.update(&buffered);
-                        total_bytes += buffered.len() as u64;
-                        next_seq += 1;
-                    } else {
-                        break;
-                    }
-                }
-
-                let computed = *hasher.finalize().as_bytes();
-                let ok = computed == expected;
-                if !ok {
-                    log::error!(
-                        "[verify] checksum_group {} MISMATCH: expected {}, got {}",
-                        grp_id,
-                        hex::encode(expected),
-                        hex::encode(computed)
-                    );
-                }
-                (ok, total_bytes)
-            });
-            (vtx, handle)
-        })
-        .unzip();
-
-    // WRITER thread — holds a tx_return clone to release Revolver ring slots after write_all.
+    // WRITER thread — verifies each chunk's BLAKE3 inline (per-slice), writes
+    // output, and releases Revolver ring slots after write_all. No group ordering.
     let tx_return_writer = tx_return.clone();
     let writer_thread = thread::spawn(move || -> WriterStats {
         let mut total_chunks = 0u64;
         let mut total_written_bytes = 0u64;
+        let mut verified_bytes = 0u64;
+        let mut corrupt_bytes = 0u64;
+        let mut corrupt_file_idx: HashSet<u64> = HashSet::new();
 
         let paths_col = batch_for_writer
             .column_by_name("relative_path")
@@ -389,7 +299,25 @@ pub fn decompress_archive(
 
         while let Ok((chunk_meta, blob)) = chunk_rx.recv() {
             total_chunks += 1;
-            total_written_bytes += blob.len() as u64;
+            let bytes = blob.as_slice();
+            let len = bytes.len() as u64;
+            total_written_bytes += len;
+
+            // Per-slice verify: hash the uncompressed bytes, compare to the row's checksum.
+            let computed = blake3::hash(bytes);
+            if computed.as_bytes() == &chunk_meta.checksum {
+                verified_bytes += len;
+            } else {
+                corrupt_bytes += len;
+                corrupt_file_idx.insert(chunk_meta.file_index);
+                log::error!(
+                    "[verify] chunk MISMATCH: row {} chunk_seq={} expected {} got {}",
+                    chunk_meta.file_index,
+                    chunk_meta.chunk_seq,
+                    hex::encode(chunk_meta.checksum),
+                    hex::encode(computed.as_bytes()),
+                );
+            }
 
             if save_data {
                 let rel_path = paths_col.value(chunk_meta.file_index as usize);
@@ -414,47 +342,19 @@ pub fn decompress_archive(
 
                 file.seek(SeekFrom::Start(chunk_meta.fdata_offset)).unwrap();
                 // Zero-copy: write directly from the ring slot (skip path) or decompressed Vec.
-                file.write_all(blob.as_slice()).unwrap();
+                file.write_all(bytes).unwrap();
             }
 
-            // Copy once for the verify thread, then immediately return the ring slot.
-            let data = match blob {
-                DecompBlob::Revolver { ptr, len, ring_nr, chunk_nr } => {
-                    let v = unsafe {
-                        std::slice::from_raw_parts(ptr as *const u8, len).to_vec()
-                    };
-                    tx_return_writer.send((ring_nr, chunk_nr as u64)).ok();
-                    v
-                }
-                DecompBlob::Owned(v) => v,
-            };
-
-            if let Some(&idx) = group_to_idx.get(&chunk_meta.checksum_group) {
-                let _ = verify_txs[idx].send((chunk_meta.chunk_seq, data));
+            // Return the ring slot for the skip (Revolver) path after we're done reading it.
+            if let DecompBlob::Revolver { ring_nr, chunk_nr, .. } = blob {
+                tx_return_writer.send((ring_nr, chunk_nr as u64)).ok();
             }
         }
 
         drop(open_files);
-        drop(verify_txs);
 
-        let mut verified_files = 0usize;
-        let mut corrupt_files = 0usize;
-        let mut verified_bytes = 0u64;
-        let mut corrupt_bytes = 0u64;
-
-        for handle in verify_threads {
-            let (ok, bytes) = handle.join().expect("verify thread panicked");
-            if ok {
-                verified_bytes += bytes;
-            } else {
-                corrupt_bytes += bytes;
-                corrupt_files += 1;
-            }
-        }
-
-        if corrupt_files == 0 && num_groups > 0 {
-            verified_files = total_rows;
-        }
+        let corrupt_files = corrupt_file_idx.len();
+        let verified_files = total_files.saturating_sub(corrupt_files);
 
         WriterStats {
             total_chunks,

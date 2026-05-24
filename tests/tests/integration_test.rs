@@ -297,6 +297,62 @@ fn test_compress_dir_with_mixed_file_types() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_compress_dir_slots_roundtrip() -> Result<()> {
+    let input_dir = TempDir::new()?;
+    let out_dir = TempDir::new()?;
+
+    // Many small files (coalesce into one slot, 1 file = 1 slice).
+    for i in 0..50 {
+        fs::write(
+            input_dir.path().join(format!("small_{i}.txt")),
+            format!("content of small file number {i}\n").repeat(3),
+        )?;
+    }
+    // Nested small file.
+    fs::create_dir_all(input_dir.path().join("nested"))?;
+    fs::write(input_dir.path().join("nested/deep.txt"), "deep content")?;
+    // Pre-compressed extension → skip path.
+    fs::write(input_dir.path().join("blob.gz"), vec![0x1F, 0x8B, 0x08, 0x00, 1, 2, 3])?;
+    // Empty file → one zero-length slice.
+    fs::write(input_dir.path().join("empty.txt"), "")?;
+    // Large compressible file that spans many slices (> slice_size of 200MB/N is
+    // unrealistic for a test, so we just make it multi-MB to exercise chunking).
+    let big: Vec<u8> = (0..(8 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+    fs::write(input_dir.path().join("big.bin"), &big)?;
+
+    let archive_path = out_dir.path().join("slots.znippy");
+    let report = compress_dir(
+        &input_dir.path().to_path_buf(),
+        &archive_path.to_path_buf(),
+        false,
+        None,
+        None,
+    )?;
+    assert_eq!(report.total_files, 54);
+    assert!(archive_path.exists());
+
+    // Decompress + per-slice verify must report zero corruption.
+    let decomp_dir = TempDir::new()?;
+    let verify = znippy_common::decompress_archive(&archive_path, true, decomp_dir.path())?;
+    assert_eq!(verify.corrupt_files, 0, "per-slice blake3 verify found corruption");
+    assert_eq!(verify.total_files, 54);
+
+    // Empty file must round-trip to an empty file.
+    let empty_out = fs::read_to_string(decomp_dir.path().join("empty.txt"))?;
+    assert_eq!(empty_out, "");
+
+    // Spot-check round-tripped contents.
+    let s7 = fs::read_to_string(decomp_dir.path().join("small_7.txt"))?;
+    assert_eq!(s7, "content of small file number 7\n".repeat(3));
+    let deep = fs::read_to_string(decomp_dir.path().join("nested/deep.txt"))?;
+    assert_eq!(deep, "deep content");
+    let big_out = fs::read(decomp_dir.path().join("big.bin"))?;
+    assert_eq!(big_out, big, "large multi-chunk file must round-trip exactly");
+
+    Ok(())
+}
+
 // ─── Index/schema tests ────────────────────────────────────────────────────
 
 #[test]
@@ -311,7 +367,6 @@ fn test_index_schema_fields() {
             "relative_path",
             "chunk_seq",
             "fdata_offset",
-            "checksum_group",
             "compressed",
             "uncompressed_size",
             "blob_offset",

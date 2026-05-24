@@ -22,7 +22,7 @@ use crate::{decompress_archive};
 use anyhow::Result;
 use arrow::array::{
     Array, ArrayRef, BooleanBuilder, FixedSizeBinaryBuilder, Int8Builder, StringBuilder,
-    UInt32Builder, UInt64Builder, UInt8Builder,
+    UInt32Builder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -45,7 +45,6 @@ fn base_index_fields() -> Vec<Field> {
         Field::new("relative_path", DataType::Utf8, false),
         Field::new("chunk_seq", DataType::UInt32, false),
         Field::new("fdata_offset", DataType::UInt64, false),
-        Field::new("checksum_group", DataType::UInt8, false),
         Field::new("compressed", DataType::Boolean, false),
         Field::new("uncompressed_size", DataType::UInt64, false),
         Field::new("blob_offset", DataType::UInt64, false),
@@ -125,13 +124,12 @@ pub fn extract_config_from_arrow_metadata(
     })
 }
 
-/// Build the Arrow metadata index batch from blob positions + checksums.
+/// Build the Arrow metadata index batch from blob positions.
 ///
-/// `checksums[i]` is the BLAKE3 for compressor group i.
-/// Every row carries its group's checksum in the `checksum` column.
+/// Every row carries its own per-slice BLAKE3 in the `checksum` column
+/// (over the chunk's uncompressed bytes).
 pub fn build_metadata_batch<F>(
     blobs: &[BlobMeta],
-    checksums: &[[u8; 32]],
     path_resolver: F,
     ext_meta: &[FileExtMeta],
     ext_fields: &[Field],
@@ -144,33 +142,28 @@ where
     let mut path_builder = StringBuilder::with_capacity(len, len * 64);
     let mut seq_builder = UInt32Builder::with_capacity(len);
     let mut fdata_builder = UInt64Builder::with_capacity(len);
-    let mut group_builder = UInt8Builder::with_capacity(len);
     let mut compressed_builder = BooleanBuilder::with_capacity(len);
     let mut size_builder = UInt64Builder::with_capacity(len);
     let mut blob_offset_builder = UInt64Builder::with_capacity(len);
     let mut blob_size_builder = UInt64Builder::with_capacity(len);
     let mut checksum_builder = FixedSizeBinaryBuilder::with_capacity(len, 32);
 
-    let empty = [0u8; 32];
     for blob in blobs {
         let m = &blob.chunk_meta;
         path_builder.append_value(path_resolver(m.file_index));
         seq_builder.append_value(m.chunk_seq);
         fdata_builder.append_value(m.fdata_offset);
-        group_builder.append_value(m.checksum_group);
         compressed_builder.append_value(m.compressed);
         size_builder.append_value(m.uncompressed_size);
         blob_offset_builder.append_value(blob.blob_offset);
         blob_size_builder.append_value(blob.blob_size);
-        let cs = checksums.get(m.checksum_group as usize).unwrap_or(&empty);
-        checksum_builder.append_value(cs)?;
+        checksum_builder.append_value(m.checksum)?;
     }
 
     let mut columns: Vec<ArrayRef> = vec![
         Arc::new(path_builder.finish()),
         Arc::new(seq_builder.finish()),
         Arc::new(fdata_builder.finish()),
-        Arc::new(group_builder.finish()),
         Arc::new(compressed_builder.finish()),
         Arc::new(size_builder.finish()),
         Arc::new(blob_offset_builder.finish()),

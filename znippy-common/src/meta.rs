@@ -5,7 +5,8 @@ pub struct ChunkMeta {
     pub fdata_offset: u64,
     pub file_index: u64,
     pub chunk_seq: u32,
-    pub checksum_group: u8,
+    /// BLAKE3 of this chunk's UNCOMPRESSED bytes (per-slice integrity).
+    pub checksum: [u8; 32],
     pub compressed: bool,
     pub uncompressed_size: u64,
     pub compressed_size: u64,

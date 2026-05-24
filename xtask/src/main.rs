@@ -11,6 +11,10 @@ struct BenchEntry {
 #[derive(Serialize, Deserialize)]
 struct BenchRun {
     date: String,
+    /// znippy version that produced these numbers. Optional so the pre-versioning
+    /// history lines (kept as test/baseline data) still parse — they read as "".
+    #[serde(default)]
+    version: String,
     results: Vec<BenchEntry>,
 }
 
@@ -32,6 +36,20 @@ fn today() -> String {
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The znippy version that produced a bench run — read from the `znippy`
+/// crate's Cargo.toml (the canonical workspace version). xtask runs from the
+/// workspace root, so the relative path is stable.
+fn znippy_version() -> String {
+    std::fs::read_to_string("znippy/Cargo.toml")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.trim_start().starts_with("version"))
+                .and_then(|l| l.split('"').nth(1).map(str::to_string))
+        })
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -95,7 +113,7 @@ fn check_and_record(tmp_file: &str, history_file: &str) {
     }
 
     // Append new run to history
-    let new_run = BenchRun { date: today(), results: current };
+    let new_run = BenchRun { date: today(), version: znippy_version(), results: current };
     let line = serde_json::to_string(&new_run).expect("serialize bench run");
     let mut content = history_raw;
     if !content.is_empty() && !content.ends_with('\n') {

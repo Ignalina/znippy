@@ -36,6 +36,23 @@ impl CompressCtx {
         output.truncate(compressed_size);
         Ok(output)
     }
+
+    /// Compress into a reusable buffer; returns the number of bytes written
+    /// (`out` is truncated to that). Reuse the same `out` across slices to keep
+    /// the compress path allocation-free (the no-hot-path-alloc rule).
+    pub fn compress_into(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<usize> {
+        use openzl_sys_rs::zl_compress_bound;
+        let bound = zl_compress_bound(input.len());
+        if out.len() < bound {
+            out.resize(bound, 0);
+        }
+        let compressed_size = self
+            .cctx
+            .compress(out.as_mut_slice(), input)
+            .map_err(|e| anyhow!(e))?;
+        out.truncate(compressed_size);
+        Ok(compressed_size)
+    }
 }
 
 pub fn decompress_frame(compressed: &[u8]) -> Result<Vec<u8>> {
