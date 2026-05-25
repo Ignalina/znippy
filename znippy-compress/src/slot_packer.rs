@@ -7,7 +7,7 @@
 //! No accumulation, no merge.
 
 use anyhow::{Result, anyhow};
-use crossbeam_channel::bounded;
+use crossbeam_channel::{bounded, unbounded};
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::os::unix::fs::FileExt;
@@ -30,11 +30,8 @@ const SLOT_SIZE: usize = 200 * 1024 * 1024;
 const NUM_SLOTS: usize = 8;
 
 struct WriteJob {
-    buf: Option<Vec<u8>>,
-    ptr: *const u8,
+    buf: Vec<u8>,
     on_disk_len: usize,
-    slot_id: u32,
-    release_slot: bool,
     file_index: u64,
     fdata_offset: u64,
     chunk_seq: u32,
@@ -42,7 +39,6 @@ struct WriteJob {
     compressed: bool,
     uncompressed_size: u64,
 }
-unsafe impl Send for WriteJob {}
 
 fn read_fully<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     let mut n = 0;
@@ -244,10 +240,8 @@ fn run_big_pass(
     let pool = Magazine::new(NUM_SLOTS, SLOT_SIZE, num_workers);
     let returner = pool.returner();
     let (tx_slice, rx_slice) = bounded(NUM_SLOTS * 4);
-    let (tx_write, rx_write) = bounded::<WriteJob>(num_workers * 4);
-    let (free_bufs_tx, free_bufs_rx) = bounded::<Vec<u8>>(num_workers * 4);
-    for _ in 0..num_workers * 4 { free_bufs_tx.send(Vec::new()).ok(); }
-    let (tx_meta, rx_meta) = bounded::<(usize, FileExtMeta)>(256);
+    let (tx_write, rx_write) = unbounded::<WriteJob>();
+    let (tx_meta, rx_meta) = unbounded::<(usize, FileExtMeta)>();
 
     let plugin_addr: usize = plugin.map(|p| p as *const _ as usize).unwrap_or(0);
 
@@ -332,10 +326,10 @@ fn run_big_pass(
         })
     };
 
-    let workers = spawn_workers(num_workers, rx_slice.clone(), tx_write.clone(), free_bufs_rx.clone(), returner.clone());
-    let writer = spawn_writer(Arc::clone(file), Arc::clone(out_cursor), returner.clone(), rx_write, free_bufs_tx);
+    let workers = spawn_workers(num_workers, rx_slice.clone(), tx_write.clone(), returner.clone());
+    let writer = spawn_writer(Arc::clone(file), Arc::clone(out_cursor), returner.clone(), rx_write);
 
-    drop(tx_write); drop(rx_slice); drop(free_bufs_rx); drop(tx_meta);
+    drop(tx_write); drop(rx_slice); drop(tx_meta);
 
     let (uf, ub, cf, cb) = reader.join().map_err(|_| anyhow!("big reader panicked"))?;
     for w in workers { w.join().map_err(|_| anyhow!("big worker panicked"))??; }
@@ -364,10 +358,8 @@ fn run_small_pass(
     let pool = Magazine::new(NUM_SLOTS, SLOT_SIZE, num_workers);
     let returner = pool.returner();
     let (tx_slice, rx_slice) = bounded(NUM_SLOTS * 4);
-    let (tx_write, rx_write) = bounded::<WriteJob>(num_workers * 4);
-    let (free_bufs_tx, free_bufs_rx) = bounded::<Vec<u8>>(num_workers * 4);
-    for _ in 0..num_workers * 4 { free_bufs_tx.send(Vec::new()).ok(); }
-    let (tx_meta, rx_meta) = bounded::<(usize, FileExtMeta)>(256);
+    let (tx_write, rx_write) = unbounded::<WriteJob>();
+    let (tx_meta, rx_meta) = unbounded::<(usize, FileExtMeta)>();
 
     let plugin_addr: usize = plugin.map(|p| p as *const _ as usize).unwrap_or(0);
 
@@ -432,10 +424,10 @@ fn run_small_pass(
         })
     };
 
-    let workers = spawn_workers(num_workers, rx_slice.clone(), tx_write.clone(), free_bufs_rx.clone(), returner.clone());
-    let writer = spawn_writer(Arc::clone(file), Arc::clone(out_cursor), returner.clone(), rx_write, free_bufs_tx);
+    let workers = spawn_workers(num_workers, rx_slice.clone(), tx_write.clone(), returner.clone());
+    let writer = spawn_writer(Arc::clone(file), Arc::clone(out_cursor), returner.clone(), rx_write);
 
-    drop(tx_write); drop(rx_slice); drop(free_bufs_rx); drop(tx_meta);
+    drop(tx_write); drop(rx_slice); drop(tx_meta);
 
     let (uf, ub, cf, cb) = reader.join().map_err(|_| anyhow!("small reader panicked"))?;
     for w in workers { w.join().map_err(|_| anyhow!("small worker panicked"))??; }
@@ -455,36 +447,40 @@ fn spawn_workers(
     num_workers: usize,
     rx_slice: crossbeam_channel::Receiver<znippy_common::slotpool::Round>,
     tx_write: crossbeam_channel::Sender<WriteJob>,
-    free_bufs_rx: crossbeam_channel::Receiver<Vec<u8>>,
     returner: znippy_common::slotpool::Ejector,
 ) -> Vec<thread::JoinHandle<Result<()>>> {
     let level = CONFIG.compression_level;
     (0..num_workers).map(|_| {
         let rx = rx_slice.clone();
         let tw = tx_write.clone();
-        let fb = free_bufs_rx.clone();
         let ret = returner.clone();
         thread::spawn(move || -> Result<()> {
             let mut cctx = znippy_common::codec::CompressCtx::new(level)?;
+            let mut reuse_buf: Vec<u8> = Vec::new();
             while let Ok(slice) = rx.recv() {
                 let src = unsafe { slice.as_slice() };
                 let checksum = *blake3::hash(src).as_bytes();
                 if slice.skip {
+                    // Copy to owned buf and release slot immediately.
+                    let mut buf = std::mem::take(&mut reuse_buf);
+                    let len = src.len();
+                    if buf.capacity() < len { buf.reserve(len - buf.len()); }
+                    buf.resize(len, 0);
+                    buf[..len].copy_from_slice(src);
+                    ret.release_one(slice.slot_id);
                     tw.send(WriteJob {
-                        buf: None, ptr: src.as_ptr(), on_disk_len: src.len(),
-                        slot_id: slice.slot_id, release_slot: true,
+                        buf, on_disk_len: len,
                         file_index: slice.file_index, fdata_offset: slice.fdata_offset,
                         chunk_seq: slice.chunk_seq, checksum, compressed: false,
-                        uncompressed_size: src.len() as u64,
+                        uncompressed_size: len as u64,
                     }).ok();
                 } else {
-                    let mut buf = fb.recv().unwrap_or_default();
+                    let mut buf = std::mem::take(&mut reuse_buf);
                     let n = cctx.compress_into(src, &mut buf)?;
                     let usz = src.len() as u64;
                     ret.release_one(slice.slot_id);
                     tw.send(WriteJob {
-                        buf: Some(buf), ptr: std::ptr::null(), on_disk_len: n,
-                        slot_id: 0, release_slot: false,
+                        buf, on_disk_len: n,
                         file_index: slice.file_index, fdata_offset: slice.fdata_offset,
                         chunk_seq: slice.chunk_seq, checksum, compressed: true,
                         uncompressed_size: usz,
@@ -499,26 +495,14 @@ fn spawn_workers(
 fn spawn_writer(
     file: Arc<File>,
     out_cursor: Arc<AtomicU64>,
-    returner: znippy_common::slotpool::Ejector,
+    _returner: znippy_common::slotpool::Ejector,
     rx_write: crossbeam_channel::Receiver<WriteJob>,
-    free_bufs_tx: crossbeam_channel::Sender<Vec<u8>>,
 ) -> thread::JoinHandle<Result<Vec<BlobMeta>>> {
     thread::spawn(move || -> Result<Vec<BlobMeta>> {
         let mut blobs = Vec::new();
         while let Ok(job) = rx_write.recv() {
             let off = out_cursor.fetch_add(job.on_disk_len as u64, Ordering::Relaxed);
-            match job.buf {
-                Some(mut buf) => {
-                    file.write_all_at(&buf[..job.on_disk_len], off)?;
-                    buf.clear();
-                    free_bufs_tx.send(buf).ok();
-                }
-                None => {
-                    let bytes = unsafe { std::slice::from_raw_parts(job.ptr, job.on_disk_len) };
-                    file.write_all_at(bytes, off)?;
-                    if job.release_slot { returner.release_one(job.slot_id); }
-                }
-            }
+            file.write_all_at(&job.buf[..job.on_disk_len], off)?;
             blobs.push(BlobMeta {
                 chunk_meta: ChunkMeta {
                     fdata_offset: job.fdata_offset, file_index: job.file_index,
