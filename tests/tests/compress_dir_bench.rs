@@ -291,7 +291,7 @@ fn dump_for_xtask(results: &[&DirBenchResult]) {
             r.label, r.compress_mbs(), r.decompress_mbs(), r.file_count
         )
     }).collect();
-    let _ = fs::write("/tmp/znippy_dir_bench_last.json", format!("[{}]", entries.join(",")));
+    let _ = fs::write("target/znippy_dir_bench_last.json", format!("[{}]", entries.join(",")));
 }
 
 /// Minimal test: just 10 .jar files (skipped compression). Isolates the skip path.
@@ -363,10 +363,11 @@ fn compress_dir_mixed_repro() -> Result<()> {
     Ok(())
 }
 
-/// Quick test with real jar files from a temp copy.
+/// Quick test with real jar files from ~/work/holger_tests/jars_39
 #[test]
 fn compress_dir_39_real_jars() -> Result<()> {
-    let jar_dir = std::path::PathBuf::from("/tmp/tmp.Jpp1GCMHUp");
+    let jar_dir = std::path::PathBuf::from(
+        format!("{}/work/holger_tests/jars_39", std::env::var("HOME").unwrap_or_default()));
     if !jar_dir.exists() { return Ok(()); }
     let result = bench_compress_dir("39_real_jars", &jar_dir)?;
     print_result(&result);
@@ -375,9 +376,90 @@ fn compress_dir_39_real_jars() -> Result<()> {
 
 #[test]
 fn compress_dir_500_real_jars() -> Result<()> {
-    let jar_dir = std::path::PathBuf::from("/tmp/tmp.DS158rYsBz");
+    let jar_dir = std::path::PathBuf::from(
+        format!("{}/work/holger_tests/jars_500", std::env::var("HOME").unwrap_or_default()));
     if !jar_dir.exists() { return Ok(()); }
     let result = bench_compress_dir("500_real_jars", &jar_dir)?;
     print_result(&result);
+    Ok(())
+}
+
+/// Pure read benchmark — no compression, just io_uring open+read+close to measure raw I/O.
+#[test]
+fn compress_dir_read_only_10k() -> Result<()> {
+    use io_uring::{IoUring, opcode, types};
+    use std::ffi::CString;
+    use walkdir::WalkDir;
+
+    let tmp = TempDir::new()?;
+    let dir = tmp.path().join("small");
+    create_small_files_dir(&dir, 10000, 10240);
+
+    // Collect all file paths
+    let files: Vec<_> = WalkDir::new(&dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.into_path())
+        .collect();
+
+    let total_bytes: u64 = files.iter().map(|f| f.metadata().unwrap().len()).sum();
+
+    let start = Instant::now();
+
+    const BATCH: usize = 64;
+    let mut ring = IoUring::new((BATCH * 2) as u32).unwrap();
+    let mut buf = vec![0u8; 6_500_000]; // one slot
+
+    let mut i = 0;
+    while i < files.len() {
+        let end = (i + BATCH).min(files.len());
+        let batch_count = end - i;
+
+        // Open batch
+        let cpaths: Vec<CString> = files[i..end].iter()
+            .map(|p| CString::new(p.as_os_str().as_encoded_bytes()).unwrap())
+            .collect();
+        for (j, cp) in cpaths.iter().enumerate() {
+            let op = opcode::OpenAt::new(types::Fd(-1), cp.as_ptr())
+                .flags(libc::O_RDONLY)
+                .build()
+                .user_data(j as u64);
+            unsafe { ring.submission().push(&op).unwrap(); }
+        }
+        ring.submit_and_wait(batch_count).unwrap();
+
+        let mut fds = vec![0i32; batch_count];
+        for _ in 0..batch_count {
+            let cqe = ring.completion().next().unwrap();
+            fds[cqe.user_data() as usize] = cqe.result();
+        }
+
+        // Read batch
+        for (j, &fd) in fds.iter().enumerate() {
+            let size = files[i + j].metadata().unwrap().len() as u32;
+            let op = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), size)
+                .build()
+                .user_data(j as u64);
+            unsafe { ring.submission().push(&op).unwrap(); }
+        }
+        ring.submit_and_wait(batch_count).unwrap();
+        for _ in 0..batch_count { ring.completion().next().unwrap(); }
+
+        // Close batch
+        for &fd in &fds {
+            let op = opcode::Close::new(types::Fd(fd)).build().user_data(0);
+            unsafe { ring.submission().push(&op).unwrap(); }
+        }
+        ring.submit_and_wait(batch_count).unwrap();
+        for _ in 0..batch_count { ring.completion().next().unwrap(); }
+
+        i = end;
+    }
+
+    let elapsed = start.elapsed();
+    let mbs = total_bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+    println!("\n  READ-ONLY 10k×10KB: {:.1} MB/s ({:.0} ms), {} files, {:.1} MB total\n",
+        mbs, elapsed.as_secs_f64() * 1000.0, files.len(), total_bytes as f64 / (1024.0*1024.0));
     Ok(())
 }

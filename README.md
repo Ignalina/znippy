@@ -8,6 +8,8 @@ Built on **Apache Arrow IPC** + **OpenZL** (zstd+lz4 under the hood).
 
 ## Benchmarks (v0.7.2 Gatling pipeline, release — 32 cores)
 
+### Stream packer (holger — HTTP downloads into archive)
+
 | Test | In | Out | Ratio | Compress | Decompress | Files |
 |------|-----|-----|-------|----------|------------|-------|
 | text 500MB | 500 MB | 0.06 MB | 9014x | 1,639 MB/s | 2,874 MB/s | 1 |
@@ -17,7 +19,16 @@ Built on **Apache Arrow IPC** + **OpenZL** (zstd+lz4 under the hood).
 | mixed repo 530MB | 530 MB | 530 MB | 1.0x | 3,118 MB/s | 6,310 MB/s | 6 |
 | single file 2GB | 2,048 MB | 0.22 MB | 9509x | 5,802 MB/s | 3,066 MB/s | 1 |
 
-Both compress and decompress run the no-barrier Gatling pipeline across all cores. Already-compressed files (.jar, .gz, .crate, .png, .parquet, etc.) match the skip-extension list and are stored/restored as-is at full I/O speed — they never touch the codec. The `random 500MB` row uses a `.bin` path that is *not* in the skip list, so it is forced through openzl level-19 on incompressible data; it measures worst-case encoder cost, not a real-world path.
+### Slot packer (CLI — directory compress with io_uring)
+
+| Test | In | Out | Ratio | Compress | Decompress | Files |
+|------|-----|-----|-------|----------|------------|-------|
+| 10k small files (10KB) | 97.7 MB | 1.7 MB | 56x | 614 MB/s | 1,356 MB/s | 10,000 |
+| mixed 720 files | 497 MB | 495 MB | 1.0x | 837 MB/s | 6,139 MB/s | 720 |
+
+Stream packer numbers are in-memory (no disk reads). Slot packer numbers include full disk I/O (io_uring batched opens+reads on NVMe).
+
+Both compress and decompress run the no-barrier Gatling pipeline across all cores. Already-compressed files (.jar, .gz, .crate, .png, .parquet, etc.) match the skip-extension list and are stored/restored as-is at full I/O speed — they never touch the codec.
 
 ## Architecture — v0.7 Multi-Index Format
 

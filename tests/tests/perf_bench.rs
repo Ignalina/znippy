@@ -228,7 +228,7 @@ fn perf_benchmark_suite() -> Result<()> {
         format!(r#"{{"name":"{}","compress_mbs":{:.1},"decompress_mbs":{:.1},"files":{}}}"#,
             r.label, r.compress_speed_mbs(), r.decompress_speed_mbs(), r.file_count)
     }).collect();
-    let _ = std::fs::write("/tmp/znippy_bench_last.json", format!("[{}]", entries.join(",")));
+    let _ = std::fs::write("target/znippy_bench_last.json", format!("[{}]", entries.join(",")));
 
     Ok(())
 }
