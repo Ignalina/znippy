@@ -376,43 +376,152 @@ fn run_small_pass(
             let mut cf = 0u64; let mut cb = 0u64;
             let mut cur = None;
 
-            for &file_index in &small_indices {
-                let path = &all_files[file_index];
-                let file_size = path.metadata().map(|m| m.len()).unwrap_or(0) as usize;
-                let skip = !no_skip && should_skip_compression(path);
-                if skip { uf += 1; ub += file_size as u64; }
-                else { cf += 1; cb += file_size as u64; }
+            let mut ring = io_uring::IoUring::new(256).expect("io_uring init");
+            let mut idx = 0usize;
+            let n = small_indices.len();
 
-                // Ensure slot has room for this file.
-                ensure_room(&pool, &tx_slice, &mut cur, file_size);
-                let fill = cur.as_mut().unwrap();
+            while idx < n {
+                // Collect a batch that fits in current slot
+                if cur.is_none() { cur = pool.claim(); }
+                let batch_start = idx;
+                let mut batch: Vec<(usize, usize, bool)> = Vec::new(); // (file_index, size, skip)
+                let mut batch_total = 0usize;
 
-                // Read directly into slot buffer.
-                let buf = fill.writable(file_size);
-                let got = match File::open(path).and_then(|mut f| read_fully(&mut f, buf)) {
-                    Ok(g) => g,
-                    Err(e) => { log::warn!("[small] read {}: {}", path.display(), e); continue; }
-                };
+                while idx < n && batch.len() < 128 {
+                    let file_index = small_indices[idx];
+                    let path = &all_files[file_index];
+                    let file_size = path.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+                    let skip = !no_skip && should_skip_compression(path);
 
-                // Inline metadata extraction — data is right here in memory.
-                if let Some(reg) = plugin_ref {
-                    let rel = path.strip_prefix(&input_dir).unwrap_or(path).to_string_lossy();
-                    if reg.matches(&rel) {
-                        let data = &buf[..got];
-                        if let Some(row) = reg.extract(&rel, data) {
-                            tx_meta.send((file_index, Some((reg.type_id().unwrap_or(0), row)))).ok();
+                    let remaining = cur.as_ref().unwrap().remaining();
+                    if batch_total + file_size > remaining {
+                        if batch_total == 0 {
+                            // Slot is too full for even one file — publish and get new slot
+                            if let Some(fill) = cur.take() {
+                                for s in fill.publish() { tx_slice.send(s).ok(); }
+                            }
+                            cur = pool.claim();
+                            continue; // retry with new slot
+                        }
+                        break; // process what we have
+                    }
+
+                    if skip { uf += 1; ub += file_size as u64; }
+                    else { cf += 1; cb += file_size as u64; }
+                    batch.push((file_index, file_size, skip));
+                    batch_total += file_size;
+                    idx += 1;
+                }
+
+                if batch.is_empty() { continue; }
+
+                // Phase 1: batch open
+                let mut cstrings: Vec<std::ffi::CString> = Vec::with_capacity(batch.len());
+                for &(fi, _, _) in &batch {
+                    let p = all_files[fi].as_os_str().as_encoded_bytes();
+                    cstrings.push(unsafe { std::ffi::CString::from_vec_unchecked(p.to_vec()) });
+                }
+
+                let mut fds: Vec<i32> = vec![-1; batch.len()];
+                for chunk in (0..batch.len()).collect::<Vec<_>>().chunks(256) {
+                    for &i in chunk {
+                        let open_e = io_uring::opcode::OpenAt::new(
+                            io_uring::types::Fd(libc::AT_FDCWD),
+                            cstrings[i].as_ptr(),
+                        )
+                        .flags(libc::O_RDONLY | libc::O_CLOEXEC)
+                        .build()
+                        .user_data(i as u64);
+                        unsafe { ring.submission().push(&open_e).ok(); }
+                    }
+                    ring.submit_and_wait(chunk.len()).ok();
+                    let mut got = 0;
+                    while got < chunk.len() {
+                        if let Some(cqe) = ring.completion().next() {
+                            fds[cqe.user_data() as usize] = cqe.result();
+                            got += 1;
                         }
                     }
                 }
 
-                fill.commit_slice(got, skip, file_index as u64, 0, 0);
+                // Phase 2: batch read directly into slot via writable()
+                // writable() gives a slice at cursor without advancing — use it for
+                // the entire batch, then commit each file.
+                let fill = cur.as_mut().unwrap();
+                let slot_buf = fill.writable(batch_total);
+                let slot_ptr = slot_buf.as_mut_ptr();
+
+                let mut offsets: Vec<usize> = Vec::with_capacity(batch.len());
+                let mut off = 0usize;
+                for &(_, size, _) in &batch {
+                    offsets.push(off);
+                    off += size;
+                }
+
+                let mut read_results: Vec<usize> = vec![0; batch.len()];
+                for chunk in (0..batch.len()).collect::<Vec<_>>().chunks(256) {
+                    let mut to_submit = 0;
+                    for &i in chunk {
+                        if fds[i] < 0 { continue; }
+                        let (_, size, _) = batch[i];
+                        let dst = unsafe { slot_ptr.add(offsets[i]) };
+                        let read_e = io_uring::opcode::Read::new(
+                            io_uring::types::Fd(fds[i]),
+                            dst,
+                            size as u32,
+                        )
+                        .build()
+                        .user_data(i as u64);
+                        unsafe { ring.submission().push(&read_e).ok(); }
+                        to_submit += 1;
+                    }
+                    if to_submit > 0 {
+                        ring.submit_and_wait(to_submit).ok();
+                        let mut got = 0;
+                        while got < to_submit {
+                            if let Some(cqe) = ring.completion().next() {
+                                let i = cqe.user_data() as usize;
+                                read_results[i] = if cqe.result() > 0 { cqe.result() as usize } else { 0 };
+                                got += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Phase 3: close fds
+                for &fd in &fds {
+                    if fd >= 0 { unsafe { libc::close(fd); } }
+                }
+
+                // Phase 4: plugin extraction + commit each file
+                let fill = cur.as_mut().unwrap();
+                for i in 0..batch.len() {
+                    let (file_index, _size, skip) = batch[i];
+                    let got = read_results[i];
+
+                    if let Some(reg) = plugin_ref {
+                        if got > 0 {
+                            let path = &all_files[file_index];
+                            let rel = path.strip_prefix(&input_dir).unwrap_or(path).to_string_lossy();
+                            if reg.matches(&rel) {
+                                let data = unsafe {
+                                    std::slice::from_raw_parts(slot_ptr.add(offsets[i]), got)
+                                };
+                                if let Some(row) = reg.extract(&rel, data) {
+                                    tx_meta.send((file_index, Some((reg.type_id().unwrap_or(0), row)))).ok();
+                                }
+                            }
+                        }
+                    }
+
+                    fill.commit_slice(got, skip, file_index as u64, 0, 0);
+                }
             }
 
             if let Some(fill) = cur.take() {
                 for s in fill.publish() { tx_slice.send(s).ok(); }
             }
 
-            // Drain: reclaim all slots to prove workers/writer are done with slot memory.
             for _ in 0..NUM_SLOTS {
                 if pool.claim().is_none() { break; }
             }
