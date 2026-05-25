@@ -3,9 +3,8 @@
 //! ORIGINAL AUTHOR: **Ragnar Groot Koerkamp** — `static-search-tree`
 //!   <https://github.com/RagnarGrootKoerkamp/static-search-tree>
 //! This module is a derivative work; credit for the algorithm belongs to Ragnar
-//! Groot Koerkamp. LICENSE NOTE: confirm and honour the upstream license before
-//! publishing this crate to crates.io — `publish = false` is set in Cargo.toml
-//! as a hard gate until that is done.
+//! Groot Koerkamp. Licensed MIT — Copyright (c) 2025 Ragnar Groot Koerkamp.
+//! The upstream MIT notice is retained in this crate's LICENSE file.
 //!
 //! Changes from the original (adapted for Rust 2024 edition):
 //!   - Key type: u32 → i64
