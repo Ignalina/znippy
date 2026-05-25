@@ -1,6 +1,6 @@
 [package]
 name = "znippy-compress"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2024"
 authors = ["Rickard Lundin <rickard@ignalina.dk>"]
 description = "Compression logic for Znippy, a parallel chunked compression system."

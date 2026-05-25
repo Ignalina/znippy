@@ -1,9 +1,25 @@
-claude --resume 2d931445-8071-4c0e-a350-9a94e9fa5a14
-# TODO_NOW — session 2026-05-24
+# TODO_NOW — v0.7.4 release
 
 ---
 
-## ⏯ RESUME HERE (paused 2026-05-24 session 3)
+## ✅ DONE (session 2026-05-25)
+
+- **Deadlock fixed**: `tx_meta` bounded(256) caused circular wait on 4657+ files.
+  Now unbounded. Workers use thread-local buffers, release slots immediately.
+- **io_uring small pass**: batched open+read (128 files/batch). 10k×10KB: 506→678 MB/s (+34%).
+- **Real jars (5.1GB, 4730 files)**: 2527 MB/s compress, 9950 MB/s decompress.
+- blake3 per-slice: DONE (session 1). No TODO remaining.
+- Two-pass architecture stable: big files (>slice_size) chunked, small files batched via io_uring.
+
+## Architecture
+
+- `slot_packer.rs`: Two-pass `compress_dir` — Magazine pool, io_uring reader, 32 workers, 1 writer.
+- `stream_packer.rs`: In-memory `compress_stream` (HTTP/holger) — Arc rounds, 4811 MB/s.
+- `decompress.rs`: N-worker positioned pread (no Magazine on read side). 6310 MB/s mixed.
+
+---
+
+## OLD NOTES (reference only)
 
 DONE session 3 (all GREEN, 21 integration + 5 common tests pass; pushed):
 - READ path REWRITTEN to N-worker positioned I/O (commit 2985eb4). Dropped Magazine

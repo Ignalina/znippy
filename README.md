@@ -6,7 +6,7 @@
 High-performance archive format with per-file compression, parallel processing, and random access.
 Built on **Apache Arrow IPC** + **OpenZL** (zstd+lz4 under the hood).
 
-## Benchmarks (v0.7.2 Gatling pipeline, release — 32 cores)
+## Benchmarks (v0.7.4 Gatling pipeline + io_uring, release — 32 cores)
 
 ### Stream packer (holger — HTTP downloads into archive)
 
@@ -23,10 +23,10 @@ Built on **Apache Arrow IPC** + **OpenZL** (zstd+lz4 under the hood).
 
 | Test | In | Out | Ratio | Compress | Decompress | Files |
 |------|-----|-----|-------|----------|------------|-------|
-| 10k small files (10KB) | 97.7 MB | 1.7 MB | 56x | 614 MB/s | 1,356 MB/s | 10,000 |
-| mixed 720 files | 497 MB | 495 MB | 1.0x | 837 MB/s | 6,139 MB/s | 720 |
+| 10k small files (10KB, tmpfs) | 97.7 MB | 1.7 MB | 56x | 678 MB/s | 1,191 MB/s | 10,000 |
+| real jars (RAID NVMe) | 5,124 MB | — | — | 2,527 MB/s | 9,950 MB/s | 4,730 |
 
-Stream packer numbers are in-memory (no disk reads). Slot packer numbers include full disk I/O (io_uring batched opens+reads on NVMe).
+Stream packer numbers are in-memory (no disk reads). Slot packer includes full disk I/O via **io_uring batched opens+reads** (128 files/batch, zero per-file syscall overhead).
 
 Both compress and decompress run the no-barrier Gatling pipeline across all cores. Already-compressed files (.jar, .gz, .crate, .png, .parquet, etc.) match the skip-extension list and are stored/restored as-is at full I/O speed — they never touch the codec.
 
@@ -222,7 +222,8 @@ cargo test --release -p znippy-tests --test perf_bench -- --ignored --nocapture
 - **v0.5.0**: Dual-pipeline architecture, DuckDB/Polars queryable, zero-copy skip path
 - **v0.6.0**: Streaming format — blobs first, Arrow index last, 8-byte footer; true zero-buffer writes
 - **v0.7.0**: Multi-index container — one Arrow IPC sub-index per `(pkg_type, repo)` group; Arrow IPC manifest; 16-byte footer; module-owned schema; WASM plugin `plugin_schema` export
-- **v0.7.2** (current): No-barrier Gatling pipeline on both paths — write via shared Magazine slots, read via N-worker positioned I/O; per-chunk blake3; ChunkRevolver removed
+- **v0.7.4** (current): io_uring batched open+read in slot_packer small pass; deadlock fix for large file sets; unbounded worker pipeline
+- **v0.7.2**: No-barrier Gatling pipeline on both paths — write via shared Magazine slots, read via N-worker positioned I/O; per-chunk blake3; ChunkRevolver removed
 - **v0.8.0** Iceberg support
 
 🧙 May Odin watch over every bit. 🧙

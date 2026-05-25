@@ -1,6 +1,6 @@
 [package]
 name = "znippy"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2024"
 authors = ["Rickard Lundin <rickard@ignalina.dk>"]
 description = "Znippy compresses files using Arrow IPC. Readable by DuckDB,Polars,Datafusion. 🧙 May Allfather Odin watch over every bit."
