@@ -1,6 +1,6 @@
 [package]
 name = "znippy-plugin-python"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2024"
 description = "Python wheel/sdist metadata plugin for znippy (PEP 503/658)"
 license = "MIT"
