@@ -3,7 +3,7 @@
 
 # Znippy
 
-High-performance archive format with per-file compression, parallel processing, and random access.
+High-performance archive format built for random access, batched random access.
 Built on **Apache Arrow IPC** + **OpenZL** (zstd+lz4 under the hood).
 
 ## Benchmarks (v0.7.4 Gatling pipeline + io_uring, release — 32 cores)
