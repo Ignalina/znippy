@@ -1,0 +1,17 @@
+[package]
+name    = "znippy-zoomies"
+version = "0.1.0"
+edition = "2024"
+description = "Fast parallel OSM-XML index (VTD-style) + static search tree + zero-copy slot pool"
+repository = "https://github.com/Ignalina/znippy"
+# NOTE: the `stree` module is derived from Ragnar Groot Koerkamp's static-search-tree.
+# Confirm and honour the upstream license before publishing to crates.io. Until then
+# `publish = false` hard-blocks `cargo publish`.
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow  = "1"
+memchr  = "2"
+memmap2 = "0.9"
+rayon   = "1"
