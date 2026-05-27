@@ -5,7 +5,10 @@
 //! - [`stree`]: Ragnar Groot Koerkamp's static search tree over sorted `i64` keys
 //!   (AVX2), including an mmap-backed variant whose leaf layer IS the sorted file.
 //! - [`chunk_revolver`]: zero-allocation slot pool for 1-reader / N-worker streaming.
+//! - [`gatling`]: generic no-barrier worker-pool engine (split → N decode → in-order
+//!   collect → sink), parameterised by a [`gatling::Codec`] + [`gatling::Sink`].
 
 pub mod chunk_revolver;
+pub mod gatling;
 pub mod stree;
 pub mod vtd;

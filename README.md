@@ -191,6 +191,14 @@ To also run the real-world network benchmarks (downloads ~1 GB on first run, cac
 cargo xtask -- --real
 ```
 
+### Release contract
+
+`cargo xtask` (no regressions) is a **release gate**: it must pass before `cargo publish`.
+`bench_history.json` (JSONL, one run per line) is the source of truth for that gate.
+The sibling `katana-osm` workspace mirrors this exact `xtask` pattern (conversion
+throughput instead of compress/decompress MB/s) and keeps its own `bench_history.json`;
+together the two histories are the evidence base for any shared streaming-engine change.
+
 ---
 
 ### Run just the tests (no benchmarks, fast)
