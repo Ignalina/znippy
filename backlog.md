@@ -212,6 +212,52 @@ Generic file extraction (decompress) stays type-agnostic in core.
 - Schema = union of *all registered* modules vs only *modules used* in this archive (Arrow writes
   schema first, so "all registered" is simpler; nulls are cheap via the validity bitmap).
 
+#### F6: Spatial archive — znippy as a geo-indexed coordinate store
+
+**Motivation:** katana-osm needs to store ~6.8 billion node coordinates (id, lat, lon)
+and look them up by ID during way geometry resolution. Current approach is a 100+ GB
+flat file sorted by node ID, with Ragnar's STree for tree-routed mmap access.
+Problem: nodes referenced by the same way are spatially close but may be far apart in
+ID-sorted order → random 4K page faults across the entire file.
+
+**Idea:** Use znippy as a spatial archive where each "file" is a geographic tile
+(S2 cell, geohash bucket, or Hilbert curve segment) stored as a compressed Arrow IPC
+chunk (columns: id, lat, lon). Ragnar's STree indexes node_id → tile, then znippy's
+per-file random decompression gives you just that tile's data.
+
+```
+spatial_nodes.znippy:
+  ├── tile_0x3a1f.arrow   (compressed Arrow IPC — ~1M nodes)
+  ├── tile_0x3a20.arrow
+  ├── ...  (~4096 tiles for planet)
+  └── [znippy Arrow IPC index with STree overlay]
+```
+
+**Why this wins:**
+- Ways reference nodes in 1-3 adjacent tiles → decompress only those tiles
+- Each tile (~1M nodes × 16B = 16 MB uncompressed) fits in L3 cache
+- Delta-encoding of spatially-local coords compresses extremely well (maybe 4-8x)
+- Znippy already supports per-file random decompression — no new format work
+- Arrow IPC gives zero-copy columnar access within each tile once decompressed
+- Total archive size maybe ~15-20 GB instead of 100 GB (with compression)
+
+**Two-level index:**
+1. STree (Ragnar's tree): node_id → tile_index (in-RAM, ~2 GB for planet)
+2. Within tile: binary search or secondary STree on the id column
+
+**Simpler alternative — Hilbert-sorted flat file:**
+Sort nodes by Hilbert curve of (lat, lon) instead of by ID. Then nodes that are
+spatially close ARE file-adjacent. Same flat file + STree architecture, but the mmap
+access pattern becomes nearly sequential for way lookups. No znippy compression, but
+massively better page-cache locality. Could be a stepping stone.
+
+**Open questions:**
+- Tile granularity: too few tiles = large decompressions; too many = index overhead
+- Hot tiles (Western Europe, Japan) vs cold tiles (ocean) — adaptive sizing?
+- Can we build the spatial index incrementally during pass 1, or need a second pass?
+- Hilbert vs S2 vs geohash for the partitioning scheme
+- Whether to cache recently-decompressed tiles in an LRU (likely yes, ~8-16 tiles)
+
 ## Performance Baseline (v0.5.0 Arrow IPC, 8-core T14s laptop, release)
 
 | Test | Compress MB/s | Decompress MB/s | Ratio |
