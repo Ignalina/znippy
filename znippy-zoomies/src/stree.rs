@@ -134,20 +134,31 @@ impl STree64 {
 // (stride scan at 128-byte intervals — cheap and cache-friendly).
 // find_exact navigates internal nodes then does a ≤9-record linear scan in the mmap.
 
-const MMAP_RECORD: usize = 16; // bytes per record in the sorted mmap
+const MMAP_RECORD: usize = 16; // default bytes per record (AoS layout)
 
 pub struct STree64Mmap {
     tree:    Vec<[i64; B]>,
     offsets: Vec<usize>,
-    pub count: usize,
+    pub count:  usize,
+    pub stride: usize, // bytes between consecutive i64 IDs in the data slice
 }
 
 impl STree64Mmap {
+    /// Build from a data slice with the default 16-byte AoS record layout
+    /// `[i64 id][f32 lat][f32 lon]`.
     pub fn new(mmap: &[u8], count: usize) -> Self {
+        Self::new_with_stride(mmap, count, MMAP_RECORD)
+    }
+
+    /// Build from a data slice where each ID is `stride` bytes apart.
+    /// Use stride=8 for a pure ID column (Arrow IPC / SoA layout).
+    /// Use stride=16 for the legacy AoS `[i64 id][f32 lat][f32 lon]` layout.
+    pub fn new_with_stride(data: &[u8], count: usize, stride: usize) -> Self {
         assert!(count > 0);
+        assert!(stride >= 8);
         let h      = height(count);
         let lsizes = layer_sizes(count, h);
-        let ni     = h - 1; // number of internal layers (all except leaf)
+        let ni     = h - 1;
 
         let n_blocks: usize = lsizes[..ni].iter().sum();
         let mut offsets = Vec::with_capacity(ni);
@@ -163,16 +174,15 @@ impl STree64Mmap {
                 let j = i % B;
                 let mut k = (i / B) * (B + 1) + j + 1;
                 for _ in lvl..h - 2 { k *= B + 1; }
-                // k is the leaf block index; read first ID of that block from mmap
                 tree[oh + i / B][j] = if k * B < count {
-                    mmap_id(mmap, k * B)
+                    id_at(data, k * B, stride)
                 } else {
                     MAX64
                 };
             }
         }
 
-        Self { tree, offsets, count }
+        Self { tree, offsets, count, stride }
     }
 
     #[inline]
@@ -182,11 +192,11 @@ impl STree64Mmap {
             let jump = count_lt(&self.tree[o + k], q);
             k = k * (B + 1) + jump;
         }
-        // k = leaf block; scan up to B+1 records (handles overflow when all B < q)
+        let stride = self.stride;
         for i in 0..=B {
             let pos = k * B + i;
             if pos >= self.count { break; }
-            match mmap_id(mmap, pos).cmp(&q) {
+            match id_at(mmap, pos, stride).cmp(&q) {
                 std::cmp::Ordering::Equal   => return Some(pos),
                 std::cmp::Ordering::Greater => break,
                 std::cmp::Ordering::Less    => {}
@@ -243,21 +253,23 @@ impl STree64Mmap {
         //    On Linux this is a non-blocking call to advise the page cache;
         //    failures are silently ignored (this is purely a performance hint).
         if let (Some(&(lo_k, _)), Some(&(hi_k, _))) = (routed.first(), routed.last()) {
-            let lo_byte = lo_k * B * MMAP_RECORD;
-            let hi_byte = ((hi_k + 1) * B + 1).min(self.count) * MMAP_RECORD;
+            let stride = self.stride;
+            let lo_byte = lo_k * B * stride;
+            let hi_byte = ((hi_k + 1) * B + 1).min(self.count) * stride;
             if hi_byte > lo_byte {
                 advise_willneed(&mmap[lo_byte..hi_byte]);
             }
         }
 
         // 4. Scan leaves in sorted order, scatter into `out` by original index.
+        let stride = self.stride;
         let mut out = vec![None; n];
         for (k, orig) in routed {
             let q = ids[orig as usize];
             for i in 0..=B {
                 let pos = k * B + i;
                 if pos >= self.count { break; }
-                match mmap_id(mmap, pos).cmp(&q) {
+                match id_at(mmap, pos, stride).cmp(&q) {
                     std::cmp::Ordering::Equal   => { out[orig as usize] = Some(pos); break; }
                     std::cmp::Ordering::Greater => break,
                     std::cmp::Ordering::Less    => {}
@@ -315,9 +327,10 @@ impl STree64Mmap {
 
         // 2. Sort & madvise as before
         routed.sort_unstable_by_key(|&(k, _)| k);
+        let stride = self.stride;
         if let (Some(&(lo_k, _)), Some(&(hi_k, _))) = (routed.first(), routed.last()) {
-            let lo_byte = lo_k * B * MMAP_RECORD;
-            let hi_byte = ((hi_k + 1) * B + 1).min(self.count) * MMAP_RECORD;
+            let lo_byte = lo_k * B * stride;
+            let hi_byte = ((hi_k + 1) * B + 1).min(self.count) * stride;
             if hi_byte > lo_byte {
                 advise_willneed(&mmap[lo_byte..hi_byte]);
             }
@@ -330,7 +343,7 @@ impl STree64Mmap {
             for t in 0..=B {
                 let pos = k * B + t;
                 if pos >= self.count { break; }
-                match mmap_id(mmap, pos).cmp(&q) {
+                match id_at(mmap, pos, stride).cmp(&q) {
                     std::cmp::Ordering::Equal => { out[orig as usize] = Some(pos); break; }
                     std::cmp::Ordering::Greater => break,
                     _ => {}
@@ -386,8 +399,15 @@ fn prefetch_index<T>(s: &[T], index: usize) {
 }
 
 #[inline]
+fn id_at(data: &[u8], idx: usize, stride: usize) -> i64 {
+    let off = idx * stride;
+    i64::from_le_bytes(data[off..off + 8].try_into().unwrap())
+}
+
+/// Legacy alias — used internally where stride is always MMAP_RECORD.
+#[inline]
 fn mmap_id(mmap: &[u8], idx: usize) -> i64 {
-    i64::from_le_bytes(mmap[idx * MMAP_RECORD..idx * MMAP_RECORD + 8].try_into().unwrap())
+    id_at(mmap, idx, MMAP_RECORD)
 }
 
 // ── Tree shape helpers ─────────────────────────────────────────────────────────
@@ -621,9 +641,10 @@ impl STree64Mmap {
 
         // 2. Sort + madvise
         routed.sort_unstable_by_key(|&(k, _)| k);
+        let stride = self.stride;
         if let (Some(&(lo_k, _)), Some(&(hi_k, _))) = (routed.first(), routed.last()) {
-            let lo_byte = lo_k * B * MMAP_RECORD;
-            let hi_byte = ((hi_k + 1) * B + 1).min(self.count) * MMAP_RECORD;
+            let lo_byte = lo_k * B * stride;
+            let hi_byte = ((hi_k + 1) * B + 1).min(self.count) * stride;
             if hi_byte > lo_byte {
                 advise_willneed(&mmap[lo_byte..hi_byte]);
             }
@@ -636,7 +657,7 @@ impl STree64Mmap {
             for t in 0..=B {
                 let pos = k * B + t;
                 if pos >= self.count { break; }
-                match mmap_id(mmap, pos).cmp(&q) {
+                match id_at(mmap, pos, stride).cmp(&q) {
                     std::cmp::Ordering::Equal => { out[orig as usize] = Some(pos); break; }
                     std::cmp::Ordering::Greater => break,
                     _ => {}
@@ -743,9 +764,10 @@ impl STree64Mmap {
 
         // Sort + madvise + leaf scan (same as other batch methods)
         routed.sort_unstable_by_key(|&(k, _)| k);
+        let stride = self.stride;
         if let (Some(&(lo_k, _)), Some(&(hi_k, _))) = (routed.first(), routed.last()) {
-            let lo_byte = lo_k * B * MMAP_RECORD;
-            let hi_byte = ((hi_k + 1) * B + 1).min(self.count) * MMAP_RECORD;
+            let lo_byte = lo_k * B * stride;
+            let hi_byte = ((hi_k + 1) * B + 1).min(self.count) * stride;
             if hi_byte > lo_byte {
                 advise_willneed(&mmap[lo_byte..hi_byte]);
             }
@@ -757,7 +779,7 @@ impl STree64Mmap {
             for t in 0..=B {
                 let pos = k * B + t;
                 if pos >= self.count { break; }
-                match mmap_id(mmap, pos).cmp(&q) {
+                match id_at(mmap, pos, stride).cmp(&q) {
                     std::cmp::Ordering::Equal => { out[orig as usize] = Some(pos); break; }
                     std::cmp::Ordering::Greater => break,
                     _ => {}
@@ -790,6 +812,15 @@ mod tests {
             let lon = (i as f32) * -0.002;
             buf.extend_from_slice(&lat.to_le_bytes());
             buf.extend_from_slice(&lon.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Build a pure ID column buffer (stride=8) — simulates Arrow IPC SoA layout.
+    fn build_ids_only(ids: &[i64]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(ids.len() * 8);
+        for &id in ids {
+            buf.extend_from_slice(&id.to_le_bytes());
         }
         buf
     }
@@ -1201,6 +1232,51 @@ mod tests {
         assert_eq!(tree.lookup_batch_pipeline::<16>(&qs, &mmap), serial);
         assert_eq!(tree.lookup_batch_ptr::<16>(&qs, &mmap), serial);
         assert_eq!(tree.lookup_batch_interleave::<8>(&qs, &mmap), serial);
+    }
+
+    // ── Stride=8 (Arrow IPC / SoA) tests ─────────────────────────────────────
+
+    #[test]
+    fn stride8_find_exact() {
+        let ids = gen_sorted_sparse_ids(10_000, 500);
+        let id_buf = build_ids_only(&ids);
+        let tree = STree64Mmap::new_with_stride(&id_buf, ids.len(), 8);
+
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(tree.find_exact(id, &id_buf), Some(i));
+        }
+        assert_eq!(tree.find_exact(ids[0] - 1, &id_buf), None);
+        assert_eq!(tree.find_exact(*ids.last().unwrap() + 1, &id_buf), None);
+    }
+
+    #[test]
+    fn stride8_batch_all_methods() {
+        let ids = gen_sorted_sparse_ids(50_000, 510);
+        let id_buf = build_ids_only(&ids);
+        let tree = STree64Mmap::new_with_stride(&id_buf, ids.len(), 8);
+        let qs = gen_queries(&ids, 5_000, 5_000, 511);
+
+        let serial: Vec<_> = qs.iter().map(|&q| tree.find_exact(q, &id_buf)).collect();
+        let batch = tree.lookup_batch(&qs, &id_buf);
+        let pipe = tree.lookup_batch_pipeline::<16>(&qs, &id_buf);
+        let ptr = tree.lookup_batch_ptr::<16>(&qs, &id_buf);
+        let interleave = tree.lookup_batch_interleave::<8>(&qs, &id_buf);
+
+        assert_eq!(batch, serial, "stride=8 lookup_batch");
+        assert_eq!(pipe, serial, "stride=8 pipeline");
+        assert_eq!(ptr, serial, "stride=8 ptr");
+        assert_eq!(interleave, serial, "stride=8 interleave");
+    }
+
+    #[test]
+    fn stride8_all_hits() {
+        let ids = gen_sorted_sparse_ids(5_000, 520);
+        let id_buf = build_ids_only(&ids);
+        let tree = STree64Mmap::new_with_stride(&id_buf, ids.len(), 8);
+
+        let expected: Vec<_> = (0..ids.len()).map(Some).collect();
+        assert_eq!(tree.lookup_batch(&ids, &id_buf), expected);
+        assert_eq!(tree.lookup_batch_pipeline::<8>(&ids, &id_buf), expected);
     }
 
     // ── Micro-benchmark (prints timing, not gated) ────────────────────────────
