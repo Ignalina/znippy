@@ -154,6 +154,7 @@ impl STree64Mmap {
     /// Use stride=8 for a pure ID column (Arrow IPC / SoA layout).
     /// Use stride=16 for the legacy AoS `[i64 id][f32 lat][f32 lon]` layout.
     pub fn new_with_stride(data: &[u8], count: usize, stride: usize) -> Self {
+        use rayon::prelude::*;
         assert!(count > 0);
         assert!(stride >= 8);
         let h      = height(count);
@@ -169,17 +170,20 @@ impl STree64Mmap {
 
         for lvl in (0..ni).rev() {
             let oh = offsets[lvl];
-            tree[oh..oh + lsizes[lvl]].iter_mut().for_each(|nd| nd.fill(MAX64));
-            for i in 0..B * lsizes[lvl] {
-                let j = i % B;
-                let mut k = (i / B) * (B + 1) + j + 1;
-                for _ in lvl..h - 2 { k *= B + 1; }
-                tree[oh + i / B][j] = if k * B < count {
-                    id_at(data, k * B, stride)
-                } else {
-                    MAX64
-                };
-            }
+            let n_nodes = lsizes[lvl];
+            tree[oh..oh + n_nodes].par_iter_mut().enumerate().for_each(|(blk, node)| {
+                node.fill(MAX64);
+                for j in 0..B {
+                    let i = blk * B + j;
+                    let mut k = blk * (B + 1) + j + 1;
+                    for _ in lvl..h - 2 { k *= B + 1; }
+                    node[j] = if k * B < count {
+                        id_at(data, k * B, stride)
+                    } else {
+                        MAX64
+                    };
+                }
+            });
         }
 
         Self { tree, offsets, count, stride }
