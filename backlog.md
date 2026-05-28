@@ -258,6 +258,19 @@ massively better page-cache locality. Could be a stepping stone.
 - Hilbert vs S2 vs geohash for the partitioning scheme
 - Whether to cache recently-decompressed tiles in an LRU (likely yes, ~8-16 tiles)
 
+### F7: Transfer/resurrect VTD into znippy-zoomies as generic parallel XML parser
+
+The VTD scanner (`xml_vtd` in katana-osm) finds XML element boundaries fast using
+memchr. Combined with gatling's worker pool, it gives parallel XML parsing with
+zero allocation for the index itself (streaming callback pattern). This is useful
+as a generic parallel XML parser module — not OSM-specific. The element-boundary
+finding + safe-split logic (`find_safe_slot_end`) is reusable for any large XML.
+
+Transfer the core scanning primitives (`build_elem_index_slice`, `find_safe_slot_end`,
+attribute parsing) into znippy-zoomies as a `vtd` module. The OSM-specific record
+building stays in katana-osm; the generic XML scanner moves to znippy-zoomies alongside
+gatling (which already orchestrates the parallel pipeline around it).
+
 ## Performance Baseline (v0.5.0 Arrow IPC, 8-core T14s laptop, release)
 
 | Test | Compress MB/s | Decompress MB/s | Ratio |
