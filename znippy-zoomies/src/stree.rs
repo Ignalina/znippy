@@ -194,6 +194,98 @@ impl STree64Mmap {
         }
         None
     }
+
+    /// Tree-only routing: descend internal nodes to a leaf block index.
+    /// Skips the mmap leaf scan — useful when the caller wants to sort all
+    /// queries by leaf-block index before touching the mmap (to convert
+    /// random page faults into a sequential read pattern).
+    ///
+    /// Returns the leaf block index `k` such that the candidate record range
+    /// is `[k*B, k*B + B + 1)` (the trailing +1 handles overflow when every
+    /// element in block `k` is `< q`).
+    #[inline]
+    pub fn route_to_block(&self, q: i64) -> usize {
+        let mut k = 0usize;
+        for &o in &self.offsets {
+            let jump = count_lt(&self.tree[o + k], q);
+            k = k * (B + 1) + jump;
+        }
+        k
+    }
+
+    /// Batch lookup: resolve `ids` against the on-disk sorted record store.
+    /// Returns `out[i]` = position of `ids[i]` in the mmap, or `None` if absent.
+    ///
+    /// Internally:
+    ///   1. Tree-only routing for every id (in-RAM, ~10 cache-line reads each)
+    ///   2. Sort `(leaf_block, original_index)` pairs — sequential mmap walk
+    ///   3. `madvise(WILLNEED)` on the distinct page range so the kernel can
+    ///      issue parallel readahead for the upcoming leaf scans
+    ///   4. Linear leaf scan in sorted order; scatter results back
+    ///
+    /// For a slot with millions of node-refs spread across a 144 GB coord
+    /// mmap, this converts millions of random page faults into a near-
+    /// sequential read pattern + parallel readahead. Expected speedup on
+    /// cold pages: ~4-8× vs N serial `find_exact` calls.
+    pub fn lookup_batch(&self, ids: &[i64], mmap: &[u8]) -> Vec<Option<usize>> {
+        let n = ids.len();
+        if n == 0 { return Vec::new(); }
+
+        // 1. Route every id through the tree → (leaf_block, original_index).
+        let mut routed: Vec<(usize, u32)> = (0..n)
+            .map(|i| (self.route_to_block(ids[i]), i as u32))
+            .collect();
+
+        // 2. Sort by leaf block so the mmap walk is sequential.
+        routed.sort_unstable_by_key(|&(k, _)| k);
+
+        // 3. Best-effort readahead hint over the touched range.
+        //    On Linux this is a non-blocking call to advise the page cache;
+        //    failures are silently ignored (this is purely a performance hint).
+        if let (Some(&(lo_k, _)), Some(&(hi_k, _))) = (routed.first(), routed.last()) {
+            let lo_byte = lo_k * B * MMAP_RECORD;
+            let hi_byte = ((hi_k + 1) * B + 1).min(self.count) * MMAP_RECORD;
+            if hi_byte > lo_byte {
+                advise_willneed(&mmap[lo_byte..hi_byte]);
+            }
+        }
+
+        // 4. Scan leaves in sorted order, scatter into `out` by original index.
+        let mut out = vec![None; n];
+        for (k, orig) in routed {
+            let q = ids[orig as usize];
+            for i in 0..=B {
+                let pos = k * B + i;
+                if pos >= self.count { break; }
+                match mmap_id(mmap, pos).cmp(&q) {
+                    std::cmp::Ordering::Equal   => { out[orig as usize] = Some(pos); break; }
+                    std::cmp::Ordering::Greater => break,
+                    std::cmp::Ordering::Less    => {}
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Best-effort `madvise(MADV_WILLNEED)` over a mmap slice. Linux-only; on
+/// other platforms this is a no-op. Errors are silently ignored — the
+/// kernel may reject the hint (e.g. unaligned, beyond mapping) but the
+/// subsequent reads still succeed via normal page faults.
+#[inline]
+fn advise_willneed(slice: &[u8]) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let _ = libc::madvise(
+            slice.as_ptr() as *mut libc::c_void,
+            slice.len(),
+            libc::MADV_WILLNEED,
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = slice;
+    }
 }
 
 #[inline]
