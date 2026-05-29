@@ -118,6 +118,25 @@ pub trait TypedSink<T>: Send {
     fn finish(&mut self) -> Result<()> { Ok(()) }
 }
 
+/// How a slot's backing memory is grown/faulted when the reader fills it.
+///
+/// Both modes lazily allocate slots (a small input still only ever touches one
+/// slot); they differ only in how much of an *allocated* slot gets faulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SlotFill {
+    /// Grow the slot in blocks to exactly the bytes read, never faulting the
+    /// unused tail. A 24 MB read into a 232 MB slot touches ~24 MB, not 232 MB.
+    /// Best for small / single-chunk / partial-tail inputs. This is the default.
+    #[default]
+    Incremental,
+    /// Size each slot to the full `carry_headroom + chunk_size` once, on first
+    /// use, then reuse it across reads with no re-zeroing and no reallocation.
+    /// The up-front fault is paid once and amortizes to ~zero over the many
+    /// full chunks of a large (planet-scale) input. Best when nearly every
+    /// chunk is full so the slot tail is never wasted.
+    Big,
+}
+
 /// Engine tuning. `slot size = carry_headroom + chunk_size`.
 pub struct Config {
     /// Compressed bytes read per slot.
@@ -128,6 +147,8 @@ pub struct Config {
     pub ring_slots: usize,
     /// Bytes to prepend to the first chunk (e.g. a stream header already read).
     pub initial_carry: Vec<u8>,
+    /// Slot memory-growth strategy. See [`SlotFill`].
+    pub slot_fill: SlotFill,
 }
 
 // ── Internal message types ──────────────────────────────────────────────────
@@ -171,48 +192,75 @@ enum Msg {
 /// `carry_headroom` (leaving the front free for a prepended carry). Returns the
 /// number of bytes read.
 ///
-/// Grows the slot incrementally so only the bytes actually read are
-/// faulted/zeroed. A small or final partial chunk (e.g. a 24 MB read into a
-/// 232 MB slot) no longer touches the ~200 MB of unused tail — that page-fault +
-/// memset of memory we never read was the dominant cost on small inputs. For a
-/// full chunk (`got == chunk_size`, the planet steady state) the touched region
-/// equals the old `slot_size`, so there is no regression on large reads.
+/// The [`SlotFill`] mode controls how much slot memory gets faulted:
+/// - [`SlotFill::Incremental`] grows the slot in blocks to exactly the bytes
+///   read, never touching the unused tail — the win on small / partial inputs.
+/// - [`SlotFill::Big`] sizes the slot to its full extent once and reuses it with
+///   no re-zeroing or reallocation — the up-front fault amortizes over the many
+///   full chunks of a planet-scale input.
+///
+/// For a full chunk (`got == chunk_size`) both modes touch the same region, so
+/// large reads never regress regardless of mode.
 fn fill_slot<R: Read>(
     src: &mut R,
     slot: &mut Vec<u8>,
     carry_headroom: usize,
     chunk_size: usize,
+    fill: SlotFill,
 ) -> usize {
-    const READ_BLOCK: usize = 8 * 1024 * 1024;
-    slot.clear();
-    // Carry prefix: bytes [data_start..carry_headroom] are overwritten by the
-    // prepended carry before use; [0..data_start] is never read.
-    slot.resize(carry_headroom, 0);
-    let mut got = 0usize;
-    while got < chunk_size {
-        let want = READ_BLOCK.min(chunk_size - got);
-        let base = slot.len();
-        slot.resize(base + want, 0);
-        match src.read(&mut slot[base..base + want]) {
-            Ok(0) => {
-                slot.truncate(base);
-                break;
+    match fill {
+        SlotFill::Big => {
+            let slot_size = carry_headroom + chunk_size;
+            // Pay the fault once: a fresh slot is sized here; a recycled slot is
+            // already full-length, so this is a no-op (no realloc, no re-zero).
+            if slot.len() != slot_size {
+                slot.resize(slot_size, 0);
             }
-            Ok(k) => {
-                slot.truncate(base + k);
-                got += k;
+            let mut got = 0usize;
+            while got < chunk_size {
+                match src.read(&mut slot[carry_headroom + got..slot_size]) {
+                    Ok(0) => break,
+                    Ok(k) => got += k,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                slot.truncate(base);
-                continue;
+            // Leave the slot full-length so the next reuse skips the resize.
+            got
+        }
+        SlotFill::Incremental => {
+            const READ_BLOCK: usize = 8 * 1024 * 1024;
+            slot.clear();
+            // Carry prefix: bytes [data_start..carry_headroom] are overwritten by
+            // the prepended carry before use; [0..data_start] is never read.
+            slot.resize(carry_headroom, 0);
+            let mut got = 0usize;
+            while got < chunk_size {
+                let want = READ_BLOCK.min(chunk_size - got);
+                let base = slot.len();
+                slot.resize(base + want, 0);
+                match src.read(&mut slot[base..base + want]) {
+                    Ok(0) => {
+                        slot.truncate(base);
+                        break;
+                    }
+                    Ok(k) => {
+                        slot.truncate(base + k);
+                        got += k;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        slot.truncate(base);
+                        continue;
+                    }
+                    Err(_) => {
+                        slot.truncate(base);
+                        break;
+                    }
+                }
             }
-            Err(_) => {
-                slot.truncate(base);
-                break;
-            }
+            got
         }
     }
-    got
 }
 
 /// Run the engine to completion over `reader`, driving `sink`.
@@ -252,6 +300,7 @@ pub fn run<C: Codec, S: Sink>(
         let chunk_size = cfg.chunk_size;
         let carry_headroom = cfg.carry_headroom;
         let ring_slots = cfg.ring_slots;
+        let slot_fill = cfg.slot_fill;
         s.spawn(move || {
             use std::sync::mpsc::TryRecvError;
             let mut src = reader;
@@ -271,7 +320,7 @@ pub fn run<C: Codec, S: Sink>(
                     },
                     Err(TryRecvError::Disconnected) => break,
                 };
-                let got = fill_slot(&mut src, &mut slot, carry_headroom, chunk_size);
+                let got = fill_slot(&mut src, &mut slot, carry_headroom, chunk_size, slot_fill);
                 let is_last = got < chunk_size;
                 if filled_tx.send((slot, got, is_last)).is_err() {
                     break;
@@ -529,6 +578,7 @@ pub fn run_typed<C: TypedCodec, S: TypedSink<C::Output>>(
         let chunk_size = cfg.chunk_size;
         let carry_headroom = cfg.carry_headroom;
         let ring_slots = cfg.ring_slots;
+        let slot_fill = cfg.slot_fill;
         s.spawn(move || {
             use std::sync::mpsc::TryRecvError;
             let mut src = reader;
@@ -546,7 +596,7 @@ pub fn run_typed<C: TypedCodec, S: TypedSink<C::Output>>(
                     },
                     Err(TryRecvError::Disconnected) => break,
                 };
-                let got = fill_slot(&mut src, &mut slot, carry_headroom, chunk_size);
+                let got = fill_slot(&mut src, &mut slot, carry_headroom, chunk_size, slot_fill);
                 let is_last = got < chunk_size;
                 if filled_tx.send((slot, got, is_last)).is_err() {
                     break;
