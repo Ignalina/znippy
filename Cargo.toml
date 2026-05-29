@@ -5,6 +5,7 @@ members = [
     "znippy-decompress",
     "znippy-cli",
     "znippy-common",
+    "znippy-iceberg",
     "znippy",
     "znippy-plugin-maven",
     "znippy-plugin-python",
