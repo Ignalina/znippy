@@ -1,6 +1,6 @@
 [package]
 name    = "znippy-zoomies"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 description = "Fast parallel OSM-XML index (VTD-style) + static search tree + zero-copy slot pool + generic no-barrier streaming engine (gatling) + parallel sample sort (psort)"
 repository = "https://github.com/Ignalina/znippy"
