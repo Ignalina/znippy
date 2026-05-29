@@ -46,7 +46,13 @@ pub const RECORD_SIZE: usize = 16;
 /// Sign handling: the leading `i64` is sign-flipped (`^ 1<<63`) before bucketing
 /// so signed keys order correctly under the unsigned-compare splitter search.
 pub fn samplesort_aos_by_i64_key(records: &mut [[u8; RECORD_SIZE]]) {
-    const SEQ_FLOOR: usize = 1 << 16; // 65 536
+    // Below this, a single-threaded sort_unstable beats the parallel path:
+    // the 4 thread::scope rounds (classify/scatter/sort/writeback) spawn and
+    // join N threads each, and that teardown dominates for small inputs.
+    // Liechtenstein's resolved pass sorts ~353 K records — keeping it under
+    // the floor recovers the post-Gatling regression. Planet (~10 B nodes)
+    // and other large workloads stay comfortably above and run parallel.
+    const SEQ_FLOOR: usize = 1 << 21; // 2 097 152
     let n = records.len();
     if n <= 1 { return; }
     if n < SEQ_FLOOR {
@@ -331,7 +337,9 @@ mod tests {
 
     #[test]
     fn samplesort_matches_std_sort() {
-        for &n in &[0usize, 1, 7, SEQ_FLOOR_FOR_TEST - 1, SEQ_FLOOR_FOR_TEST, 100_000, 1_500_000] {
+        // Includes a case above the real SEQ_FLOOR (1<<21) so the parallel
+        // sample-sort path stays covered after the floor was raised.
+        for &n in &[0usize, 1, 7, SEQ_FLOOR_FOR_TEST - 1, SEQ_FLOOR_FOR_TEST, 100_000, 1_500_000, 2_200_000] {
             let mut records = build_shuffled_records(n);
             let mut expected = records.clone();
             expected.sort_unstable_by_key(|r| i64::from_le_bytes(r[..8].try_into().unwrap()));
