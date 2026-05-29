@@ -105,7 +105,9 @@ pub fn samplesort_aos_by_i64_key(records: &mut [[u8; RECORD_SIZE]]) {
     // Record each element's bucket once into `bucket_id` so the scatter pass
     // doesn't re-run the binary search.
     let mut bucket_id: Vec<u16> = vec![0u16; n];
-    let mut hists: Vec<Vec<u32>> = (0..n_threads).map(|_| vec![0u32; k]).collect();
+    // Offsets are `usize` so the prefix sum addresses >u32::MAX records
+    // (e.g. planet's ~10.4 B nodes); per-thread × k buckets, so negligible RAM.
+    let mut hists: Vec<Vec<usize>> = (0..n_threads).map(|_| vec![0usize; k]).collect();
     std::thread::scope(|s| {
         let recs = &*records;
         let spl = &splitters;
@@ -127,21 +129,20 @@ pub fn samplesort_aos_by_i64_key(records: &mut [[u8; RECORD_SIZE]]) {
     // hists[t][b] becomes the dst position where thread t starts writing its
     // bucket-b records. Globally non-overlapping → race-free scatter.
     {
-        let mut running: u32 = 0;
+        let mut running: usize = 0;
         for b in 0..k {
             for hist in hists.iter_mut() {
                 let count = hist[b];
                 hist[b] = running;
-                running = running.checked_add(count)
-                    .expect("samplesort offset overflow (n must fit in u32)");
+                running += count;
             }
         }
-        debug_assert_eq!(running as usize, n);
+        debug_assert_eq!(running, n);
     }
     // Bucket b begins at thread 0's offset (it is first in the bucket-major
     // order). Snapshot before the scatter mutates `hists`.
-    let mut bucket_start: Vec<u32> = (0..k).map(|b| hists[0][b]).collect();
-    bucket_start.push(n as u32);
+    let mut bucket_start: Vec<usize> = (0..k).map(|b| hists[0][b]).collect();
+    bucket_start.push(n);
 
     // ── Phase 3: parallel scatter (records → scratch, grouped by bucket) ─────
     let mut scratch: Vec<[u8; RECORD_SIZE]> = vec![[0u8; RECORD_SIZE]; n];
@@ -156,7 +157,7 @@ pub fn samplesort_aos_by_i64_key(records: &mut [[u8; RECORD_SIZE]]) {
                 let dst = dst_addr as *mut [u8; RECORD_SIZE];
                 for i in start..end {
                     let b = bid[i] as usize;
-                    let pos = hist[b] as usize;
+                    let pos = hist[b];
                     hist[b] += 1;
                     unsafe { std::ptr::copy_nonoverlapping(&recs[i], dst.add(pos), 1); }
                 }
@@ -176,8 +177,8 @@ pub fn samplesort_aos_by_i64_key(records: &mut [[u8; RECORD_SIZE]]) {
                     loop {
                         let b = next.fetch_add(1, Ordering::Relaxed);
                         if b >= k { break; }
-                        let lo = bucket_start[b] as usize;
-                        let hi = bucket_start[b + 1] as usize;
+                        let lo = bucket_start[b];
+                        let hi = bucket_start[b + 1];
                         if hi - lo > 1 {
                             let base = scratch_addr as *mut [u8; RECORD_SIZE];
                             let slice = unsafe {
@@ -232,7 +233,6 @@ pub fn radix_sort_aos_by_i64_key(records: &mut [[u8; RECORD_SIZE]]) {
         records.sort_unstable_by_key(|r| i64::from_le_bytes(r[..8].try_into().unwrap()));
         return;
     }
-    assert!(n <= u32::MAX as usize, "radix_sort_aos_by_i64_key: n {n} exceeds u32 offsets");
 
     let mut scratch: Vec<[u8; RECORD_SIZE]> = vec![[0u8; RECORD_SIZE]; n];
     let mut src_addr = records.as_mut_ptr() as usize;
@@ -254,7 +254,7 @@ pub fn radix_sort_aos_by_i64_key(records: &mut [[u8; RECORD_SIZE]]) {
     for pass in 0..PASSES {
         let shift = (pass * 16) as u32;
 
-        let mut hists: Vec<Vec<u32>> = (0..n_threads).map(|_| vec![0u32; RADIX]).collect();
+        let mut hists: Vec<Vec<usize>> = (0..n_threads).map(|_| vec![0usize; RADIX]).collect();
         std::thread::scope(|s| {
             for (t, hist) in hists.iter_mut().enumerate() {
                 let start = t * chunk;
@@ -271,16 +271,15 @@ pub fn radix_sort_aos_by_i64_key(records: &mut [[u8; RECORD_SIZE]]) {
         });
 
         {
-            let mut running: u32 = 0;
+            let mut running: usize = 0;
             for b in 0..RADIX {
                 for hist in hists.iter_mut() {
                     let count = hist[b];
                     hist[b] = running;
-                    running = running.checked_add(count)
-                        .expect("radix sort offset overflow (n must fit in u32)");
+                    running += count;
                 }
             }
-            debug_assert_eq!(running as usize, n);
+            debug_assert_eq!(running, n);
         }
 
         std::thread::scope(|s| {
@@ -295,7 +294,7 @@ pub fn radix_sort_aos_by_i64_key(records: &mut [[u8; RECORD_SIZE]]) {
                     for i in start..end {
                         let rec_ptr = unsafe { src.add(i) };
                         let bucket  = key_bits(rec_ptr, shift);
-                        let pos = hist[bucket] as usize;
+                        let pos = hist[bucket];
                         hist[bucket] += 1;
                         unsafe { std::ptr::copy_nonoverlapping(rec_ptr, dst.add(pos), 1); }
                     }
