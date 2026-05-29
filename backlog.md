@@ -28,6 +28,29 @@
 - [x] Dropped v0.6 read support (archives must be re-compressed)
 - [x] 20 integration tests (5 new v0.7: manifest roundtrip, footer detection, multi-index write/read, single-group v0.7)
 
+## Done (v0.8.0) — Iceberg support
+- [x] `ArchiveMetaSink` trait (znippy-common): sync abstraction over the archive
+  metadata layer (sub-indexes + manifest + footer), keeping the blob/compression
+  pipeline untouched
+- [x] `ArrowIpcSink`: default backend reproducing the v0.7 container format
+  **byte-identically** (verified via structural fingerprint; slot_packer +
+  stream_packer now write their metadata tail through the trait)
+- [x] `znippy-iceberg` crate: `IcebergSink` backend using the official `iceberg`
+  crate (0.9.1) — writes a real on-disk Iceberg table (Parquet + metadata.json +
+  Avro manifests) to a local-fs warehouse (MemoryCatalog + LocalFsStorageFactory)
+- [x] One namespace per archive, one table per `(pkg_type, repo, module)` sub-index
+- [x] Arrow 58 → IPC bytes → Arrow 57 bridge across the version gap; unsigned
+  columns widened (`UInt32→Int32`, `UInt64→Int64`) since Iceberg has no unsigned types
+- [x] **tokio/iceberg/Arrow-57/Parquet confined to znippy-iceberg** — all existing
+  crates stay tokio-free (sync trait bridged to async API via private runtime +
+  `block_on` in `finish()`)
+- [x] Round-trip test (write base index → read rows back via StaticTable)
+- [ ] **Follow-up:** CLI `--format arrow-ipc|iceberg` + `--warehouse` flags —
+  requires injecting `Box<dyn ArchiveMetaSink>` into `compress_dir`/`compress_stream`
+  (can be done without adding tokio to znippy-compress); blobs stay in the `.znippy`
+  sidecar, Iceberg table holds the index incl. `blob_offset`/`blob_size`
+- [ ] **Follow-up:** `IcebergZnippyReader` implementing `ZnippyReader` for read-back
+
 ## Arrow IPC Serialization Bottleneck — Technical Analysis
 
 ### The numbers
