@@ -21,9 +21,10 @@ use std::thread;
 use znippy_common::CompressionReport;
 use znippy_common::common_config::CONFIG;
 use znippy_common::index::{
-    MULTI_INDEX_MAGIC, ManifestEntry, build_arrow_metadata_for_config, build_metadata_batch,
-    compose_index_schema, should_skip_compression, write_manifest_bytes,
+    build_arrow_metadata_for_config, build_metadata_batch,
+    compose_index_schema, should_skip_compression,
 };
+use znippy_common::{ArchiveMetaSink, ArrowIpcSink, GroupKey};
 use znippy_common::meta::{BlobMeta, ChunkMeta};
 
 /// Entries bigger than this are cut into slice-size rounds; smaller stay whole.
@@ -301,8 +302,6 @@ fn run_pipeline(
     let blob_bytes = out_cursor.load(Ordering::Relaxed);
     let total_chunks = all_blobs.len() as u64;
 
-    use arrow::ipc::writer::StreamWriter;
-
     // Group blob indices by (pkg_type, repo). BTreeMap keeps groups stable.
     let file_keys: Vec<(i8, String)> = reg
         .pkg_types
@@ -318,13 +317,12 @@ fn run_pipeline(
     }
 
     let meta_map = build_arrow_metadata_for_config(&CONFIG);
-    let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
-    let mut cursor = blob_bytes; // index region begins right after the blobs
+    let mut sink: Box<dyn ArchiveMetaSink> =
+        Box::new(ArrowIpcSink::new(Arc::clone(&file), blob_bytes));
+    let group_count = groups.len();
 
     for ((pkg_type, repo), blob_indices) in &groups {
-        let sub_start = cursor;
         let group_blobs: Vec<_> = blob_indices.iter().map(|&i| all_blobs[i].clone()).collect();
-        let row_count = group_blobs.len() as u64;
 
         let batch = build_metadata_batch(&group_blobs, |fi| reg.paths[fi as usize].clone(), &[], &[])
             .map_err(|e| anyhow!("build sub-index batch: {e}"))?;
@@ -332,40 +330,25 @@ fn run_pipeline(
             compose_index_schema(&[]).fields().to_vec(),
             meta_map.clone(),
         );
-        let mut sub_bytes: Vec<u8> = Vec::new();
-        let mut sw = StreamWriter::try_new(&mut sub_bytes, &schema_with_meta)
-            .map_err(|e| anyhow!("sub-index writer: {e}"))?;
-        sw.write(&batch).map_err(|e| anyhow!("sub-index write: {e}"))?;
-        sw.finish().map_err(|e| anyhow!("sub-index finish: {e}"))?;
 
-        let sub_len = sub_bytes.len() as u64;
-        file.write_all_at(&sub_bytes, sub_start)?;
-        cursor += sub_len;
-
-        manifest_entries.push(ManifestEntry {
-            pkg_type: *pkg_type,
-            repo: repo.clone(),
-            module_name: String::new(),
-            index_offset: sub_start,
-            index_len: sub_len,
-            row_count,
-        });
+        sink.push_subindex(
+            &schema_with_meta,
+            std::slice::from_ref(&batch),
+            GroupKey {
+                pkg_type: *pkg_type,
+                repo: repo.clone(),
+                module_name: String::new(),
+            },
+        )?;
     }
 
-    let manifest_offset = cursor;
-    let manifest_bytes = write_manifest_bytes(&manifest_entries).map_err(|e| anyhow!("manifest: {e}"))?;
-    file.write_all_at(&manifest_bytes, manifest_offset)?;
-    let after = manifest_offset + manifest_bytes.len() as u64;
-    file.write_all_at(&MULTI_INDEX_MAGIC, after)?;
-    file.write_all_at(&manifest_offset.to_le_bytes(), after + MULTI_INDEX_MAGIC.len() as u64)?;
-    file.sync_all()?;
-
-    let total_bytes_out = after + MULTI_INDEX_MAGIC.len() as u64 + 8;
+    let manifest_offset = blob_bytes; // logging only; sink owns real placement
+    let total_bytes_out = sink.finish()?;
     let total_files = uf + cf;
 
     log::info!(
         "[stream] gatling archive: {} group(s), {} blob bytes, manifest at {}",
-        manifest_entries.len(),
+        group_count,
         blob_bytes,
         manifest_offset
     );

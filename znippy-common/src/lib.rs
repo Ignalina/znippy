@@ -8,6 +8,7 @@ pub mod codec;
 pub mod common_config;
 pub mod index;
 pub mod archive;
+pub mod meta_sink;
 
 pub mod slotpool;
 
@@ -22,6 +23,7 @@ mod skip;
 
 pub use archive::{ZnippyArchive, ZnippyReader};
 pub use decompress::decompress_archive;
+pub use meta_sink::{ArchiveMetaSink, ArrowIpcSink, GroupKey};
 
 pub use index::{
     VerifyReport, ZNIPPY_INDEX_SCHEMA,

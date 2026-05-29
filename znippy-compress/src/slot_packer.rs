@@ -19,12 +19,13 @@ use walkdir::WalkDir;
 
 use znippy_common::common_config::CONFIG;
 use znippy_common::index::{
-    FileExtMeta, MULTI_INDEX_MAGIC, ManifestEntry, build_arrow_metadata_for_config,
-    build_metadata_batch, compose_index_schema, should_skip_compression, write_manifest_bytes,
+    FileExtMeta, build_arrow_metadata_for_config,
+    build_metadata_batch, compose_index_schema, should_skip_compression,
 };
 use znippy_common::meta::{BlobMeta, ChunkMeta};
 use znippy_common::slotpool::Magazine;
 use znippy_common::CompressionReport;
+use znippy_common::{ArchiveMetaSink, ArrowIpcSink, GroupKey};
 
 const SLOT_SIZE: usize = 200 * 1024 * 1024;
 const NUM_SLOTS: usize = 8;
@@ -105,17 +106,14 @@ pub fn compress_dir(
     let mut compressed_files = 0u64;
     let mut compressed_bytes = 0u64;
     let mut total_chunks = 0u64;
-    let mut row_count = 0u64;
 
-    // Arrow IPC StreamWriter — stays open across both passes.
-    use arrow::ipc::writer::StreamWriter;
+    // Metadata index schema (shared across both passes). The batches are
+    // collected and handed to the metadata sink as one sub-index below.
     let meta_map = build_arrow_metadata_for_config(&CONFIG);
     let composed = compose_index_schema(&ext_fields);
     let schema_with_meta =
         arrow::datatypes::Schema::new_with_metadata(composed.fields().to_vec(), meta_map);
-    let mut index_buf: Vec<u8> = Vec::new();
-    let mut sw = StreamWriter::try_new(&mut index_buf, &schema_with_meta)
-        .map_err(|e| anyhow!("index writer: {e}"))?;
+    let mut index_batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
 
     let input_dir_for_paths = input_dir.clone();
     let all_files_for_paths = Arc::clone(&all_files);
@@ -133,7 +131,6 @@ pub fn compress_dir(
         for (idx, m) in meta { if idx < ext_meta.len() { ext_meta[idx] = m; } }
 
         total_chunks += blobs.len() as u64;
-        row_count += blobs.len() as u64;
         let all_f = Arc::clone(&all_files_for_paths);
         let inp = input_dir_for_paths.clone();
         let resolver = |file_index: u64| {
@@ -143,7 +140,7 @@ pub fn compress_dir(
         };
         let batch = build_metadata_batch(&blobs, resolver, &ext_meta, &ext_fields)
             .map_err(|e| anyhow!("big index batch: {e}"))?;
-        sw.write(&batch).map_err(|e| anyhow!("big index write: {e}"))?;
+        index_batches.push(batch);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -159,7 +156,6 @@ pub fn compress_dir(
         for (idx, m) in meta { if idx < ext_meta.len() { ext_meta[idx] = m; } }
 
         total_chunks += blobs.len() as u64;
-        row_count += blobs.len() as u64;
         let all_f = Arc::clone(&all_files_for_paths);
         let inp = input_dir_for_paths.clone();
         let resolver = |file_index: u64| {
@@ -169,42 +165,28 @@ pub fn compress_dir(
         };
         let batch = build_metadata_batch(&blobs, resolver, &ext_meta, &ext_fields)
             .map_err(|e| anyhow!("small index batch: {e}"))?;
-        sw.write(&batch).map_err(|e| anyhow!("small index write: {e}"))?;
+        index_batches.push(batch);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // FINALIZE: flush index buffer to disk
+    // FINALIZE: write the metadata layer (one sub-index of all batches) via the sink
     // ══════════════════════════════════════════════════════════════════════════
-    sw.finish().map_err(|e| anyhow!("index finish: {e}"))?;
-
     let index_offset = out_cursor.load(Ordering::Relaxed);
     let blob_bytes = index_offset;
-    let sub_len = index_buf.len() as u64;
-    file.write_all_at(&index_buf, index_offset)?;
-
-    let manifest_offset = index_offset + sub_len;
     let pkg_type_val: i8 = plugin.and_then(|r| r.type_id()).unwrap_or(0);
-    let manifest_entries = vec![ManifestEntry {
-        pkg_type: pkg_type_val,
-        repo: repo.unwrap_or("").to_string(),
-        module_name: String::new(),
-        index_offset,
-        index_len: sub_len,
-        row_count,
-    }];
-    let manifest_bytes = write_manifest_bytes(&manifest_entries)
-        .map_err(|e| anyhow!("manifest: {e}"))?;
-    file.write_all_at(&manifest_bytes, manifest_offset)?;
 
-    let after_manifest = manifest_offset + manifest_bytes.len() as u64;
-    file.write_all_at(&MULTI_INDEX_MAGIC, after_manifest)?;
-    file.write_all_at(
-        &manifest_offset.to_le_bytes(),
-        after_manifest + MULTI_INDEX_MAGIC.len() as u64,
+    let mut sink: Box<dyn ArchiveMetaSink> =
+        Box::new(ArrowIpcSink::new(Arc::clone(&file), blob_bytes));
+    sink.push_subindex(
+        &schema_with_meta,
+        &index_batches,
+        GroupKey {
+            pkg_type: pkg_type_val,
+            repo: repo.unwrap_or("").to_string(),
+            module_name: String::new(),
+        },
     )?;
-    file.sync_all()?;
-
-    let total_bytes_out = after_manifest + MULTI_INDEX_MAGIC.len() as u64 + 8;
+    let total_bytes_out = sink.finish()?;
 
     Ok(CompressionReport {
         total_files,
