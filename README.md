@@ -238,4 +238,4 @@ cargo test --release -p znippy-tests --test perf_bench -- --ignored --nocapture
 ## Fan arts
 
 Iceberg 
-![znippy](https://github.com/user-attachments/assets/b068d559-4339-4f9f-9623-7c6b5efe2771)
+![znippy](doc/gatlin_znippy.png)

@@ -97,6 +97,13 @@ pub trait TypedCodec: Sync {
     /// threads in parallel. `data` is the full slot slice (carry + read);
     /// use `seg` to index into it.
     fn transform(&self, data: &[u8], seg: &Self::Seg) -> Self::Output;
+
+    /// Called once on each worker thread after it has processed all of its
+    /// segments, just before the thread exits. Lets a codec flush per-worker
+    /// accumulated state (e.g. a partial row group carried across segments via
+    /// thread-local storage) into the stream. The returned output, if any, is
+    /// forwarded to the sink after all in-order segment outputs. Default: none.
+    fn finish_worker(&self) -> Option<Self::Output> { None }
 }
 
 /// Consumer plug-in for typed mode. Receives each segment's output individually,
@@ -442,6 +449,8 @@ struct TypedInFlight<T> {
 enum TypedMsg<T> {
     New(TypedInFlight<T>),
     Result(TypedSegResult<T>),
+    /// End-of-worker remainder, forwarded to the sink after all ordered outputs.
+    Tail(T),
 }
 
 // ── Typed engine ────────────────────────────────────────────────────────────
@@ -550,6 +559,11 @@ pub fn run_typed<C: TypedCodec, S: TypedSink<C::Output>>(
                         output,
                     }));
                 }
+                // This worker has drained all its segments; flush any per-worker
+                // remainder (e.g. a partial row group accumulated across segments).
+                if let Some(tail) = codec_ref.finish_worker() {
+                    let _ = collector_tx.send(TypedMsg::Tail(tail));
+                }
             });
         }
         drop(work_rx);
@@ -562,6 +576,7 @@ pub fn run_typed<C: TypedCodec, S: TypedSink<C::Output>>(
         let collector = s.spawn(move || -> Result<()> {
             let mut in_flight: Vec<TypedInFlight<C::Output>> = Vec::new();
             let mut next_id: u64 = 0;
+            let mut tails: Vec<C::Output> = Vec::new();
 
             while let Ok(msg) = collector_rx.recv() {
                 match msg {
@@ -575,6 +590,7 @@ pub fn run_typed<C: TypedCodec, S: TypedSink<C::Output>>(
                             }
                         }
                     }
+                    TypedMsg::Tail(out) => tails.push(out),
                 }
 
                 // Flush completed slots strictly in stream order.
@@ -603,6 +619,10 @@ pub fn run_typed<C: TypedCodec, S: TypedSink<C::Output>>(
                 }
             }
 
+            // All ordered segment outputs are flushed; emit per-worker remainders.
+            for tail in tails {
+                sink_ref.process(tail, false)?;
+            }
             sink_ref.finish()?;
             Ok(())
         });
