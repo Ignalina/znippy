@@ -167,6 +167,54 @@ enum Msg {
 
 // ── Engine ──────────────────────────────────────────────────────────────────
 
+/// Fill `slot` with up to `chunk_size` bytes read from `src`, placed at offset
+/// `carry_headroom` (leaving the front free for a prepended carry). Returns the
+/// number of bytes read.
+///
+/// Grows the slot incrementally so only the bytes actually read are
+/// faulted/zeroed. A small or final partial chunk (e.g. a 24 MB read into a
+/// 232 MB slot) no longer touches the ~200 MB of unused tail — that page-fault +
+/// memset of memory we never read was the dominant cost on small inputs. For a
+/// full chunk (`got == chunk_size`, the planet steady state) the touched region
+/// equals the old `slot_size`, so there is no regression on large reads.
+fn fill_slot<R: Read>(
+    src: &mut R,
+    slot: &mut Vec<u8>,
+    carry_headroom: usize,
+    chunk_size: usize,
+) -> usize {
+    const READ_BLOCK: usize = 8 * 1024 * 1024;
+    slot.clear();
+    // Carry prefix: bytes [data_start..carry_headroom] are overwritten by the
+    // prepended carry before use; [0..data_start] is never read.
+    slot.resize(carry_headroom, 0);
+    let mut got = 0usize;
+    while got < chunk_size {
+        let want = READ_BLOCK.min(chunk_size - got);
+        let base = slot.len();
+        slot.resize(base + want, 0);
+        match src.read(&mut slot[base..base + want]) {
+            Ok(0) => {
+                slot.truncate(base);
+                break;
+            }
+            Ok(k) => {
+                slot.truncate(base + k);
+                got += k;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                slot.truncate(base);
+                continue;
+            }
+            Err(_) => {
+                slot.truncate(base);
+                break;
+            }
+        }
+    }
+    got
+}
+
 /// Run the engine to completion over `reader`, driving `sink`.
 ///
 /// `sink` is borrowed mutably for the duration; counts / outputs the consumer
@@ -215,9 +263,7 @@ pub fn run<C: Codec, S: Sink>(
                     Ok(sl) => sl,
                     Err(TryRecvError::Empty) if allocated < ring_slots => {
                         allocated += 1;
-                        let mut sl = Vec::with_capacity(slot_size);
-                        sl.resize(slot_size, 0);
-                        sl
+                        Vec::with_capacity(slot_size)
                     }
                     Err(TryRecvError::Empty) => match slot_return_rx.recv() {
                         Ok(sl) => sl,
@@ -225,15 +271,7 @@ pub fn run<C: Codec, S: Sink>(
                     },
                     Err(TryRecvError::Disconnected) => break,
                 };
-                let mut got = 0usize;
-                while got < chunk_size {
-                    match src.read(&mut slot[carry_headroom + got..slot_size]) {
-                        Ok(0) => break,
-                        Ok(k) => got += k,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
-                    }
-                }
+                let got = fill_slot(&mut src, &mut slot, carry_headroom, chunk_size);
                 let is_last = got < chunk_size;
                 if filled_tx.send((slot, got, is_last)).is_err() {
                     break;
@@ -500,9 +538,7 @@ pub fn run_typed<C: TypedCodec, S: TypedSink<C::Output>>(
                     Ok(sl) => sl,
                     Err(TryRecvError::Empty) if allocated < ring_slots => {
                         allocated += 1;
-                        let mut sl = Vec::with_capacity(slot_size);
-                        sl.resize(slot_size, 0);
-                        sl
+                        Vec::with_capacity(slot_size)
                     }
                     Err(TryRecvError::Empty) => match slot_return_rx.recv() {
                         Ok(sl) => sl,
@@ -510,15 +546,7 @@ pub fn run_typed<C: TypedCodec, S: TypedSink<C::Output>>(
                     },
                     Err(TryRecvError::Disconnected) => break,
                 };
-                let mut got = 0usize;
-                while got < chunk_size {
-                    match src.read(&mut slot[carry_headroom + got..slot_size]) {
-                        Ok(0) => break,
-                        Ok(k) => got += k,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
-                    }
-                }
+                let got = fill_slot(&mut src, &mut slot, carry_headroom, chunk_size);
                 let is_last = got < chunk_size;
                 if filled_tx.send((slot, got, is_last)).is_err() {
                     break;
