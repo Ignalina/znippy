@@ -154,7 +154,6 @@ impl STree64Mmap {
     /// Use stride=8 for a pure ID column (Arrow IPC / SoA layout).
     /// Use stride=16 for the legacy AoS `[i64 id][f32 lat][f32 lon]` layout.
     pub fn new_with_stride(data: &[u8], count: usize, stride: usize) -> Self {
-        use rayon::prelude::*;
         assert!(count > 0);
         assert!(stride >= 8);
         let h      = height(count);
@@ -168,13 +167,28 @@ impl STree64Mmap {
 
         let mut tree = vec![[MAX64; B]; n_blocks];
 
+        // Per-layer fill, bottom-up. Each layer's blocks are independent so
+        // they parallelise trivially; the layer barrier between iterations
+        // is algorithmic (parent nodes read child IDs from `data`, not from
+        // the upper-layer tree, so layers can in principle even run out of
+        // order — we keep bottom-up for cache friendliness).
+        //
+        // Was rayon `par_iter_mut().enumerate().for_each`; switched to
+        // `std::thread::scope` so this crate no longer pulls a rayon thread
+        // pool when used from a Gatling-shape parent pipeline (katana-osm
+        // 0.1.4 onwards). For very small top layers (1, 8, 64 blocks) the
+        // thread-spawn overhead exceeds the work; we fall back to a serial
+        // loop below `SMALL_LAYER_BLOCKS`.
+        const SMALL_LAYER_BLOCKS: usize = 4096;
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get()).unwrap_or(1).max(1);
         for lvl in (0..ni).rev() {
             let oh = offsets[lvl];
             let n_nodes = lsizes[lvl];
-            tree[oh..oh + n_nodes].par_iter_mut().enumerate().for_each(|(blk, node)| {
+            let slice = &mut tree[oh..oh + n_nodes];
+            let fill_block = |blk: usize, node: &mut [i64; B]| {
                 node.fill(MAX64);
                 for j in 0..B {
-                    let i = blk * B + j;
                     let mut k = blk * (B + 1) + j + 1;
                     for _ in lvl..h - 2 { k *= B + 1; }
                     node[j] = if k * B < count {
@@ -182,6 +196,23 @@ impl STree64Mmap {
                     } else {
                         MAX64
                     };
+                }
+            };
+            if n_nodes < SMALL_LAYER_BLOCKS {
+                for (blk, node) in slice.iter_mut().enumerate() {
+                    fill_block(blk, node);
+                }
+                continue;
+            }
+            let chunk_size = n_nodes.div_ceil(n_threads);
+            std::thread::scope(|s| {
+                for (chunk_idx, sub) in slice.chunks_mut(chunk_size).enumerate() {
+                    let base = chunk_idx * chunk_size;
+                    s.spawn(move || {
+                        for (i, node) in sub.iter_mut().enumerate() {
+                            fill_block(base + i, node);
+                        }
+                    });
                 }
             });
         }
