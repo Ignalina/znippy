@@ -7,8 +7,11 @@
 //! - [`chunk_revolver`]: zero-allocation slot pool for 1-reader / N-worker streaming.
 //! - [`gatling`]: generic no-barrier worker-pool engine (split → N decode → in-order
 //!   collect → sink), parameterised by a [`gatling::Codec`] + [`gatling::Sink`].
+//! - [`psort`]: parallel sample sort (and reference LSD radix) over 16-byte AoS
+//!   records keyed by their leading `i64`.
 
 pub mod chunk_revolver;
 pub mod gatling;
+pub mod psort;
 pub mod stree;
 pub mod vtd;

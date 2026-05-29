@@ -1,8 +1,8 @@
 [package]
 name    = "znippy-zoomies"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
-description = "Fast parallel OSM-XML index (VTD-style) + static search tree + zero-copy slot pool + generic no-barrier streaming engine (gatling)"
+description = "Fast parallel OSM-XML index (VTD-style) + static search tree + zero-copy slot pool + generic no-barrier streaming engine (gatling) + parallel sample sort (psort)"
 repository = "https://github.com/Ignalina/znippy"
 # The `stree` module is derived from Ragnar Groot Koerkamp's static-search-tree (MIT).
 # His copyright notice is retained in LICENSE, as MIT requires.
