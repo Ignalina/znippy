@@ -2,13 +2,20 @@
 name = "znippy-iceberg"
 version = "0.1.0"
 edition = "2024"
+authors = ["Rickard Lundin <rickard@ignalina.dk>"]
+description = "Apache Iceberg backend (IcebergSink) for znippy's ArchiveMetaSink trait."
+license = "MIT"
+repository = "https://github.com/Ignalina/znippy"
+readme = "../README.md"
+categories = ["compression"]
+keywords = ["iceberg", "arrow", "znippy", "parquet"]
 
 # Iceberg backend for the `ArchiveMetaSink` trait. All of the async/tokio +
 # Apache Iceberg + Arrow-57/Parquet dependencies are confined to this crate so
 # the existing sync, tokio-free crates (znippy-common, znippy-compress, ...) are
 # completely unaffected.
 [dependencies]
-znippy-common = { path = "../znippy-common" }
+znippy-common = { version = "0.8.0", path = "../znippy-common" }
 anyhow = "1"
 
 # Async runtime — allowed here only (bridged to the sync trait via block_on).

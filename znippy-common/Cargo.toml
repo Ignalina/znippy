@@ -1,6 +1,6 @@
 [package]
 name = "znippy-common"
-version = "0.7.5"
+version = "0.8.0"
 edition = "2024"
 authors = ["Rickard Lundin <rickard@ignalina.dk>"]
 description = "Core logic and data structures for Znippy, a parallel chunked compression system."
