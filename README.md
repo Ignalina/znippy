@@ -1,3 +1,6 @@
+# Znippy moved to https://codeberg.org/nordisk/znippy
+<img width="1391" height="768" alt="znippy_move" src="https://github.com/user-attachments/assets/28b05038-c83d-415c-a4a5-89edba26c15e" />
+
 
 ![znippy](https://github.com/user-attachments/assets/7db1c1c1-d577-4f87-bfe1-11af6e8c58a0)
 
